@@ -16,12 +16,19 @@ Stage adapters:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from importlib.resources import files as _pkg_files
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 import numpy as np
 
 ProgressCB = Callable[[float, str], None]
+
+# Default pixel scale for our typical 100×/1.4 NA setup. Used wherever a
+# pixel size hasn't been read from CZI metadata or set in the GUI; kept
+# in one place so SegmentOpts / ClassifyOpts and the live-preview
+# fallback can't drift apart.
+DEFAULT_PIXELS_PER_UM: float = 13.8767
 
 
 def _noop(_: float, __: str) -> None:
@@ -218,7 +225,7 @@ class SegmentOpts:
     model_type: str = "cpsam"
     diameter: Optional[float] = None
     gpu: bool = True
-    pixels_per_um: float = 13.8767
+    pixels_per_um: float = DEFAULT_PIXELS_PER_UM
     # Cellpose tunables. Lower cellprob_threshold (e.g. -2.0) keeps more
     # marginal cells; raise flow_threshold (e.g. 0.6) to be more permissive
     # about mask shape; lower min_size to keep smaller objects.
@@ -316,12 +323,14 @@ class ClassifyOpts:
     keep_classes: tuple[str, ...] = ("good",)
     confidence_threshold: float = 0.5
     use_rules: bool = True
-    pixels_per_um: float = 13.8767
+    pixels_per_um: float = DEFAULT_PIXELS_PER_UM
 
 
-# Bundled model presets (resolved to absolute paths at the package root)
-PRESET_MODELS = {
-    "mtb": Path(__file__).resolve().parents[2] / "models_mtb" / "best_model.pth",
+# Bundled model presets. Resolved via importlib.resources so the lookup
+# works in editable installs, wheels, and zipapps alike — the .pth files
+# are shipped with the package via [tool.setuptools.package-data].
+PRESET_MODELS: dict[str, Path] = {
+    "mtb": Path(str(_pkg_files("mycoprep.core") / "models" / "mtb_best_model.pth")),
     # "msm": Path(...)  # add when an Msm model is trained
 }
 

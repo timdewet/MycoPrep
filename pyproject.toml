@@ -39,3 +39,6 @@ mycoprep-focus = "mycoprep.core.focus.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mycoprep.core" = ["models/*.pth"]
