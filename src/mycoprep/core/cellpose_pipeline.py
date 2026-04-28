@@ -73,11 +73,9 @@ import numpy as np
 import tifffile
 
 # Named presets for species-specific cell quality classification models.
-# Use --classify-preset <name> to select one.
-CLASSIFY_PRESETS = {
-    "mtb": Path(__file__).parent / "models" / "best_model.pth",
-    # "msm": Path(__file__).parent / "models" / "msm_best_model.pth",  # TODO: add when trained
-}
+# Re-exported from ``api.PRESET_MODELS`` so the CLI and the GUI resolve
+# through one source of truth (importlib.resources-backed package data).
+from .api import PRESET_MODELS as CLASSIFY_PRESETS  # noqa: E402
 
 
 def read_czi(filepath):

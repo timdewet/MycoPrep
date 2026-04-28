@@ -36,12 +36,16 @@ def run(
 
     Returns an empty DataFrame when no cells are present.
     """
+    from mycoprep.core.api import DEFAULT_PIXELS_PER_UM
     from mycoprep.core.extract.per_cell import extract_fov_features
 
     if mask is None or int(mask.max()) == 0:
         return pd.DataFrame()
 
-    px = float(pixels_per_um) if pixels_per_um else 1.0
+    # Fall back to the pipeline-wide default (px/µm) rather than 1.0,
+    # which would silently report pixel counts as micrometres in the
+    # overlay and make objects look ~192× too large.
+    px = float(pixels_per_um) if pixels_per_um else DEFAULT_PIXELS_PER_UM
 
     intensity_channels = None
     if features_opts is not None:

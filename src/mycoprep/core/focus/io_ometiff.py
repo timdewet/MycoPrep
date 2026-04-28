@@ -49,8 +49,10 @@ def _imagej_metadata(
 def _resolution(px_um: tuple[float | None, float | None]):
     px_x, px_y = px_um
     if px_x and px_y:
-        # pixels per centimetre (TIFF standard unit) so values fit cleanly
-        return (px_x * 10_000, px_y * 10_000)
+        # ``px_um`` is micrometres-per-pixel; the TIFF resolution tag is
+        # pixels-per-(resolution unit). With resolutionunit=3 (cm) that's
+        # px/cm = (1 cm / 1 µm) / (µm/px) = 10_000 / px_um.
+        return (10_000.0 / px_x, 10_000.0 / px_y)
     return None
 
 
