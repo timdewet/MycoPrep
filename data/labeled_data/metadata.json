@@ -1,0 +1,9 @@
+{
+  "crop_size": 64,
+  "n_channels": 3,
+  "class_names": [
+    "good",
+    "bad"
+  ],
+  "n_samples": 192
+}

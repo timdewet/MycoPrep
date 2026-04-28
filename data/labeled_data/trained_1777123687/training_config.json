@@ -1,0 +1,16 @@
+{
+  "in_channels": 3,
+  "num_classes": 2,
+  "class_names": [
+    "good",
+    "bad"
+  ],
+  "n_train": 153,
+  "n_val": 39,
+  "best_val_acc": 0.8717948717948718,
+  "best_epoch": 25,
+  "total_epochs": 40,
+  "lr": 0.0001,
+  "batch_size": 32,
+  "patience": 15
+}
