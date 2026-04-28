@@ -80,12 +80,8 @@ src/mycoprep/
 assets/
 ├── logo/        # app icon (svg + ico)
 └── models_mtb/  # training artifacts (final_model.pth, curves, configs)
-data/
-└── labeled_data/  # training crops + labels
 packaging/
 └── mycoprep.spec  # PyInstaller spec for desktop bundle
-design_review/
-└── CRITIQUE.md    # post-launch UX backlog
 ```
 
 ## Building a desktop bundle
