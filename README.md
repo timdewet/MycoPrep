@@ -104,7 +104,13 @@ Pre-built Windows bundles are published on the [Releases](https://github.com/tim
 
 ## Acknowledgments
 
-MycoPrep incorporates methods derived from previously published research, including segmentation via Cellpose-SAM and other techniques adapted from the broader microscopy and computer vision literature. Credit for those underlying methods belongs to their original authors.
+MycoPrep incorporates methods derived from previously published research:
+
+- **Cellpose-SAM** for cell segmentation.
+- **MicrobeJ** (Ducret et al., *Nat. Microbiol.* 2016), **Oufti** (Paintdakhi et al., *Mol. Microbiol.* 2016), and **PSICIC** (Guberman et al., *PLoS Comput. Biol.* 2008) for the sub-pixel contour / medial-axis / gradient-snap midline methodology.
+- **MOMIA** ([jzrolling/MOMIA](https://github.com/jzrolling/MOMIA), MIT licence) as inspiration for the midline-derived per-cell morphology columns.
+
+Our implementations are rewritten on top of modern scikit-image / SciPy primitives — no upstream code is vendored. Full per-module citations live alongside the code (see `src/mycoprep/core/extract/_midline.py`). Credit for the underlying methods belongs to their original authors.
 
 ## License
 
