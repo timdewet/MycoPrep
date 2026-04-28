@@ -26,6 +26,7 @@ hiddenimports: list = []
 # Project assets — bundled at the runtime root so ``resource_root()``
 # (in ``mycoprep/gui/_resources.py``) finds them.
 datas.append(("../assets/logo/logo.svg", "logo"))
+datas.append(("../assets/logo/logo.ico", "logo"))
 
 # ``collect_all`` walks each package's files (Python modules, package
 # data, DLLs) so the bundle contains everything ``mycoprep.*`` imports
@@ -90,9 +91,9 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data)
 
 
-# A windowed (no console) executable. Provide a ``logo/logo.ico`` if you
-# want a custom Windows icon — convert the SVG to ICO once and drop it
-# in ``assets/logo/``, then point ``icon`` at it.
+# A windowed (no console) executable. ``assets/logo/logo.ico`` is a
+# multi-resolution ICO (16/24/32/48/64/128/256) generated from
+# logo.svg; PyInstaller stamps it on the Windows .exe and macOS .app.
 exe = EXE(
     pyz,
     a.scripts,
@@ -109,7 +110,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon="../assets/logo/logo.ico",
 )
 
 
