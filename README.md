@@ -102,6 +102,10 @@ PyInstaller can't cross-compile. Use one of:
 
 Pre-built Windows bundles are published on the [Releases](https://github.com/timdewet/MycoPrep/releases) page. Each release ships a zipped `dist\MycoPrep\` folder — see the end-user install steps above.
 
+## Acknowledgments
+
+MycoPrep incorporates methods derived from previously published research, including segmentation via Cellpose-SAM and other techniques adapted from the broader microscopy and computer vision literature. Credit for those underlying methods belongs to their original authors.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
