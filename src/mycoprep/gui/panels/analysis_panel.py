@@ -1,18 +1,14 @@
-"""Analysis panel — post-pipeline clustering and feature library tools.
+"""Analysis panel — interactive UMAP of the feature library.
 
-This page lives after the Run stage and houses workflows that operate on
-already-extracted features rather than raw images:
+The page is a single full-bleed plot view. The library is the source of
+truth: anything you want to see lives in the library, registered either
+during a pipeline run or via the library browser's "Import existing
+parquet" action. Removing this surface entirely would leave no place for
+the interactive plot, but everything else has been pared back so the
+UMAP gets the room it deserves.
 
-- Embedded interactive Plotly UMAP at the top of the page. Default view
-  shows the feature library on its own; switches to a current-run-vs-
-  library comparison after the user re-runs clustering.
-- Embedded feature library browser (manage registered runs, import existing).
-- Re-run morphology clustering on a chosen features directory + library
-  selection, regenerating the clustering QC plots without rerunning the
-  full pipeline.
-
-Plot rendering runs on a worker QThread so the UI stays responsive and a
-progress bar reflects the current step.
+Workers render plots on a QThread; a translucent overlay greys out the
+plot area and shows a progress bar while a render is running.
 """
 
 from __future__ import annotations
@@ -26,40 +22,26 @@ from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QComboBox,
-    QFileDialog,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QMessageBox,
     QProgressBar,
     QPushButton,
-    QSplitter,
+    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
 from ..ui import tokens
-from ..widgets.library_browser import LibraryBrowser
 
 SPECIES_OPTIONS = ["M. tuberculosis", "M. smegmatis"]
-
-_FEATURE_SUBDIRS = {"04_features", "features"}
-
-
-def _default_run_id(features_dir: Path) -> str:
-    """Best-effort run label, walking past conventional feature subdirs."""
-    if features_dir.name in _FEATURE_SUBDIRS and features_dir.parent != features_dir:
-        return features_dir.parent.name or features_dir.name
-    return features_dir.name
 
 
 _PLACEHOLDER_HTML = """\
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
 body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-     color:#666;text-align:center;padding:60px 20px;background:#fafafa;}}
+     color:#666;text-align:center;padding:80px 20px;background:#fafafa;}}
 h2{{color:#333;font-weight:500;margin-bottom:6px;}}
 p{{margin:6px 0;font-size:13px;}}
 </style></head><body>
@@ -70,7 +52,67 @@ p{{margin:6px 0;font-size:13px;}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker QObjects — run plot rendering off the GUI thread.
+# Translucent overlay used as a "loading" curtain over the plot area
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _PlotOverlay(QWidget):
+    """A semi-transparent grey curtain with a centred progress bar."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet(
+            "background-color: rgba(40, 40, 40, 110);"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
+
+        card = QFrame()
+        card.setObjectName("loadingCard")
+        card.setStyleSheet(
+            "QFrame#loadingCard {"
+            f"  background-color: white; border-radius: {tokens.R_LG}px;"
+            "}"
+        )
+        card.setMinimumWidth(320)
+        card.setMaximumWidth(420)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(tokens.S5, tokens.S4, tokens.S5, tokens.S4)
+        card_layout.setSpacing(tokens.S2)
+
+        self._label = QLabel("Rendering\u2026")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet(f"color: {tokens.active().text_muted};")
+        card_layout.addWidget(self._label)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setMaximumHeight(10)
+        card_layout.addWidget(self._progress)
+
+        # Center the card horizontally
+        card_row = QHBoxLayout()
+        card_row.addStretch(1)
+        card_row.addWidget(card)
+        card_row.addStretch(1)
+        outer.addLayout(card_row)
+        outer.addStretch(1)
+
+        self.hide()
+
+    def set_progress(self, pct: int, msg: str) -> None:
+        self._progress.setValue(int(pct))
+        if msg:
+            self._label.setText(msg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker — renders the library Plotly HTML in a thread
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -86,67 +128,32 @@ class _LibraryWorker(QObject):
         out_path: Path,
         library_dir: Optional[Path],
         species: str,
+        color_by: str = "cluster",
+        feature_col: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._out_path = out_path
         self._library_dir = library_dir
         self._species = species
+        self._color_by = color_by
+        self._feature_col = feature_col
 
     def run(self) -> None:
         try:
             from mycoprep.core.extract.qc_plots import render_library_html
 
-            self.progress.emit(5, "Loading library\u2026")
-            self.progress.emit(20, "Computing S-scores\u2026")
+            self.progress.emit(10, "Loading library\u2026")
+            self.progress.emit(35, "Computing S-scores\u2026")
+            self.progress.emit(60, "Embedding (UMAP)\u2026")
             written = render_library_html(
                 self._out_path,
                 library_dir=self._library_dir,
                 species=self._species,
+                color_by=self._color_by,
+                feature_col=self._feature_col,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
-        except Exception as e:  # noqa: BLE001
-            self.failed.emit(str(e))
-
-
-class _ClusteringWorker(QObject):
-    """Run ``make_qc_plots`` (current run + optional library comparison)."""
-
-    progress = pyqtSignal(int, str)
-    finished = pyqtSignal(object)   # Path | None (qc_plots dir)
-    failed = pyqtSignal(str)
-
-    def __init__(
-        self,
-        features_dir: Path,
-        library_dir: Optional[Path],
-        species: str,
-        current_run_id: str,
-        control_labels: list[str],
-    ) -> None:
-        super().__init__()
-        self._features_dir = features_dir
-        self._library_dir = library_dir
-        self._species = species
-        self._current_run_id = current_run_id
-        self._control_labels = control_labels
-
-    def run(self) -> None:
-        try:
-            from mycoprep.core.extract.qc_plots import make_qc_plots
-
-            def cb(f: float, m: str) -> None:
-                self.progress.emit(int(round(max(0.0, min(1.0, f)) * 100)), m)
-
-            out = make_qc_plots(
-                self._features_dir,
-                library_dir=self._library_dir,
-                species=self._species,
-                current_run_id=self._current_run_id,
-                control_labels=self._control_labels,
-                progress_cb=cb,
-            )
-            self.finished.emit(out)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -155,150 +162,109 @@ class _ClusteringWorker(QObject):
 
 
 class AnalysisPanel(QWidget):
-    """Clustering and feature library management with an embedded interactive
-    plot view."""
+    """Full-bleed interactive UMAP of the feature library."""
 
     statusMessage = pyqtSignal(str)
+    openLibraryBrowserRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="mycoprep_analysis_"))
         self._library_html_path = self._tmp_dir / "library.html"
-        self._last_plots_dir: Path | None = None
-        self._current_view: str = "library"  # "library" or "comparison"
+        self._library_dir: Path | None = None
         self._worker_thread: QThread | None = None
         self._worker: QObject | None = None
-        # Track when we last saw the library change so we know whether
-        # to re-render on tab entry.
+        # Cached library state (path, species, mtime) — avoid re-rendering
+        # on tab switches when nothing has changed.
         self._last_library_state: tuple[Path | None, str, float] | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(tokens.S3)
+        root.setSpacing(tokens.S2)
 
-        # ── Interactive plot view (top, largest) ───────────────────────
-        self._web_view = QWebEngineView()
-        self._web_view.setMinimumHeight(420)
-        root.addWidget(self._web_view, stretch=3)
+        # ── Top toolbar ────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(tokens.S4, tokens.S3, tokens.S4, 0)
+        toolbar.setSpacing(tokens.S2)
 
-        # Progress strip — shown only while a worker is running.
-        progress_row = QHBoxLayout()
-        progress_row.setContentsMargins(tokens.S3, 0, tokens.S3, 0)
-        progress_row.setSpacing(tokens.S2)
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 100)
-        self._progress.setMinimumWidth(160)
-        self._progress.setMaximumHeight(14)
-        self._progress.setTextVisible(False)
-        self._progress_label = QLabel("")
-        self._progress_label.setStyleSheet(
-            f"color: {tokens.active().text_subtle}; font-size: {tokens.FS_CAPTION}px;"
-        )
-        progress_row.addWidget(self._progress)
-        progress_row.addWidget(self._progress_label, stretch=1)
-        progress_widget = QWidget(); progress_widget.setLayout(progress_row)
-        root.addWidget(progress_widget)
-        progress_widget.setVisible(False)
-        self._progress_widget = progress_widget
-
-        # ── Bottom: re-run controls (left) | library browser (right) ───
-        self._bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        cluster_box = QGroupBox("Re-run clustering on existing features")
-        cluster_form = QFormLayout(cluster_box)
-        cluster_form.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
-        cluster_form.setHorizontalSpacing(tokens.S4)
-        cluster_form.setVerticalSpacing(tokens.S3)
-
-        feat_row = QHBoxLayout()
-        self._features_dir = QLineEdit()
-        self._features_dir.setPlaceholderText(
-            "Path to a features dir containing all_features.parquet"
-        )
-        feat_row.addWidget(self._features_dir)
-        self._browse_features_btn = QPushButton("Browse\u2026")
-        self._browse_features_btn.setFixedWidth(80)
-        self._browse_features_btn.clicked.connect(self._browse_features_dir)
-        feat_row.addWidget(self._browse_features_btn)
-        feat_widget = QWidget(); feat_widget.setLayout(feat_row)
-        cluster_form.addRow("Features dir:", feat_widget)
-
+        toolbar.addWidget(QLabel("Species:"))
         self._species = QComboBox()
         self._species.addItems([""] + SPECIES_OPTIONS)
         self._species.currentTextChanged.connect(
-            lambda _t: self._refresh_library_view()
+            lambda _t: self._refresh_library_view(force=True)
         )
-        cluster_form.addRow("Species:", self._species)
+        toolbar.addWidget(self._species)
+        toolbar.addStretch(1)
 
-        self._run_id = QLineEdit()
-        self._run_id.setPlaceholderText(
-            "Used in the figure title (default: features dir name)"
+        self._library_btn = QPushButton("Library browser\u2026")
+        self._library_btn.setToolTip(
+            "Open the feature library to add, edit, or remove registered runs."
         )
-        cluster_form.addRow("Run label:", self._run_id)
+        self._library_btn.clicked.connect(self.openLibraryBrowserRequested.emit)
+        toolbar.addWidget(self._library_btn)
 
-        self._control_labels = QLineEdit()
-        self._control_labels.setPlaceholderText("e.g. NT1, NT2, WT, DMSO")
-        self._control_labels.setToolTip(
-            "Comma-separated mutant tokens to treat as controls when "
-            "computing S-scores. Leave blank to fall back to a global "
-            "z-score (no control anchor)."
+        self._open_browser_btn = QPushButton("Open in browser")
+        self._open_browser_btn.setToolTip(
+            "Open the current interactive plot in your default browser."
         )
-        cluster_form.addRow("Control labels:", self._control_labels)
+        self._open_browser_btn.clicked.connect(self._open_current_in_browser)
+        toolbar.addWidget(self._open_browser_btn)
 
-        action_row = QHBoxLayout()
-        self._run_btn = QPushButton("Generate clustering plots")
-        self._run_btn.clicked.connect(self._run_clustering)
-        action_row.addWidget(self._run_btn)
+        root.addLayout(toolbar)
 
-        self._show_library_btn = QPushButton("Show library only")
-        self._show_library_btn.setToolTip(
-            "Reload the interactive plot of just the feature library "
-            "(no current run overlaid)."
+        # ── Plot area with translucent overlay ─────────────────────────
+        plot_container = QWidget()
+        plot_stack = QStackedLayout(plot_container)
+        plot_stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        plot_stack.setContentsMargins(tokens.S3, tokens.S2, tokens.S3, tokens.S3)
+
+        self._web_view = QWebEngineView()
+        self._web_view.setMinimumHeight(420)
+        plot_stack.addWidget(self._web_view)
+
+        self._overlay = _PlotOverlay(plot_container)
+        plot_stack.addWidget(self._overlay)
+
+        root.addWidget(plot_container, stretch=1)
+
+        # ── Bottom: colour-by selector + status pill ───────────────────
+        colour_row = QHBoxLayout()
+        colour_row.setContentsMargins(tokens.S4, 0, tokens.S4, 0)
+        colour_row.setSpacing(tokens.S2)
+
+        colour_row.addWidget(QLabel("Colour by:"))
+        self._color_by = QComboBox()
+        self._color_by.addItem("Cluster", userData="cluster")
+        self._color_by.addItem("Run ID", userData="run_id")
+        self._color_by.addItem("Feature gradient\u2026", userData="feature")
+        self._color_by.currentIndexChanged.connect(self._on_color_by_changed)
+        colour_row.addWidget(self._color_by)
+
+        self._feature_col = QComboBox()
+        self._feature_col.setMinimumWidth(220)
+        self._feature_col.setEnabled(False)
+        self._feature_col.currentIndexChanged.connect(
+            lambda _i: self._refresh_library_view(force=True)
+            if self._color_by.currentData() == "feature" else None
         )
-        self._show_library_btn.clicked.connect(self._refresh_library_view)
-        action_row.addWidget(self._show_library_btn)
+        colour_row.addWidget(self._feature_col)
 
-        self._open_plots_btn = QPushButton("Open plots folder")
-        self._open_plots_btn.clicked.connect(self._open_plots_folder)
-        self._open_plots_btn.setEnabled(False)
-        action_row.addWidget(self._open_plots_btn)
-
-        self._open_in_browser_btn = QPushButton("Open in browser")
-        self._open_in_browser_btn.setToolTip(
-            "Open the currently displayed interactive plot in your "
-            "default browser (more screen space, native zoom)."
-        )
-        self._open_in_browser_btn.clicked.connect(self._open_current_in_browser)
-        action_row.addWidget(self._open_in_browser_btn)
-
-        action_row.addStretch(1)
-        action_widget = QWidget(); action_widget.setLayout(action_row)
-        cluster_form.addRow("", action_widget)
+        colour_row.addStretch(1)
 
         self._status = QLabel("")
         self._status.setStyleSheet(
-            f"color: {tokens.active().text_subtle}; font-size: {tokens.FS_CAPTION}px;"
+            f"color: {tokens.active().text_subtle}; "
+            f"font-size: {tokens.FS_CAPTION}px;"
         )
         self._status.setWordWrap(True)
-        cluster_form.addRow("", self._status)
+        colour_row.addWidget(self._status, stretch=2)
 
-        self._bottom_splitter.addWidget(cluster_box)
-
-        lib_box = QGroupBox("Feature library")
-        lib_layout = QVBoxLayout(lib_box)
-        lib_layout.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
-        self._library_browser = LibraryBrowser()
-        self._library_browser.libraryChanged.connect(self._on_library_changed)
-        lib_layout.addWidget(self._library_browser)
-        self._bottom_splitter.addWidget(lib_box)
-
-        self._bottom_splitter.setStretchFactor(0, 1)
-        self._bottom_splitter.setStretchFactor(1, 1)
-        root.addWidget(self._bottom_splitter, stretch=2)
+        root.addLayout(colour_row)
 
         self._set_placeholder(
-            "Feature library", "Loading\u2026 (will appear here once the library has data).",
+            "Feature library",
+            "Loading\u2026 (will appear here once the library has data).",
         )
 
     # ------------------------------------------------------------------
@@ -306,24 +272,25 @@ class AnalysisPanel(QWidget):
     # ------------------------------------------------------------------
 
     def set_library_dir(self, library_dir: Path | None) -> None:
-        """Sync the embedded browser with the library dir from FeaturesPanel."""
-        self._library_browser.set_library_dir(library_dir)
-        self._refresh_library_view()
+        """Sync the library dir from FeaturesPanel and re-render the plot."""
+        self._library_dir = library_dir
+        self._refresh_library_view(force=True)
 
     def refresh_library(self) -> None:
-        """Called when the user navigates to the Analysis page or after a
-        pipeline run finishes. Re-renders the library plot only when the
-        underlying library has actually changed since we last saw it, so
-        switching tabs doesn't flicker."""
-        self._library_browser.refresh()
+        """Called when the user navigates to the Analysis page. Re-renders
+        only when the underlying library has actually changed since we
+        last saw it."""
         if self._library_state_changed():
-            self._refresh_library_view()
+            self._refresh_library_view(force=True)
 
     def on_pipeline_finished(self) -> None:
-        """Hook invoked from MainWindow when a pipeline run finishes —
-        the library may have just gained a new run, so re-render."""
-        self._library_browser.refresh()
-        self._refresh_library_view()
+        """Hook from MainWindow when a pipeline run completes — the library
+        may have just gained a new run, so re-render unconditionally."""
+        self._refresh_library_view(force=True)
+
+    def on_library_changed_external(self) -> None:
+        """The popup library browser changed (import / edit / remove)."""
+        self._refresh_library_view(force=True)
 
     # ------------------------------------------------------------------
     # Plot view management
@@ -335,44 +302,81 @@ class AnalysisPanel(QWidget):
         self._web_view.setUrl(QUrl.fromLocalFile(str(self._library_html_path)))
 
     def _library_state_changed(self) -> bool:
-        """Detect whether the library_dir, species, or library.parquet
-        mtime has changed since the last successful render."""
         species = self._species.currentText().strip()
-        library_dir = self._library_browser._library_dir
         from mycoprep.core.extract.feature_library import FeatureLibrary
         try:
-            lib = FeatureLibrary(library_dir)
+            lib = FeatureLibrary(self._library_dir)
             idx_path = lib.library_dir / "library.parquet"
             mtime = idx_path.stat().st_mtime if idx_path.exists() else 0.0
         except Exception:  # noqa: BLE001
             mtime = 0.0
-        state = (library_dir, species, mtime)
-        if state != self._last_library_state:
-            return True
-        return False
+        state = (self._library_dir, species, mtime)
+        return state != self._last_library_state
 
-    def _on_library_changed(self) -> None:
-        """The embedded browser flagged a content change (import / edit /
-        remove). Always re-render, since any displayed plot is now stale."""
-        self._refresh_library_view()
-
-    def _refresh_library_view(self) -> None:
-        """Render the library-only interactive plot (in a worker thread)
-        and load it into the embedded view. Falls back to a placeholder
-        when the library is empty or has too few conditions."""
+    def _refresh_library_view(self, force: bool = False) -> None:
         if self._is_busy():
             return
-        species = self._species.currentText().strip()
-        library_dir = self._library_browser._library_dir
+        if not force and not self._library_state_changed():
+            return
 
+        species = self._species.currentText().strip()
+        # Make sure the feature dropdown reflects the current library state
+        # before we kick off the worker (so a feature-mode render finds a
+        # valid column, not a stale one from a different species).
+        self._populate_feature_combo()
+        color_by = self._color_by.currentData() or "cluster"
+        feature_col = (
+            self._feature_col.currentText() or None
+            if color_by == "feature" else None
+        )
         worker = _LibraryWorker(
-            self._library_html_path, library_dir, species,
+            self._library_html_path, self._library_dir, species,
+            color_by=color_by, feature_col=feature_col,
         )
         self._start_worker(
             worker,
             on_finished=self._on_library_render_finished,
             status="Rendering library plot\u2026",
         )
+
+    def _on_color_by_changed(self, _idx: int) -> None:
+        mode = self._color_by.currentData() or "cluster"
+        is_feature = (mode == "feature")
+        self._feature_col.setEnabled(is_feature)
+        if is_feature:
+            self._populate_feature_combo()
+            if self._feature_col.count() == 0:
+                self._status.setText(
+                    "No feature columns available — library is empty for this species."
+                )
+                return
+        # Re-render with the new colouring.
+        self._refresh_library_view(force=True)
+
+    def _populate_feature_combo(self) -> None:
+        """Populate the feature combo from the library if not already done.
+
+        Preserves the user's current selection when possible so a render
+        triggered by another control change doesn't reset it.
+        """
+        from mycoprep.core.extract.qc_plots import library_feature_columns
+
+        species = self._species.currentText().strip()
+        try:
+            cols = library_feature_columns(
+                library_dir=self._library_dir, species=species,
+            )
+        except Exception:  # noqa: BLE001
+            cols = []
+        prev = self._feature_col.currentText()
+        if [self._feature_col.itemText(i) for i in range(self._feature_col.count())] == cols:
+            return  # no change
+        self._feature_col.blockSignals(True)
+        self._feature_col.clear()
+        self._feature_col.addItems(cols)
+        if prev and prev in cols:
+            self._feature_col.setCurrentText(prev)
+        self._feature_col.blockSignals(False)
 
     def _on_library_render_finished(self, written: object) -> None:
         species = self._species.currentText().strip()
@@ -381,33 +385,21 @@ class AnalysisPanel(QWidget):
             self._set_placeholder(
                 "No library data",
                 f"No registered runs match {sp_label}. Add runs from the "
-                "Features panel during a pipeline run, or use \u201cImport "
-                "existing parquet\u201d in the library browser to seed it.",
+                "Features panel during a pipeline run, or use \u201cLibrary "
+                "browser\u201d \u2192 \u201cImport existing parquet\u201d.",
             )
+            self._status.setText("")
         else:
             self._web_view.setUrl(QUrl.fromLocalFile(str(written)))
-        self._current_view = "library"
-        # Cache the state we just rendered for so refresh_library() can
-        # decide whether to re-render on next tab entry.
-        library_dir = self._library_browser._library_dir
+            self._status.setText("")
         from mycoprep.core.extract.feature_library import FeatureLibrary
         try:
-            lib = FeatureLibrary(library_dir)
+            lib = FeatureLibrary(self._library_dir)
             idx_path = lib.library_dir / "library.parquet"
             mtime = idx_path.stat().st_mtime if idx_path.exists() else 0.0
         except Exception:  # noqa: BLE001
             mtime = 0.0
-        self._last_library_state = (library_dir, species, mtime)
-
-    def _show_comparison(self, html_path: Path) -> None:
-        if not html_path.exists():
-            QMessageBox.information(
-                self, "Plot not available",
-                f"{html_path.name} was not produced for the last run.",
-            )
-            return
-        self._web_view.setUrl(QUrl.fromLocalFile(str(html_path)))
-        self._current_view = "comparison"
+        self._last_library_state = (self._library_dir, species, mtime)
 
     # ------------------------------------------------------------------
     # Worker plumbing
@@ -423,12 +415,11 @@ class AnalysisPanel(QWidget):
         on_finished,
         status: str,
     ) -> None:
-        self._progress.setValue(0)
-        self._progress_label.setText(status)
-        self._progress_widget.setVisible(True)
-        self._run_btn.setEnabled(False)
-        self._show_library_btn.setEnabled(False)
-        self._status.setText(status)
+        self._overlay.set_progress(0, status)
+        self._overlay.show()
+        self._overlay.raise_()
+        self._library_btn.setEnabled(False)
+        self._open_browser_btn.setEnabled(False)
 
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -450,14 +441,12 @@ class AnalysisPanel(QWidget):
         thread.start()
 
     def _on_worker_progress(self, pct: int, msg: str) -> None:
-        self._progress.setValue(int(pct))
-        self._progress_label.setText(msg)
-        self._status.setText(msg)
+        self._overlay.set_progress(pct, msg)
 
     def _on_worker_done(self, callback, result, *, success: bool) -> None:
-        self._progress_widget.setVisible(False)
-        self._run_btn.setEnabled(True)
-        self._show_library_btn.setEnabled(True)
+        self._overlay.hide()
+        self._library_btn.setEnabled(True)
+        self._open_browser_btn.setEnabled(True)
         self._worker = None
         self._worker_thread = None
         if success:
@@ -466,83 +455,14 @@ class AnalysisPanel(QWidget):
             except Exception as e:  # noqa: BLE001
                 self._status.setText(f"Render callback failed: {e}")
         else:
-            QMessageBox.critical(self, "Plot generation failed", str(result))
             self._status.setText(f"Failed: {result}")
+            self._set_placeholder("Plot generation failed", str(result))
 
     # ------------------------------------------------------------------
     # Action handlers
     # ------------------------------------------------------------------
 
-    def _browse_features_dir(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select features directory")
-        if d:
-            self._features_dir.setText(d)
-
-    def _open_plots_folder(self) -> None:
-        if self._last_plots_dir and self._last_plots_dir.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._last_plots_dir)))
-
     def _open_current_in_browser(self) -> None:
         url = self._web_view.url()
         if url.isValid():
             QDesktopServices.openUrl(url)
-
-    def _run_clustering(self) -> None:
-        if self._is_busy():
-            return
-        text = self._features_dir.text().strip()
-        if not text:
-            QMessageBox.warning(
-                self, "Missing input",
-                "Choose a features directory containing all_features.parquet.",
-            )
-            return
-        feat_dir = Path(text)
-        if not (feat_dir / "all_features.parquet").exists():
-            QMessageBox.warning(
-                self, "Not found",
-                f"No all_features.parquet under {feat_dir}",
-            )
-            return
-
-        species = self._species.currentText().strip()
-        run_id = self._run_id.text().strip() or _default_run_id(feat_dir)
-        library_dir = self._library_browser._library_dir
-        control_labels = [
-            t.strip() for t in self._control_labels.text().split(",")
-            if t and t.strip()
-        ]
-
-        worker = _ClusteringWorker(
-            feat_dir, library_dir, species, run_id, control_labels,
-        )
-        self._start_worker(
-            worker,
-            on_finished=self._on_clustering_finished,
-            status="Running clustering\u2026",
-        )
-
-    def _on_clustering_finished(self, out_dir: object) -> None:
-        if out_dir is None:
-            self._status.setText("No plots generated (see status above).")
-            return
-        out_dir = Path(out_dir)
-        self._last_plots_dir = out_dir
-        self._open_plots_btn.setEnabled(True)
-
-        # Prefer the comparison-with-library plot; fall back to solo.
-        comparison_html = out_dir / "morphology_clustering_library.html"
-        solo_html = out_dir / "morphology_clustering_run.html"
-        if comparison_html.exists():
-            self._show_comparison(comparison_html)
-            self._status.setText(
-                f"Showing current run vs library. Plots in {out_dir}."
-            )
-        elif solo_html.exists():
-            self._show_comparison(solo_html)
-            self._status.setText(
-                f"Library was empty — showing solo run. Plots in {out_dir}."
-            )
-        else:
-            self._status.setText(f"Plots written to {out_dir}")
-        self.statusMessage.emit(f"Clustering done: {out_dir}")

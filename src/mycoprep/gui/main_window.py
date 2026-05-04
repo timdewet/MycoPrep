@@ -171,8 +171,9 @@ class MainWindow(QMainWindow):
         self.classify_panel.openLabelTrainerRequested.connect(self._open_label_trainer)
         self.classify_panel.showModelDetailsRequested.connect(self._open_model_details)
         self.features_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
-        # Keep the Analysis panel's embedded library browser pointed at the
-        # same library directory the user picks in FeaturesPanel.
+        self.analysis_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
+        # Keep the Analysis panel's library plot pointed at the same
+        # library directory the user picks in FeaturesPanel.
         self.features_panel.library_dir.textChanged.connect(self._sync_analysis_library_dir)
 
         # Stage-state tracking for sidebar status dots.
@@ -788,6 +789,11 @@ class MainWindow(QMainWindow):
         lib_dir = Path(lib_dir_text) if lib_dir_text else None
         if self._library_browser_window is None:
             browser = LibraryBrowser(library_dir=lib_dir, parent=self)
+            # Push library mutations (import / edit / remove) back to the
+            # Analysis page so its plot stays in sync.
+            browser.libraryChanged.connect(
+                self.analysis_panel.on_library_changed_external
+            )
             self._library_browser_window = _LibraryBrowserWindow(browser, parent=self)
         else:
             self._library_browser_window.centralWidget().set_library_dir(lib_dir)

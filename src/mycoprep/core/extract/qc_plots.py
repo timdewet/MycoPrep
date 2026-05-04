@@ -648,24 +648,17 @@ def _plot_condition_panel_static(
         ax.spines[sp].set_visible(False)
 
 
-def _plot_condition_plotly(
-    profiles, embedding, labels_cluster, meta_rows, title,
-    top_features_per_point: int = 5,
-):
-    """Build an interactive Plotly figure: a single cluster-colored
-    scatter. Returns a ``plotly.graph_objects.Figure`` ready to
-    ``write_html``. Hover shows condition, run_id, experiment_type,
-    # cells, and the top |S-score| features. Controls are always grey,
-    regardless of cluster assignment.
-    """
+_CATEGORICAL_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+
+def _build_hover_text(profiles, meta_rows, top_features_per_point: int = 5):
     import numpy as np
-    import plotly.graph_objects as go
 
-    fig = go.Figure()
-
-    # Pre-compute hover text per profile row: top abs(S) features.
-    hover_text = []
     feat_cols = list(profiles.columns)
+    hover_text = []
     for i, r in enumerate(meta_rows):
         vals = profiles.iloc[i]
         top_idx = np.argsort(np.abs(vals.values))[::-1][:top_features_per_point]
@@ -673,81 +666,164 @@ def _plot_condition_plotly(
             f"  {feat_cols[j]}: {vals.iloc[j]:+.2f}" for j in top_idx
         ]
         ctrl_tag = " · control" if r.get("is_control") else ""
-        ht = (
+        hover_text.append(
             f"<b>{r['condition']}</b>{ctrl_tag}"
             f"{(' · ' + r['run_id']) if r['run_id'] else ''}"
             f"<br>type: {r['experiment_type']}"
             f"<br>cells: {r['n_cells']:,}"
             f"<br>top S-scores:<br>" + "<br>".join(top_lines)
         )
-        hover_text.append(ht)
+    return hover_text
 
-    palette = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    ]
 
-    # Controls first so they sit in the legend before clusters.
-    ctrl_idxs = [i for i, r in enumerate(meta_rows) if r["is_control"]]
+def _plot_condition_plotly(
+    profiles, embedding, labels_cluster, meta_rows, title,
+    color_by: str = "cluster",
+    feature_col: str | None = None,
+    top_features_per_point: int = 5,
+):
+    """Build an interactive Plotly figure: single scatter, configurable colour.
+
+    ``color_by``:
+      - ``"cluster"`` (default): HDBSCAN cluster id; controls grey
+      - ``"run_id"``: each registered run gets its own colour; controls grey
+      - ``"feature"``: continuous viridis gradient over ``feature_col``
+        (an S-score column from ``profiles``); controls excluded from the
+        gradient and overlaid as grey circles for reference
+
+    Returns a ``plotly.graph_objects.Figure`` ready to ``write_html``.
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    hover_text = _build_hover_text(profiles, meta_rows, top_features_per_point)
+
+    n = len(meta_rows)
+    sizes = np.array([22 if r["is_current_run"] else 12 for r in meta_rows])
+    line_widths = np.array([2 if r["is_current_run"] else 0 for r in meta_rows])
+    is_ctrl = np.array([r["is_control"] for r in meta_rows], dtype=bool)
+    exp_types = [r["experiment_type"] for r in meta_rows]
+
+    if color_by == "feature":
+        if feature_col is None or feature_col not in profiles.columns:
+            # Fall back to cluster colouring if the feature is missing.
+            color_by = "cluster"
+
+    # ── Always draw controls in grey first (consistent across modes) ────
+    ctrl_idxs = np.where(is_ctrl)[0].tolist()
     if ctrl_idxs:
         for exp_type in ("knockdown", "drug"):
-            sel = [i for i in ctrl_idxs if meta_rows[i]["experiment_type"] == exp_type]
+            sel = [i for i in ctrl_idxs if exp_types[i] == exp_type]
             if not sel:
                 continue
             symbol = "circle" if exp_type == "knockdown" else "triangle-up"
-            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
-            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
-            fig.add_trace(
-                go.Scatter(
-                    x=embedding[sel, 0], y=embedding[sel, 1],
-                    mode="markers",
-                    name="control",
-                    legendgroup="control",
-                    showlegend=(exp_type == "knockdown"),
-                    marker=dict(
-                        size=sizes,
-                        color=_CONTROL_COLOR,
-                        symbol=symbol,
-                        line=dict(width=line_widths, color="black"),
-                    ),
-                    hovertext=[hover_text[i] for i in sel],
-                    hoverinfo="text",
+            fig.add_trace(go.Scatter(
+                x=embedding[sel, 0], y=embedding[sel, 1],
+                mode="markers",
+                name="control",
+                legendgroup="control",
+                showlegend=(exp_type == "knockdown"),
+                marker=dict(
+                    size=sizes[sel].tolist(),
+                    color=_CONTROL_COLOR,
+                    symbol=symbol,
+                    line=dict(width=line_widths[sel].tolist(), color="black"),
                 ),
-            )
+                hovertext=[hover_text[i] for i in sel],
+                hoverinfo="text",
+            ))
 
-    for cl in sorted(set(labels_cluster)):
-        idxs = [
-            i for i, _ in enumerate(meta_rows)
-            if labels_cluster[i] == cl and not meta_rows[i]["is_control"]
-        ]
-        if not idxs:
-            continue
-        color = "#cccccc" if cl == -1 else palette[cl % len(palette)]
-        name = "noise" if cl == -1 else f"cluster {cl}"
-        for exp_type in ("knockdown", "drug"):
-            sel = [i for i in idxs if meta_rows[i]["experiment_type"] == exp_type]
-            if not sel:
+    non_ctrl_idxs = np.where(~is_ctrl)[0].tolist()
+
+    if color_by == "cluster":
+        for cl in sorted(set(labels_cluster)):
+            grp = [i for i in non_ctrl_idxs if labels_cluster[i] == cl]
+            if not grp:
                 continue
-            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
-            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
-            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
-            fig.add_trace(
-                go.Scatter(
+            color = "#cccccc" if cl == -1 else _CATEGORICAL_PALETTE[cl % len(_CATEGORICAL_PALETTE)]
+            name = "noise" if cl == -1 else f"cluster {cl}"
+            for exp_type in ("knockdown", "drug"):
+                sel = [i for i in grp if exp_types[i] == exp_type]
+                if not sel:
+                    continue
+                symbol = "circle" if exp_type == "knockdown" else "triangle-up"
+                fig.add_trace(go.Scatter(
                     x=embedding[sel, 0], y=embedding[sel, 1],
                     mode="markers",
                     name=f"{name} ({exp_type})" if exp_type == "drug" else name,
                     legendgroup=f"cl{cl}",
                     showlegend=(exp_type == "knockdown"),
                     marker=dict(
-                        size=sizes,
+                        size=sizes[sel].tolist(),
                         color=color,
                         symbol=symbol,
-                        line=dict(width=line_widths, color="black"),
+                        line=dict(width=line_widths[sel].tolist(), color="black"),
                     ),
                     hovertext=[hover_text[i] for i in sel],
                     hoverinfo="text",
+                ))
+
+    elif color_by == "run_id":
+        run_ids = [meta_rows[i]["run_id"] or "(unknown)" for i in non_ctrl_idxs]
+        unique_runs = sorted(set(run_ids))
+        for k, rid in enumerate(unique_runs):
+            grp = [non_ctrl_idxs[j] for j, r in enumerate(run_ids) if r == rid]
+            color = _CATEGORICAL_PALETTE[k % len(_CATEGORICAL_PALETTE)]
+            for exp_type in ("knockdown", "drug"):
+                sel = [i for i in grp if exp_types[i] == exp_type]
+                if not sel:
+                    continue
+                symbol = "circle" if exp_type == "knockdown" else "triangle-up"
+                fig.add_trace(go.Scatter(
+                    x=embedding[sel, 0], y=embedding[sel, 1],
+                    mode="markers",
+                    name=f"{rid} ({exp_type})" if exp_type == "drug" else rid,
+                    legendgroup=f"run_{rid}",
+                    showlegend=(exp_type == "knockdown"),
+                    marker=dict(
+                        size=sizes[sel].tolist(),
+                        color=color,
+                        symbol=symbol,
+                        line=dict(width=line_widths[sel].tolist(), color="black"),
+                    ),
+                    hovertext=[hover_text[i] for i in sel],
+                    hoverinfo="text",
+                ))
+
+    elif color_by == "feature":
+        # One trace per experiment type, coloured continuously along
+        # the chosen feature's S-score. Plotly only renders one
+        # colorbar per figure, so all non-control traces share the
+        # ``coloraxis``.
+        feature_vals = profiles[feature_col].values
+        for exp_type in ("knockdown", "drug"):
+            sel = [i for i in non_ctrl_idxs if exp_types[i] == exp_type]
+            if not sel:
+                continue
+            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
+            fig.add_trace(go.Scatter(
+                x=embedding[sel, 0], y=embedding[sel, 1],
+                mode="markers",
+                name=exp_type,
+                showlegend=True,
+                marker=dict(
+                    size=sizes[sel].tolist(),
+                    color=feature_vals[sel].tolist(),
+                    coloraxis="coloraxis",
+                    symbol=symbol,
+                    line=dict(width=line_widths[sel].tolist(), color="black"),
                 ),
-            )
+                hovertext=[hover_text[i] for i in sel],
+                hoverinfo="text",
+            ))
+        fig.update_layout(coloraxis=dict(
+            colorscale="Viridis",
+            colorbar=dict(
+                title=dict(text=feature_col, side="right"),
+                thickness=12, len=0.7,
+            ),
+        ))
 
     fig.update_layout(
         title=dict(text=title, x=0.5, xanchor="center"),
@@ -761,18 +837,46 @@ def _plot_condition_plotly(
     return fig
 
 
+def library_feature_columns(
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+) -> list[str]:
+    """Return the S-score feature column names that ``render_library_html``
+    would expose for ``color_by="feature"``. Empty list if the library
+    has no matching runs.
+    """
+    from .feature_library import FeatureLibrary
+
+    try:
+        lib = FeatureLibrary(library_dir)
+        df_lib = lib.load_species(species)
+    except Exception:  # noqa: BLE001
+        return []
+    if df_lib.empty:
+        return []
+    morph_cols = _select_morphology_cols(df_lib)
+    if len(morph_cols) < 3:
+        return []
+    # The S-score profile concatenates means + CVs.
+    return list(morph_cols) + [c + "_CV" for c in morph_cols]
+
+
 def render_library_html(
     out_path: "Path",
     *,
     library_dir: "Path | None" = None,
     species: str = "",
+    color_by: str = "cluster",
+    feature_col: str | None = None,
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
     Useful for the Analysis page's default view: shows each
     (run, condition) S-score profile as a point, with hover info and
-    cluster colouring. Returns the written path, or ``None`` if the
-    library has no usable data for *species*.
+    a configurable colouring (``cluster`` / ``run_id`` / ``feature``).
+    Returns the written path, or ``None`` if the library has no usable
+    data for *species*.
     """
     import pandas as pd
 
@@ -840,7 +944,10 @@ def render_library_html(
     title = (
         f"Feature library — {n_runs} run(s), species: {species or 'all'}"
     )
-    fig = _plot_condition_plotly(profiles, embedding, lbl_cluster, meta, title)
+    fig = _plot_condition_plotly(
+        profiles, embedding, lbl_cluster, meta, title,
+        color_by=color_by, feature_col=feature_col,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_path, include_plotlyjs=True, full_html=True)
     return out_path
