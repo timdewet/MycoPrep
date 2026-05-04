@@ -812,6 +812,14 @@ class MainWindow(QMainWindow):
         # Outputs now exist on disk for stages that just ran — re-evaluate so
         # any newly-produced output sets its sidebar dot green.
         self._recompute_stage_readiness()
+        # The Features stage may have just registered a new run in the
+        # feature library — refresh the Analysis page's interactive plot
+        # so it reflects the new data on next visit (or right now if the
+        # user is already on the Analysis tab).
+        try:
+            self.analysis_panel.on_pipeline_finished()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_run_all_failed(self, msg: str) -> None:
         self._run_active = False

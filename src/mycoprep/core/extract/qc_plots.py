@@ -600,61 +600,20 @@ def _condition_meta_table(
 _CONTROL_COLOR = "#9aa0a6"   # mid-grey, distinguishable in both light and dark
 
 
-def _plot_condition_panels_static(
-    profiles, embedding, labels_cluster, meta_rows,
-    title, ax_left, ax_right,
+def _plot_condition_panel_static(
+    profiles, embedding, labels_cluster, meta_rows, title, ax,
 ):
-    """Static matplotlib version: condition-colored | cluster-colored.
-
-    Controls are rendered in grey on both panels so the baseline reference
-    is visually consistent across the two views.
+    """Static matplotlib version: cluster-colored scatter with hover-style
+    annotations for the current run. Controls are always grey, regardless
+    of cluster assignment, so the baseline reference is visually distinct.
     """
     import numpy as np
 
-    cmap = __import__("matplotlib").colormaps.get_cmap("tab20")
     cmap_cl = __import__("matplotlib").colormaps.get_cmap("tab10")
     markers = {"knockdown": "o", "drug": "^"}
 
-    # Stable color per non-control condition (controls all share grey).
-    cond_index: dict[str, int] = {}
-    for r in meta_rows:
-        if not r["is_control"]:
-            cond_index.setdefault(r["condition"], len(cond_index))
-
     has_control = any(r["is_control"] for r in meta_rows)
 
-    # --- Left: condition-colored, shaped by experiment type ---
-    for i, r in enumerate(meta_rows):
-        marker = markers.get(r["experiment_type"], "o")
-        is_curr = r["is_current_run"]
-        s = 90 if is_curr else 35
-        alpha = 0.95 if is_curr else 0.5
-        ec = "black" if is_curr else "none"
-        color = (
-            _CONTROL_COLOR
-            if r["is_control"]
-            else cmap(cond_index[r["condition"]] % 20)
-        )
-        ax_left.scatter(
-            embedding[i, 0], embedding[i, 1],
-            s=s, alpha=alpha, color=color,
-            marker=marker, edgecolors=ec, linewidths=0.8,
-        )
-        if is_curr:
-            ax_left.annotate(
-                r["condition"], (embedding[i, 0], embedding[i, 1]),
-                fontsize=6, alpha=0.8,
-                xytext=(4, 4), textcoords="offset points",
-            )
-    if has_control:
-        ax_left.scatter([], [], color=_CONTROL_COLOR, label="control", marker="o")
-        ax_left.legend(fontsize=7, frameon=False, loc="best")
-    ax_left.set_title(f"{title} — by condition", fontsize=10)
-    ax_left.set_xlabel("Component 1"); ax_left.set_ylabel("Component 2")
-    for sp in ("top", "right"):
-        ax_left.spines[sp].set_visible(False)
-
-    # --- Right: cluster-colored (controls still grey, override cluster) ---
     seen_legend: set[str] = set()
     for cl in sorted(set(labels_cluster)):
         mask = np.array(labels_cluster) == cl
@@ -665,46 +624,44 @@ def _plot_condition_panels_static(
             marker = markers.get(r["experiment_type"], "o")
             is_curr = r["is_current_run"]
             color = _CONTROL_COLOR if r["is_control"] else cluster_color
-            ax_right.scatter(
+            ax.scatter(
                 embedding[i, 0], embedding[i, 1],
                 s=90 if is_curr else 35, alpha=0.85,
                 color=color, marker=marker,
                 edgecolors="black" if is_curr else "none",
                 linewidths=0.6,
             )
-        # Legend entry for the cluster — drawn from a non-control swatch.
+            if is_curr:
+                ax.annotate(
+                    r["condition"], (embedding[i, 0], embedding[i, 1]),
+                    fontsize=6, alpha=0.8,
+                    xytext=(4, 4), textcoords="offset points",
+                )
         if cluster_label not in seen_legend:
-            ax_right.scatter([], [], color=cluster_color, label=cluster_label, marker="o")
+            ax.scatter([], [], color=cluster_color, label=cluster_label, marker="o")
             seen_legend.add(cluster_label)
-    if has_control and "control" not in seen_legend:
-        ax_right.scatter([], [], color=_CONTROL_COLOR, label="control", marker="o")
-    ax_right.set_title(f"{title} — by cluster", fontsize=10)
-    ax_right.set_xlabel("Component 1"); ax_right.set_ylabel("Component 2")
-    ax_right.legend(fontsize=7, frameon=False, loc="best")
+    if has_control:
+        ax.scatter([], [], color=_CONTROL_COLOR, label="control", marker="o")
+    ax.set_xlabel("Component 1"); ax.set_ylabel("Component 2")
+    ax.legend(fontsize=7, frameon=False, loc="best")
     for sp in ("top", "right"):
-        ax_right.spines[sp].set_visible(False)
+        ax.spines[sp].set_visible(False)
 
 
 def _plot_condition_plotly(
     profiles, embedding, labels_cluster, meta_rows, title,
     top_features_per_point: int = 5,
 ):
-    """Build an interactive Plotly figure (two side-by-side scatter plots).
-
-    Returns a ``plotly.graph_objects.Figure`` ready to ``write_html``.
-    Hover shows: condition, run_id, experiment_type, # cells, top S-scores.
-    Controls are drawn in grey on both panels so the baseline reference
-    is visually consistent.
+    """Build an interactive Plotly figure: a single cluster-colored
+    scatter. Returns a ``plotly.graph_objects.Figure`` ready to
+    ``write_html``. Hover shows condition, run_id, experiment_type,
+    # cells, and the top |S-score| features. Controls are always grey,
+    regardless of cluster assignment.
     """
     import numpy as np
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 
-    fig = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=(f"{title} — by condition", f"{title} — by cluster"),
-        horizontal_spacing=0.08,
-    )
+    fig = go.Figure()
 
     # Pre-compute hover text per profile row: top abs(S) features.
     hover_text = []
@@ -725,9 +682,12 @@ def _plot_condition_plotly(
         )
         hover_text.append(ht)
 
-    # --- Left: condition-colored (controls greyed) ---
-    # Draw a single grey trace for all controls first so they share a
-    # legend entry; then per-condition traces for non-controls.
+    palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
+
+    # Controls first so they sit in the legend before clusters.
     ctrl_idxs = [i for i, r in enumerate(meta_rows) if r["is_control"]]
     if ctrl_idxs:
         for exp_type in ("knockdown", "drug"):
@@ -753,71 +713,6 @@ def _plot_condition_plotly(
                     hovertext=[hover_text[i] for i in sel],
                     hoverinfo="text",
                 ),
-                row=1, col=1,
-            )
-
-    non_ctrl_conditions = sorted({
-        r["condition"] for r in meta_rows if not r["is_control"]
-    })
-    for cond in non_ctrl_conditions:
-        idxs = [i for i, r in enumerate(meta_rows)
-                if r["condition"] == cond and not r["is_control"]]
-        for exp_type in ("knockdown", "drug"):
-            sel = [i for i in idxs if meta_rows[i]["experiment_type"] == exp_type]
-            if not sel:
-                continue
-            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
-            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
-            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
-            fig.add_trace(
-                go.Scatter(
-                    x=embedding[sel, 0], y=embedding[sel, 1],
-                    mode="markers",
-                    name=f"{cond} ({exp_type})" if exp_type == "drug" else cond,
-                    legendgroup=cond,
-                    showlegend=(exp_type == "knockdown"),
-                    marker=dict(
-                        size=sizes,
-                        symbol=symbol,
-                        line=dict(width=line_widths, color="black"),
-                    ),
-                    hovertext=[hover_text[i] for i in sel],
-                    hoverinfo="text",
-                ),
-                row=1, col=1,
-            )
-
-    # --- Right: cluster-colored (controls still grey) ---
-    palette = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    ]
-
-    if ctrl_idxs:
-        for exp_type in ("knockdown", "drug"):
-            sel = [i for i in ctrl_idxs if meta_rows[i]["experiment_type"] == exp_type]
-            if not sel:
-                continue
-            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
-            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
-            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
-            fig.add_trace(
-                go.Scatter(
-                    x=embedding[sel, 0], y=embedding[sel, 1],
-                    mode="markers",
-                    name="control",
-                    legendgroup="ctrl-r",
-                    showlegend=(exp_type == "knockdown"),
-                    marker=dict(
-                        size=sizes,
-                        color=_CONTROL_COLOR,
-                        symbol=symbol,
-                        line=dict(width=line_widths, color="black"),
-                    ),
-                    hovertext=[hover_text[i] for i in sel],
-                    hoverinfo="text",
-                ),
-                row=1, col=2,
             )
 
     for cl in sorted(set(labels_cluster)):
@@ -852,7 +747,6 @@ def _plot_condition_plotly(
                     hovertext=[hover_text[i] for i in sel],
                     hoverinfo="text",
                 ),
-                row=1, col=2,
             )
 
     fig.update_layout(
@@ -861,9 +755,9 @@ def _plot_condition_plotly(
         margin=dict(l=40, r=20, t=80, b=40),
         legend=dict(font=dict(size=10)),
         plot_bgcolor="white",
+        xaxis=dict(title="Component 1", showgrid=True, gridcolor="#eee"),
+        yaxis=dict(title="Component 2", showgrid=True, gridcolor="#eee"),
     )
-    fig.update_xaxes(title_text="Component 1", showgrid=True, gridcolor="#eee")
-    fig.update_yaxes(title_text="Component 2", showgrid=True, gridcolor="#eee")
     return fig
 
 
@@ -966,10 +860,10 @@ def _render_clustering_figure(
 
     embedding, lbl_cluster = _embed_profiles(profiles)
 
-    # Static PNG (1×2 panels)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    _plot_condition_panels_static(
-        profiles, embedding, lbl_cluster, meta_rows, title, axes[0], axes[1],
+    # Static PNG (single panel — cluster-colored)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+    _plot_condition_panel_static(
+        profiles, embedding, lbl_cluster, meta_rows, title, ax,
     )
     fig.suptitle(title, fontsize=13, y=1.0)
     fig.tight_layout()
