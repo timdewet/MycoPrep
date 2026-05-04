@@ -126,6 +126,9 @@ def library_add(
     run_id: str = typer.Option(
         "", help="Run ID. Defaults to parent directory name."
     ),
+    controls: str = typer.Option(
+        "", "--controls", help="Comma-separated control labels (e.g. 'NT1,NT2,WT')."
+    ),
     library_dir: str = typer.Option(
         "", "--dir", help="Library directory."
     ),
@@ -148,6 +151,7 @@ def library_add(
         features_parquet=pq,
         species=species,
         experiment_type=experiment_type,
+        control_labels=controls,
     )
     typer.echo(f"Registered '{rid}' ({species or 'unknown'}, {experiment_type}) in library.")
 
@@ -159,22 +163,27 @@ def library_update(
     experiment_type: str = typer.Option(
         "", "--type", help="New experiment type (knockdown / drug)."
     ),
+    controls: str = typer.Option(
+        None, "--controls",
+        help="New control labels (comma-separated). Pass empty string to clear.",
+    ),
     library_dir: str = typer.Option(
         "", "--dir", help="Library directory."
     ),
 ) -> None:
-    """Update species and/or experiment type for a registered run."""
+    """Update species, experiment type, and/or control labels for a run."""
     from pathlib import Path
     from .extract.feature_library import FeatureLibrary
 
-    if not species and not experiment_type:
-        typer.echo("Provide --species and/or --type to update.")
+    if not species and not experiment_type and controls is None:
+        typer.echo("Provide --species, --type, and/or --controls to update.")
         raise typer.Exit(code=1)
     lib = FeatureLibrary(Path(library_dir) if library_dir else None)
     if lib.update_run(
         run_id,
         species=species or None,
         experiment_type=experiment_type or None,
+        control_labels=controls,
     ):
         typer.echo(f"Updated '{run_id}'.")
     else:

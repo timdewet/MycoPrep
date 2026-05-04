@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -25,6 +26,7 @@ class LayoutPanel(QWidget):
     # True when the layout has at least one active well AND validates
     # clean; False otherwise. Drives the sidebar status indicator.
     layoutValidityChanged = pyqtSignal(bool)
+    controlLabelsChanged = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -68,6 +70,26 @@ class LayoutPanel(QWidget):
         toolbar.addWidget(self._status_label)
 
         root.addWidget(toolbar_card)
+
+        # Controls field (S-score baseline)
+        controls_card = QFrame()
+        controls_card.setObjectName("card")
+        controls_row = QHBoxLayout(controls_card)
+        controls_row.setContentsMargins(tokens.S3, tokens.S2, tokens.S3, tokens.S2)
+        controls_row.setSpacing(tokens.S2)
+        controls_row.addWidget(QLabel("Control labels:"))
+        self._control_labels = QLineEdit()
+        self._control_labels.setPlaceholderText("e.g. NT1, NT2, WT, DMSO")
+        self._control_labels.setToolTip(
+            "Comma-separated mutant tokens to treat as controls for S-score "
+            "normalisation. Whole-word case-insensitive match against the "
+            "mutant value of each well. Overrides the Input panel's "
+            "Control labels field for plate runs."
+        )
+        self._control_labels.textChanged.connect(self.controlLabelsChanged.emit)
+        controls_row.addWidget(self._control_labels, stretch=1)
+        root.addWidget(controls_card)
+
         root.addWidget(self._editor, stretch=1)
 
         self._czi_path: Path | None = None
@@ -241,3 +263,19 @@ class LayoutPanel(QWidget):
     @property
     def layout_model(self) -> PlateLayout:
         return self._editor.layout_model
+
+    @property
+    def control_labels(self) -> str:
+        return self._control_labels.text().strip()
+
+    def set_control_labels(self, text: str) -> None:
+        self._control_labels.setText(text or "")
+
+    def state(self) -> dict:
+        return {"control_labels": self._control_labels.text()}
+
+    def restore_state(self, s: dict) -> None:
+        if isinstance(s, dict):
+            ctrl = s.get("control_labels")
+            if ctrl is not None:
+                self._control_labels.setText(str(ctrl))

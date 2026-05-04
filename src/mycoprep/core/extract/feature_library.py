@@ -32,6 +32,7 @@ _INDEX_COLUMNS = [
     "species",
     "experiment_type",
     "condition_labels",
+    "control_labels",
     "n_cells",
     "n_conditions",
     "source_czi",
@@ -78,6 +79,7 @@ class FeatureLibrary:
         experiment_type: str,
         source_czi: str = "",
         acquisition_datetime: str = "",
+        control_labels: str = "",
     ) -> None:
         """Copy run features into the library and update the index."""
         features_parquet = Path(features_parquet)
@@ -101,6 +103,7 @@ class FeatureLibrary:
                     "species": species or "unknown",
                     "experiment_type": experiment_type,
                     "condition_labels": ",".join(sorted(conditions)),
+                    "control_labels": control_labels or "",
                     "n_cells": len(df),
                     "n_conditions": len(conditions),
                     "source_czi": source_czi,
@@ -113,7 +116,11 @@ class FeatureLibrary:
             ]
         )
         idx = pd.concat([idx, new_row], ignore_index=True)
-        self._write_index(idx)
+        # Ensure schema parity with new columns when reading older indexes.
+        for col in _INDEX_COLUMNS:
+            if col not in idx.columns:
+                idx[col] = ""
+        self._write_index(idx[_INDEX_COLUMNS])
 
     def load_species(self, species: str) -> pd.DataFrame:
         """Load all cell features for *species* across registered runs."""
@@ -167,8 +174,9 @@ class FeatureLibrary:
         run_id: str,
         species: Optional[str] = None,
         experiment_type: Optional[str] = None,
+        control_labels: Optional[str] = None,
     ) -> bool:
-        """Update species and/or experiment_type for an existing run.
+        """Update species, experiment_type, and/or control_labels.
 
         Returns True if the run was found and at least one field updated.
         """
@@ -180,6 +188,10 @@ class FeatureLibrary:
             idx.loc[mask, "species"] = species
         if experiment_type is not None:
             idx.loc[mask, "experiment_type"] = experiment_type
+        if control_labels is not None:
+            if "control_labels" not in idx.columns:
+                idx["control_labels"] = ""
+            idx.loc[mask, "control_labels"] = control_labels
         self._write_index(idx)
         return True
 

@@ -413,6 +413,7 @@ class MainWindow(QMainWindow):
             s.setValue("window/nav_index", self._stack.currentIndex())
             s.setValue("window/main_splitter", self._main_splitter.saveState())
             s.setValue("input_panel", json.dumps(self.input_panel.state()))
+            s.setValue("layout_panel", json.dumps(self.layout_panel.state()))
             s.setValue("focus_panel", json.dumps(self.focus_panel.state()))
             s.setValue("segment_panel", json.dumps(self.segment_panel.state()))
             s.setValue("classify_panel", json.dumps(self.classify_panel.state()))
@@ -450,6 +451,7 @@ class MainWindow(QMainWindow):
             print(f"[mycoprep] live_preview restore failed: {e}", file=sys.stderr)
         for key, panel in (
             ("input_panel",    self.input_panel),
+            ("layout_panel",   self.layout_panel),
             ("focus_panel",    self.focus_panel),
             ("segment_panel",  self.segment_panel),
             ("classify_panel", self.classify_panel),
@@ -768,6 +770,18 @@ class MainWindow(QMainWindow):
         text = (text or "").strip()
         self.analysis_panel.set_library_dir(Path(text) if text else None)
 
+    def _resolve_control_labels(self, mode: InputMode) -> str:
+        """Pick the user-typed control labels from the appropriate panel.
+
+        Plate runs prefer the LayoutPanel's value (it lives next to the
+        well editor), falling back to the InputPanel. Single-file / bulk
+        runs only use the InputPanel.
+        """
+        if mode == InputMode.SINGLE_PLATE:
+            return (self.layout_panel.control_labels
+                    or self.input_panel.control_labels)
+        return self.input_panel.control_labels
+
     def _open_library_browser(self) -> None:
         # Use the library_dir currently configured in the FeaturesPanel.
         lib_dir_text = self.features_panel.library_dir.text().strip()
@@ -823,6 +837,8 @@ class MainWindow(QMainWindow):
             if czi is None or not czi_paths:
                 QMessageBox.warning(self, "Missing input", "Select a CZI file.")
                 return
+            features_opts = self.features_panel.opts()
+            features_opts.control_labels = self._resolve_control_labels(mode)
             ctx = RunContext(
                 czi_path=czi,
                 czi_paths=list(czi_paths),
@@ -836,7 +852,7 @@ class MainWindow(QMainWindow):
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
-                features_opts=self.features_panel.opts(),
+                features_opts=features_opts,
                 phase_channel=(self.input_panel.phase_channel
                                if isinstance(self.input_panel.phase_channel, int) else 0),
                 channel_labels=self.input_panel.channel_labels,
@@ -851,6 +867,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Validation failed", "\n".join(issues))
                 return
             entries = bulk.active_rows().to_dict(orient="records")
+            features_opts = self.features_panel.opts()
+            features_opts.control_labels = self._resolve_control_labels(mode)
             ctx = BulkRunContext(
                 czi_entries=entries,
                 output_dir=out,
@@ -861,7 +879,7 @@ class MainWindow(QMainWindow):
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
-                features_opts=self.features_panel.opts(),
+                features_opts=features_opts,
                 phase_channel=(self.input_panel.phase_channel
                                if isinstance(self.input_panel.phase_channel, int) else 0),
                 channel_labels=self.input_panel.channel_labels,

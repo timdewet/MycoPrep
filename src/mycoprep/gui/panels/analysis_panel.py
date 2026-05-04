@@ -90,6 +90,15 @@ class AnalysisPanel(QWidget):
         )
         cluster_form.addRow("Run label:", self._run_id)
 
+        self._control_labels = QLineEdit()
+        self._control_labels.setPlaceholderText("e.g. NT1, NT2, WT, DMSO")
+        self._control_labels.setToolTip(
+            "Comma-separated mutant tokens to treat as controls when "
+            "computing S-scores. Leave blank to fall back to a global "
+            "z-score (no control anchor)."
+        )
+        cluster_form.addRow("Control labels:", self._control_labels)
+
         action_row = QHBoxLayout()
         self._run_btn = QPushButton("Generate clustering plots")
         self._run_btn.clicked.connect(self._run_clustering)
@@ -165,6 +174,10 @@ class AnalysisPanel(QWidget):
         species = self._species.currentText().strip()
         run_id = self._run_id.text().strip() or _default_run_id(feat_dir)
         library_dir = self._library_browser._library_dir
+        control_labels = [
+            t.strip() for t in self._control_labels.text().split(",")
+            if t and t.strip()
+        ]
 
         self._status.setText("Running clustering\u2026")
         self._run_btn.setEnabled(False)
@@ -179,6 +192,7 @@ class AnalysisPanel(QWidget):
                 library_dir=library_dir,
                 species=species,
                 current_run_id=run_id,
+                control_labels=control_labels,
                 progress_cb=cb,
             )
         except Exception as e:  # noqa: BLE001

@@ -49,6 +49,13 @@ def _scaled_cb(outer: ProgressCB, base: float, span: float) -> ProgressCB:
     return inner
 
 
+def _parse_control_labels(text: str) -> list[str]:
+    """Comma-separated control labels → list of stripped non-empty tokens."""
+    if not text:
+        return []
+    return [t.strip() for t in str(text).split(",") if t and t.strip()]
+
+
 def _iter_tiffs(directory: Path) -> list[Path]:
     """All TIFFs directly in *directory*, including OME-TIFFs (``*.ome.tiff``)."""
     paths: set[Path] = set()
@@ -591,6 +598,7 @@ class ExtractStage:
                     experiment_type=getattr(opts, "experiment_type", "knockdown"),
                     source_czi=source_czi,
                     acquisition_datetime=acq_dt,
+                    control_labels=getattr(opts, "control_labels", ""),
                 )
                 progress_cb(1.0, f"Registered run '{run_id}' in feature library")
             except Exception as e:  # noqa: BLE001
@@ -601,11 +609,15 @@ class ExtractStage:
         # for users who don't want the matplotlib import at end of run.
         if outputs and getattr(opts, "make_qc_plots", True):
             try:
+                control_labels = _parse_control_labels(
+                    getattr(opts, "control_labels", "")
+                )
                 make_qc_plots(
                     ctx.features_dir,
                     library_dir=library_dir,
                     species=getattr(opts, "species", ""),
                     current_run_id=run_id,
+                    control_labels=control_labels,
                     progress_cb=progress_cb,
                 )
             except Exception as e:  # noqa: BLE001

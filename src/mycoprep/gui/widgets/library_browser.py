@@ -52,6 +52,7 @@ class LibraryBrowser(QWidget):
         ("run_id", "Run ID"),
         ("species", "Species"),
         ("experiment_type", "Type"),
+        ("control_labels", "Controls"),
         ("n_cells", "# Cells"),
         ("n_conditions", "# Conds"),
         ("condition_labels", "Conditions"),
@@ -298,6 +299,7 @@ class LibraryBrowser(QWidget):
             return
         current_species = str(match.iloc[0].get("species", ""))
         current_type = str(match.iloc[0].get("experiment_type", "knockdown"))
+        current_controls = str(match.iloc[0].get("control_labels", "") or "")
 
         species_options = ["M. tuberculosis", "M. smegmatis"]
         try:
@@ -323,8 +325,22 @@ class LibraryBrowser(QWidget):
         if not ok:
             return
 
+        controls, ok = QInputDialog.getText(
+            self, "Edit controls",
+            f"Control labels for '{run_id}'\n"
+            f"(comma-separated, e.g. NT1, NT2, WT, DMSO):",
+            text=current_controls,
+        )
+        if not ok:
+            return
+
         lib = FeatureLibrary(self._library_dir)
-        lib.update_run(run_id, species=species, experiment_type=exp_type)
+        lib.update_run(
+            run_id,
+            species=species,
+            experiment_type=exp_type,
+            control_labels=controls,
+        )
         self.refresh()
         self.libraryChanged.emit()
 
@@ -386,6 +402,14 @@ class LibraryBrowser(QWidget):
         if not ok or not run_id.strip():
             return
 
+        controls, ok = QInputDialog.getText(
+            self, "Control labels",
+            "Comma-separated control labels (optional):\n"
+            "e.g. NT1, NT2, WT, DMSO",
+        )
+        if not ok:
+            return
+
         try:
             lib = FeatureLibrary(self._library_dir)
             lib.register_run(
@@ -393,6 +417,7 @@ class LibraryBrowser(QWidget):
                 features_parquet=Path(path),
                 species=species.strip(),
                 experiment_type=exp_type,
+                control_labels=controls.strip(),
             )
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Import failed", str(e))

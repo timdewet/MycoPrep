@@ -54,6 +54,7 @@ def make_qc_plots(
     library_dir: Optional[Path] = None,
     species: str = "",
     current_run_id: str = "",
+    control_labels: Optional[list[str]] = None,
     progress_cb: ProgressCB = _noop,
 ) -> Optional[Path]:
     """Generate QC plots in ``<features_dir>/qc_plots/`` from
@@ -345,6 +346,7 @@ def make_qc_plots(
             library_dir=library_dir,
             species=species,
             current_run_id=current_run_id,
+            control_labels=control_labels or [],
             progress_cb=progress_cb,
         )
     except Exception as e:  # noqa: BLE001
@@ -398,8 +400,41 @@ def _select_morphology_cols(df) -> list[str]:
     return selected
 
 
-def _compute_condition_sscores(df, morph_cols, condition_col="condition"):
-    """Compute per-condition S-score profiles (mean + CV, Z-scored vs controls)."""
+def _match_controls(condition_labels, control_labels: list[str]) -> "np.ndarray":
+    """Boolean mask: which entries in *condition_labels* are controls.
+
+    Each control_label is matched as a case-insensitive whole-word token
+    against the condition label. ``"NT1"`` matches ``"NT1 ATc-"`` but not
+    ``"mutNT11 ATc+"``. If *control_labels* is empty, no rows are flagged.
+    """
+    import re
+
+    import numpy as np
+
+    arr = np.array([str(c) for c in condition_labels])
+    if not control_labels:
+        return np.zeros(len(arr), dtype=bool)
+
+    tokens = [re.escape(c.strip()) for c in control_labels if c and c.strip()]
+    if not tokens:
+        return np.zeros(len(arr), dtype=bool)
+    pattern = r"\b(?:" + "|".join(tokens) + r")\b"
+    rx = re.compile(pattern, re.IGNORECASE)
+    return np.array([bool(rx.search(c)) for c in arr])
+
+
+def _compute_condition_sscores(
+    df, morph_cols, condition_col="condition",
+    control_labels: list[str] | None = None,
+):
+    """Compute per-condition S-score profiles (mean + CV, Z-scored vs controls).
+
+    Controls are identified explicitly via *control_labels* (e.g.
+    ``["NT1", "NT2", "WT"]``). If none of the conditions match any
+    control label, the function falls back to ``StandardScaler`` against
+    the full dataset — no longer a true S-score, but the resulting
+    geometry is still informative.
+    """
     import numpy as np
     import pandas as pd
 
@@ -413,10 +448,8 @@ def _compute_condition_sscores(df, morph_cols, condition_col="condition"):
 
     profiles = pd.concat([means, cvs], axis=1)
 
-    # Z-score vs controls (conditions containing "WT" or "DMSO" or ATc-)
-    control_mask = profiles.index.str.contains(
-        r"WT|DMSO|wildtype|control", case=False, regex=True
-    )
+    control_mask = _match_controls(profiles.index.tolist(), control_labels or [])
+
     if control_mask.any():
         ctrl = profiles.loc[control_mask]
         mu = ctrl.mean()
@@ -606,6 +639,7 @@ def _morphology_cluster_plots(
     library_dir=None,
     species="",
     current_run_id="",
+    control_labels: list[str] | None = None,
     progress_cb=_noop,
 ):
     """Generate solo and library clustering plots."""
@@ -657,7 +691,10 @@ def _morphology_cluster_plots(
     )
 
     # Condition-level solo
-    profiles_solo = _compute_condition_sscores(df_solo, morph_cols, "condition")
+    profiles_solo = _compute_condition_sscores(
+        df_solo, morph_cols, "condition",
+        control_labels=control_labels or [],
+    )
     if len(profiles_solo) >= 2:
         X_prof = profiles_solo.values
         n_cond = len(profiles_solo)
@@ -697,11 +734,23 @@ def _morphology_cluster_plots(
         from .feature_library import FeatureLibrary
         lib = FeatureLibrary(library_dir)
         df_lib = lib.load_species(species)
+        lib_index = lib.list_runs(species=species or None)
     except Exception:
         return
 
     if df_lib.empty:
         return
+
+    # Combine the current run's control_labels with any registered with
+    # library runs, so library-mode S-scores honour each registered run's
+    # own notion of what is/isn't a control.
+    combined_controls: list[str] = list(control_labels or [])
+    if "control_labels" in lib_index.columns:
+        for lbl in lib_index["control_labels"].dropna().astype(str).tolist():
+            for tok in lbl.split(","):
+                tok = tok.strip()
+                if tok and tok not in combined_controls:
+                    combined_controls.append(tok)
 
     progress_cb(0.92, "qc_plots: building library comparison figure")
 
@@ -767,7 +816,10 @@ def _morphology_cluster_plots(
     else:
         lib_types = None
 
-    profiles_lib = _compute_condition_sscores(combined, lib_morph_cols, "condition")
+    profiles_lib = _compute_condition_sscores(
+        combined, lib_morph_cols, "condition",
+        control_labels=combined_controls,
+    )
     if len(profiles_lib) >= 2:
         X_prof_lib = profiles_lib.values
         n_cond_lib = len(profiles_lib)

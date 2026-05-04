@@ -262,6 +262,24 @@ class InputPanel(QWidget):
         self._channels_form.addRow("Phase channel:", self._phase_combo)
 
         outer.addWidget(self._channels_box)
+
+        # ── Controls group (shared across all modes) ────────────────────
+        controls_box = QGroupBox("Controls (for S-score baseline)")
+        controls_form = QFormLayout(controls_box)
+        controls_form.setContentsMargins(16, 20, 16, 16)
+        controls_form.setHorizontalSpacing(14)
+        controls_form.setVerticalSpacing(8)
+        self._control_labels = QLineEdit()
+        self._control_labels.setPlaceholderText("e.g. NT1, NT2, WT, DMSO")
+        self._control_labels.setToolTip(
+            "Comma-separated mutant/condition tokens to treat as controls "
+            "for S-score normalisation. Whole-word case-insensitive match. "
+            "For plate-mode runs the Plate-layout panel can override this."
+        )
+        self._control_labels.textChanged.connect(lambda _t: self.channelsChanged.emit())
+        controls_form.addRow("Control labels:", self._control_labels)
+        outer.addWidget(controls_box)
+
         outer.addStretch(1)
 
         # Initial visibility
@@ -778,6 +796,11 @@ class InputPanel(QWidget):
     def phase_channel(self) -> int | str | None:
         return self._phase_combo.currentData()
 
+    @property
+    def control_labels(self) -> str:
+        """Comma-separated control labels typed by the user. Empty if unset."""
+        return self._control_labels.text().strip()
+
     # ──────────────────────────────────────────────────────── persistence
 
     def state(self) -> dict:
@@ -795,6 +818,7 @@ class InputPanel(QWidget):
             "output_dir": str(self._out_dir) if self._out_dir else "",
             "phase_channel": self._phase_combo.currentData(),
             "channel_labels": [e.text() for e in self._channel_name_edits],
+            "control_labels": self._control_labels.text(),
         }
 
     def restore_state(self, s: dict) -> None:
@@ -881,6 +905,10 @@ class InputPanel(QWidget):
                 if self._phase_combo.itemData(i) == phase:
                     self._phase_combo.setCurrentIndex(i)
                     break
+
+        ctrl = s.get("control_labels")
+        if ctrl is not None:
+            self._control_labels.setText(str(ctrl))
 
         # Notify listeners now that the panel reflects the saved state.
         self.channelsChanged.emit()
