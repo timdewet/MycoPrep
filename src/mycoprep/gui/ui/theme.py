@@ -450,9 +450,13 @@ QScrollBar::handle:horizontal {{
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
+/* Splitter handle: a thin visible line plus a few px of grab area on
+ * either side via padding so the user can actually drag it. Hover
+ * highlights so the affordance is obvious. */
 QSplitter::handle {{ background: {p.border}; }}
-QSplitter::handle:horizontal {{ width: 1px; }}
-QSplitter::handle:vertical   {{ height: 1px; }}
+QSplitter::handle:horizontal {{ width: 5px; margin: 0 -2px; }}
+QSplitter::handle:vertical   {{ height: 5px; margin: -2px 0; }}
+QSplitter::handle:hover {{ background: {p.text_subtle}; }}
 
 QFrame#card {{
     background: {p.surface};

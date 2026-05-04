@@ -312,7 +312,10 @@ class MainWindow(QMainWindow):
 
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._main_splitter.setChildrenCollapsible(False)
-        self._main_splitter.setHandleWidth(1)
+        # Wider handle than the visible line so the drag area is easy to
+        # grab — the stylesheet renders only the central pixel as a line
+        # but the hit zone extends a few px on either side.
+        self._main_splitter.setHandleWidth(6)
         self._main_splitter.addWidget(self._stack)
         self._main_splitter.addWidget(self.live_preview)
         # Default split: ~45% options, ~55% preview. Restored from
