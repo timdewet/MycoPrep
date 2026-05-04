@@ -25,7 +25,9 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMainWindow,
     QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QStackedLayout,
@@ -203,6 +205,48 @@ class _PlotOverlay(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class _CompareWorker(QObject):
+    """Render a per-feature comparison heatmap for a given gene set."""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        out_path: Path,
+        library_dir: Optional[Path],
+        species: str,
+        genes: list[str],
+        baseline_mode: str,
+    ) -> None:
+        super().__init__()
+        self._out_path = out_path
+        self._library_dir = library_dir
+        self._species = species
+        self._genes = list(genes)
+        self._baseline_mode = baseline_mode
+
+    def run(self) -> None:
+        try:
+            from mycoprep.core.extract.qc_plots import render_comparison_html
+
+            self.progress.emit(15, "Loading library\u2026")
+            self.progress.emit(40, "Computing S-scores\u2026")
+            self.progress.emit(75, "Building heatmap\u2026")
+            written = render_comparison_html(
+                self._out_path,
+                library_dir=self._library_dir,
+                species=self._species,
+                genes=self._genes,
+                baseline_mode=self._baseline_mode,
+            )
+            self.progress.emit(100, "Done")
+            self.finished.emit(written)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class _LibraryWorker(QObject):
     """Render the library-only Plotly HTML in a worker thread."""
 
@@ -265,9 +309,11 @@ class AnalysisPanel(QWidget):
 
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="mycoprep_analysis_"))
         self._library_html_path = self._tmp_dir / "library.html"
+        self._comparison_html_path = self._tmp_dir / "comparison.html"
         self._library_dir: Path | None = None
         self._worker_thread: QThread | None = None
         self._worker: QObject | None = None
+        self._compare_window: "_ComparisonWindow | None" = None
         # Cached library state (path, species, mtime) — avoid re-rendering
         # on tab switches when nothing has changed.
         self._last_library_state: tuple[Path | None, str, float] | None = None
@@ -335,6 +381,9 @@ class AnalysisPanel(QWidget):
         self._color_by = QComboBox()
         self._color_by.addItem("Cluster", userData="cluster")
         self._color_by.addItem("Run ID", userData="run_id")
+        self._color_by.addItem("Condition", userData="condition")
+        self._color_by.addItem("Reporter", userData="reporter")
+        self._color_by.addItem("Replica", userData="replica")
         self._color_by.addItem("Feature gradient\u2026", userData="feature")
         self._color_by.currentIndexChanged.connect(self._on_color_by_changed)
         colour_row.addWidget(self._color_by)
@@ -374,10 +423,18 @@ class AnalysisPanel(QWidget):
             "Highlight points whose mutant/gene matches the selected "
             "name(s); other points are dimmed. Empty = no highlighting."
         )
-        self._highlight_genes.selectionChanged.connect(
-            lambda _names: self._refresh_library_view(force=True)
-        )
+        self._highlight_genes.selectionChanged.connect(self._on_highlight_changed)
         colour_row.addWidget(self._highlight_genes)
+
+        self._compare_btn = QPushButton("Compare\u2026")
+        self._compare_btn.setToolTip(
+            "Open a per-feature S-score heatmap for the highlighted "
+            "gene(s) so you can see exactly where their profiles "
+            "diverge across runs / ATc states."
+        )
+        self._compare_btn.clicked.connect(self._open_comparison)
+        self._compare_btn.setEnabled(False)
+        colour_row.addWidget(self._compare_btn)
 
         colour_row.addStretch(1)
 
@@ -608,3 +665,63 @@ class AnalysisPanel(QWidget):
         url = self._web_view.url()
         if url.isValid():
             QDesktopServices.openUrl(url)
+
+    def _on_highlight_changed(self, names: list[str]) -> None:
+        # Compare button only makes sense once the user has picked some
+        # genes to compare. Otherwise prompt them via the disabled state.
+        self._compare_btn.setEnabled(bool(names))
+        self._refresh_library_view(force=True)
+
+    def _open_comparison(self) -> None:
+        genes = self._highlight_genes.selected()
+        if not genes:
+            QMessageBox.information(
+                self, "Pick genes first",
+                "Select one or more genes in \u201cHighlight gene(s)\u201d "
+                "to compare their per-feature S-scores.",
+            )
+            return
+        if self._is_busy():
+            return
+
+        species = self._species.currentText().strip()
+        baseline_mode = self._baseline_mode.currentData() or "pooled"
+
+        worker = _CompareWorker(
+            self._comparison_html_path,
+            self._library_dir, species, genes, baseline_mode,
+        )
+        self._start_worker(
+            worker,
+            on_finished=self._on_comparison_finished,
+            status="Building comparison heatmap\u2026",
+        )
+
+    def _on_comparison_finished(self, written: object) -> None:
+        if not written:
+            QMessageBox.information(
+                self, "Comparison empty",
+                "No matching profiles found for the selected gene(s) "
+                "in the current library / species.",
+            )
+            return
+        if self._compare_window is None:
+            self._compare_window = _ComparisonWindow(parent=self)
+        self._compare_window.set_html(Path(written))
+        self._compare_window.show()
+        self._compare_window.raise_()
+        self._compare_window.activateWindow()
+
+
+class _ComparisonWindow(QMainWindow):
+    """Popup window hosting the per-feature S-score heatmap."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Per-feature comparison")
+        self.resize(1200, 700)
+        self._view = QWebEngineView()
+        self.setCentralWidget(self._view)
+
+    def set_html(self, path: Path) -> None:
+        self._view.setUrl(QUrl.fromLocalFile(str(path)))

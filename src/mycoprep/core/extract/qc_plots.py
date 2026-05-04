@@ -602,8 +602,13 @@ def _condition_meta_table(
 ):
     """Resolve per-profile metadata used by the static + interactive plots.
 
-    Returns a list of dicts in profile order with: condition, run_id,
-    experiment_type, n_cells, is_current_run, is_control.
+    Returns a list of dicts in profile order with: condition, gene,
+    atc, reporter, replica, run_id, experiment_type, n_cells,
+    is_current_run, is_control.
+
+    The well-name convention is ``<atc>__<reporter>__<mutant>[__R<n>]``
+    (see ``crops.derive_condition_fields``); this helper recovers each
+    field from the underlying ``well`` column when present.
     """
     import pandas as pd
 
@@ -612,7 +617,9 @@ def _condition_meta_table(
         sub = combined_df[combined_df[label_col] == label]
         if sub.empty:
             rows.append({
-                "label": label, "condition": label, "run_id": "",
+                "label": label, "condition": label, "gene": "",
+                "atc": "", "reporter": "", "replica": "",
+                "run_id": "",
                 "experiment_type": "knockdown", "n_cells": 0,
                 "is_current_run": False, "is_control": False,
             })
@@ -629,12 +636,32 @@ def _condition_meta_table(
             else "knockdown"
         )
         is_current = bool(sub.get("_is_current_run", pd.Series([True])).any())
+
+        # Parse atc / reporter / mutant / replica from the well stem.
+        atc = reporter = replica = ""
+        if "well" in sub.columns:
+            well = str(sub["well"].iloc[0])
+            parts = [p for p in well.split("__")]
+            # Strip a focus-stage suffix like "_focused" if present.
+            parts = [p.replace("_focused", "") for p in parts]
+            if len(parts) > 0:
+                atc = parts[0]
+            if len(parts) > 1:
+                reporter = parts[1]
+            if len(parts) > 3:
+                p3 = parts[3]
+                if len(p3) > 1 and p3[0].lower() == "r" and p3[1:].isdigit():
+                    replica = p3[1:]
+                else:
+                    replica = p3
+
         # Gene is the first whitespace-separated token of the condition
-        # ("<gene> <ATc-/+>"). Stable enough that we don't need a
-        # separate column.
+        # ("<gene> <ATc-/+>").
         gene = str(cond).split()[0] if str(cond).strip() else ""
         rows.append({
-            "label": label, "condition": cond, "gene": gene, "run_id": run_id,
+            "label": label, "condition": cond, "gene": gene,
+            "atc": atc, "reporter": reporter, "replica": replica,
+            "run_id": run_id,
             "experiment_type": exp_type or "knockdown",
             "n_cells": int(len(sub)),
             "is_current_run": is_current,
@@ -840,11 +867,19 @@ def _plot_condition_plotly(
                     hoverinfo="text",
                 ))
 
-    elif color_by == "run_id":
-        run_ids = [meta_rows[i]["run_id"] or "(unknown)" for i in non_ctrl_idxs]
-        unique_runs = sorted(set(run_ids))
-        for k, rid in enumerate(unique_runs):
-            grp = [non_ctrl_idxs[j] for j, r in enumerate(run_ids) if r == rid]
+    elif color_by in ("run_id", "condition", "reporter", "replica"):
+        # Categorical colouring keyed on whatever meta-row attribute the
+        # user picked. Empty/missing values get bucketed under "(unknown)".
+        key = color_by
+        labels_per_point = [
+            meta_rows[i].get(key) or "(unknown)" for i in non_ctrl_idxs
+        ]
+        unique_labels = sorted(set(labels_per_point))
+        for k, val in enumerate(unique_labels):
+            grp = [
+                non_ctrl_idxs[j]
+                for j, r in enumerate(labels_per_point) if r == val
+            ]
             color = _CATEGORICAL_PALETTE[k % len(_CATEGORICAL_PALETTE)]
             for exp_type in ("knockdown", "drug"):
                 sel = [i for i in grp if exp_types[i] == exp_type]
@@ -854,8 +889,8 @@ def _plot_condition_plotly(
                 fig.add_trace(go.Scatter(
                     x=embedding[sel, 0], y=embedding[sel, 1],
                     mode="markers",
-                    name=f"{rid} ({exp_type})" if exp_type == "drug" else rid,
-                    legendgroup=f"run_{rid}",
+                    name=f"{val} ({exp_type})" if exp_type == "drug" else val,
+                    legendgroup=f"{key}_{val}",
                     showlegend=(exp_type == "knockdown"),
                     marker=dict(
                         size=sizes[sel].tolist(),
@@ -1010,6 +1045,184 @@ def library_feature_columns(
         return []
     # The S-score profile concatenates means + CVs.
     return list(morph_cols) + [c + "_CV" for c in morph_cols]
+
+
+def render_comparison_html(
+    out_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    genes: list[str] | None = None,
+    baseline_mode: str = "pooled",
+    top_features: int = 20,
+) -> "Path | None":
+    """Build an interactive horizontal-bar comparison of S-score profiles.
+
+    All (run, condition) profiles whose gene is in *genes* (plus all
+    controls) are drawn together so the user can see, feature-by-feature,
+    where the selected gene's instances diverge across runs / ATc states.
+
+    Features are ranked by *spread* (max - min of selected non-control
+    profiles) and the top *top_features* are shown. Returns the written
+    HTML path, or ``None`` if the library has no usable data.
+    """
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+
+    from .feature_library import FeatureLibrary
+
+    out_path = Path(out_path)
+    if not genes:
+        return None
+
+    try:
+        lib = FeatureLibrary(library_dir)
+        df_lib = lib.load_species(species)
+        lib_index = lib.list_runs(species=species or None)
+    except Exception:  # noqa: BLE001
+        return None
+    if df_lib.empty:
+        return None
+
+    morph_cols = _select_morphology_cols(df_lib)
+    if len(morph_cols) < 3:
+        return None
+
+    df_lib = df_lib.dropna(subset=morph_cols).copy()
+    if "condition" not in df_lib.columns:
+        if "well" in df_lib.columns:
+            parts = df_lib["well"].astype(str).str.split("__", expand=True)
+            atc_lib = parts[0].str.replace("_focused", "", regex=False)
+            mutant_lib = parts[2] if 2 in parts.columns else df_lib["well"].astype(str)
+            df_lib["condition"] = (
+                mutant_lib.astype(str) + " " + atc_lib.astype(str)
+            ).str.strip()
+        else:
+            df_lib["condition"] = "library"
+
+    df_lib["_run_id"] = df_lib.get("_library_run_id", "library").astype(str)
+    df_lib["_combined_label"] = (
+        df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str)
+    )
+
+    controls: list[str] = []
+    if "control_labels" in lib_index.columns:
+        for lbl in lib_index["control_labels"].dropna().astype(str).tolist():
+            for tok in lbl.split(","):
+                tok = tok.strip()
+                if tok and tok not in controls:
+                    controls.append(tok)
+
+    profiles = _compute_condition_sscores(
+        df_lib, morph_cols, "_combined_label",
+        control_labels=controls,
+        baseline_mode=baseline_mode,
+    )
+    if profiles.empty:
+        return None
+
+    # Split into selected (target) profiles and the run-matched controls.
+    gene_set = {g.strip() for g in genes if g and g.strip()}
+    is_target = []
+    is_control = []
+    for label in profiles.index:
+        cond = str(label).rsplit(" @ ", 1)[0]
+        gene = cond.split()[0] if cond.strip() else ""
+        is_target.append(gene in gene_set)
+        is_control.append(_match_controls([cond], controls)[0] if controls else False)
+    is_target = np.array(is_target)
+    is_control = np.array(is_control)
+
+    if not is_target.any():
+        return None
+
+    target_profiles = profiles.loc[is_target]
+    ctrl_profiles = profiles.loc[is_control]
+
+    # Rank features by spread among targets.
+    spread = target_profiles.max(axis=0) - target_profiles.min(axis=0)
+    top_feat_names = list(spread.sort_values(ascending=False).head(top_features).index)
+
+    # Heatmap: rows = features (top by spread), columns = profiles.
+    # Values are S-scores (already control-anchored). Diverging RdBu so
+    # +/- of the baseline read as opposite colours.
+    z = target_profiles[top_feat_names].T.values  # features × profiles
+    profile_labels = list(target_profiles.index)
+
+    # Symmetric colour limits about 0 so the diverging scale stays centred.
+    abs_max = float(np.nanmax(np.abs(z))) if z.size else 1.0
+    abs_max = max(abs_max, 1.0)
+
+    # Per-cell hover text including control range for context.
+    if not ctrl_profiles.empty:
+        ctrl_min = ctrl_profiles[top_feat_names].min(axis=0)
+        ctrl_max = ctrl_profiles[top_feat_names].max(axis=0)
+    else:
+        ctrl_min = pd.Series({f: float("nan") for f in top_feat_names})
+        ctrl_max = pd.Series({f: float("nan") for f in top_feat_names})
+
+    customdata = [
+        [
+            [
+                float(ctrl_min[feat]) if not np.isnan(ctrl_min[feat]) else 0.0,
+                float(ctrl_max[feat]) if not np.isnan(ctrl_max[feat]) else 0.0,
+            ]
+            for _ in profile_labels
+        ]
+        for feat in top_feat_names
+    ]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=profile_labels,
+            y=top_feat_names,
+            colorscale="RdBu_r",
+            zmid=0,
+            zmin=-abs_max,
+            zmax=abs_max,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "%{x}<br>"
+                "S-score: %{z:+.2f}<br>"
+                "control range: %{customdata[0]:+.2f} to %{customdata[1]:+.2f}"
+                "<extra></extra>"
+            ),
+            colorbar=dict(title=dict(text="S-score", side="right"), thickness=12),
+        )
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=f"Per-feature S-score heatmap — {', '.join(sorted(gene_set))} "
+                 f"({len(target_profiles)} profile(s), baseline: {baseline_mode})",
+            x=0.5, xanchor="center",
+        ),
+        autosize=True,
+        margin=dict(l=200, r=20, t=80, b=140),
+        plot_bgcolor="white",
+        xaxis=dict(
+            title="", tickangle=-30,
+            showgrid=False,
+        ),
+        yaxis=dict(
+            title="", autorange="reversed",
+            showgrid=False,
+        ),
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(
+        out_path,
+        include_plotlyjs=True,
+        full_html=True,
+        default_height="100vh",
+        config={"responsive": True},
+    )
+    _make_plot_html_fullheight(out_path)
+    return out_path
 
 
 def render_library_html(
