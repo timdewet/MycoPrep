@@ -331,6 +331,13 @@ class MainWindow(QMainWindow):
         self.live_preview.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
         )
+        # QStackedWidget reports its minimumSizeHint as the maximum across
+        # all child pages — and the Segment & Classify model inspector is
+        # 660 px wide, plus padding, so the stack would otherwise refuse
+        # to shrink below ~700 px regardless of which tab is showing.
+        # Cap the minimum so the user can drag the splitter freely.
+        self._stack.setMinimumWidth(200)
+        self.live_preview.setMinimumWidth(200)
         self._main_splitter.setSizes([1000, 1000])
         self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 1)
