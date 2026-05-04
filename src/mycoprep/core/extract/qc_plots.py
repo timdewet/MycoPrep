@@ -853,6 +853,32 @@ def _plot_condition_plotly(
             ),
         ))
 
+    # One label per highlighted gene at the centroid of its points.
+    # We use Plotly annotations (rather than textmode markers) so the
+    # label survives all colouring modes and stays readable when a gene
+    # has multiple points spread across runs.
+    if has_highlight:
+        for gene in sorted(highlight_set):
+            gene_idxs = [
+                i for i, r in enumerate(meta_rows)
+                if r.get("gene", "") == gene
+            ]
+            if not gene_idxs:
+                continue
+            cx = float(embedding[gene_idxs, 0].mean())
+            cy = float(embedding[gene_idxs, 1].mean())
+            fig.add_annotation(
+                x=cx, y=cy,
+                text=f"<b>{gene}</b>",
+                showarrow=False,
+                font=dict(size=12, color="#222"),
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="#444",
+                borderwidth=1,
+                borderpad=3,
+                yshift=16,
+            )
+
     fig.update_layout(
         title=dict(text=title, x=0.5, xanchor="center"),
         autosize=True,
