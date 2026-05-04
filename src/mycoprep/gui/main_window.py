@@ -201,10 +201,6 @@ class MainWindow(QMainWindow):
             segment_opts=self.segment_panel.opts,
             classify_opts=self.classify_panel.opts,
             features_opts=self.features_panel.opts,
-            # Pass the InputPanel's phase_channel through verbatim —
-            # ``None`` is the "auto-detect by skewness" sentinel, which
-            # the worker resolves from the actual image data once focus
-            # has loaded it.
             phase_channel=lambda: self.input_panel.phase_channel,
             channel_labels=lambda: self.input_panel.channel_labels,
         )
@@ -719,11 +715,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_channels_changed(self) -> None:
-        self.focus_panel.set_phase_channel(self.input_panel.phase_channel)
         ch = self.input_panel.phase_channel
-        ch_int = ch if isinstance(ch, int) else 0
-        self.label_train_panel.set_phase_channel(ch_int)
-        self.live_preview.set_phase_channel(ch_int)
+        self.focus_panel.set_phase_channel(ch)
+        self.label_train_panel.set_phase_channel(ch)
+        self.live_preview.set_phase_channel(ch)
         labels = self.input_panel.channel_labels or []
         self.features_panel.set_channels(list(labels))
 
@@ -918,8 +913,7 @@ class MainWindow(QMainWindow):
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
                 features_opts=features_opts,
-                phase_channel=(self.input_panel.phase_channel
-                               if isinstance(self.input_panel.phase_channel, int) else 0),
+                phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
             self._runner = PipelineRunner(
@@ -945,8 +939,7 @@ class MainWindow(QMainWindow):
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
                 features_opts=features_opts,
-                phase_channel=(self.input_panel.phase_channel
-                               if isinstance(self.input_panel.phase_channel, int) else 0),
+                phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
             self._runner = BulkPipelineRunner(

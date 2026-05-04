@@ -43,6 +43,29 @@ from ..pipeline.bulk_layout import COLUMNS as BULK_COLS
 from ..pipeline.bulk_layout import BulkLayout
 
 
+_PHASE_LABEL_TOKENS = ("phase", "bright", "brightfield", "tl", "dic")
+
+
+def _guess_phase_channel_index(names: list[str]) -> int:
+    """Pick the channel most likely to be the transmitted-light source.
+
+    Looks for whole-word matches against the common labels users give
+    that channel ("Phase", "Bright", "Brightfield", "TL", "DIC"). If
+    nothing matches, falls back to 0 — the first channel — which is
+    where most acquisition setups put it by default.
+    """
+    import re
+
+    pattern = re.compile(
+        r"\b(?:" + "|".join(_PHASE_LABEL_TOKENS) + r")\b",
+        re.IGNORECASE,
+    )
+    for i, n in enumerate(names):
+        if n and pattern.search(n):
+            return i
+    return 0 if names else 0
+
+
 class InputMode(Enum):
     SINGLE_FILE = "single_file"
     SINGLE_PLATE = "single_plate"
@@ -257,7 +280,6 @@ class InputPanel(QWidget):
         self._channels_form.setVerticalSpacing(8)
 
         self._phase_combo = QComboBox()
-        self._phase_combo.addItem("auto (detect by skewness)", userData=None)
         self._phase_combo.currentIndexChanged.connect(lambda _i: self.channelsChanged.emit())
         self._channels_form.addRow("Phase channel:", self._phase_combo)
 
@@ -688,7 +710,6 @@ class InputPanel(QWidget):
         self._original_channel_names.clear()
         self._phase_combo.blockSignals(True)
         self._phase_combo.clear()
-        self._phase_combo.addItem("auto (detect by skewness)", userData=None)
         self._phase_combo.blockSignals(False)
 
     def _on_reset_clicked(self) -> None:
@@ -730,7 +751,11 @@ class InputPanel(QWidget):
         self._phase_combo.blockSignals(True)
         for i, n in enumerate(names):
             self._phase_combo.addItem(f"{i}:  {n}", userData=i)
-        self._phase_combo.setCurrentIndex(0)
+        # Default the phase channel to whichever label looks like a
+        # transmitted-light channel ("Bright", "Phase", "TL", "DIC").
+        # Falls back to channel 0 if nothing matches.
+        default_idx = _guess_phase_channel_index(names)
+        self._phase_combo.setCurrentIndex(default_idx)
         self._phase_combo.blockSignals(False)
         for i, n in enumerate(names):
             edit = QLineEdit(n)
@@ -793,8 +818,14 @@ class InputPanel(QWidget):
                 for i, e in enumerate(self._channel_name_edits)]
 
     @property
-    def phase_channel(self) -> int | str | None:
-        return self._phase_combo.currentData()
+    def phase_channel(self) -> int:
+        """Index of the channel currently selected as the phase channel.
+
+        Always an int once channel rows have been populated. Returns 0
+        as a safe fallback before that (e.g. while the panel is empty).
+        """
+        data = self._phase_combo.currentData()
+        return int(data) if isinstance(data, int) else 0
 
     @property
     def control_labels(self) -> str:
