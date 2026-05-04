@@ -83,7 +83,14 @@ class _StatusBadge(QLabel):
 
 
 class _NavItem(QPushButton):
-    def __init__(self, text: str, icon_name: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        text: str,
+        icon_name: str,
+        parent: Optional[QWidget] = None,
+        *,
+        show_status: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("navItem")
         self.setCheckable(True)
@@ -91,7 +98,9 @@ class _NavItem(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._icon_name = icon_name
         self._label_text = text
-        self._dot = _StatusBadge(self)
+        self._dot: Optional[_StatusBadge] = (
+            _StatusBadge(self) if show_status else None
+        )
         self.setMinimumHeight(40)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         # Build the row as inner child widgets so we can explicitly control
@@ -112,7 +121,8 @@ class _NavItem(QPushButton):
         self._lbl.setStyleSheet("background: transparent;")
         layout.addWidget(self._lbl)
         layout.addStretch(1)
-        layout.addWidget(self._dot)
+        if self._dot is not None:
+            layout.addWidget(self._dot)
 
         self._refresh_icon()
         icons.on_theme_change(self._refresh_icon)
@@ -148,7 +158,8 @@ class _NavItem(QPushButton):
         self._refresh_icon()
 
     def set_status(self, s: StageStatus) -> None:
-        self._dot.set_status(s)
+        if self._dot is not None:
+            self._dot.set_status(s)
 
 
 @dataclass
@@ -156,6 +167,11 @@ class NavEntry:
     key: str
     label: str
     icon: str
+    # Whether this entry is part of the pipeline. Entries with
+    # ``pipeline=False`` skip the sidebar status dot and get a thin
+    # separator drawn above them, visually grouping them apart from
+    # the linear pipeline stages.
+    pipeline: bool = True
 
 
 class NavSidebar(QFrame):
@@ -180,11 +196,28 @@ class NavSidebar(QFrame):
         brand.setContentsMargins(tokens.S4, tokens.S2, tokens.S4, tokens.S4)
         root.addWidget(brand)
 
+        prev_was_pipeline = True
         for i, entry in enumerate(entries):
-            item = _NavItem(entry.label, entry.icon, self)
+            # Insert a thin grey separator the first time we transition
+            # from a pipeline entry to a non-pipeline entry.
+            if prev_was_pipeline and not entry.pipeline and i > 0:
+                divider = QFrame()
+                divider.setObjectName("navDivider")
+                divider.setFrameShape(QFrame.Shape.HLine)
+                divider.setFixedHeight(1)
+                divider.setStyleSheet(
+                    f"background-color: {tokens.active().border}; "
+                    f"margin: {tokens.S2}px {tokens.S4}px;"
+                )
+                root.addWidget(divider)
+            item = _NavItem(
+                entry.label, entry.icon, self,
+                show_status=entry.pipeline,
+            )
             item.clicked.connect(lambda _checked=False, idx=i: self._on_clicked(idx))
             root.addWidget(item)
             self._items.append(item)
+            prev_was_pipeline = entry.pipeline
 
         if self._items:
             self._items[0].setChecked(True)

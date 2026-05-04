@@ -72,7 +72,7 @@ NAV_ENTRIES = [
     NavEntry("segment",  "Segment & Classify", "segment"),
     NavEntry("features", "Features",           "features"),
     NavEntry("run",      "Run",                "run"),
-    NavEntry("analysis", "Analysis",           "analysis"),
+    NavEntry("analysis", "Analysis",           "analysis", pipeline=False),
 ]
 
 
