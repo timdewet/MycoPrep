@@ -426,14 +426,30 @@ def _match_controls(condition_labels, control_labels: list[str]) -> "np.ndarray"
 def _compute_condition_sscores(
     df, morph_cols, condition_col="condition",
     control_labels: list[str] | None = None,
+    baseline_mode: str = "pooled",
 ):
     """Compute per-condition S-score profiles (mean + CV, Z-scored vs controls).
 
     Controls are identified explicitly via *control_labels* (e.g.
-    ``["NT1", "NT2", "WT"]``). If none of the conditions match any
-    control label, the function falls back to ``StandardScaler`` against
-    the full dataset — no longer a true S-score, but the resulting
-    geometry is still informative.
+    ``["NT1", "NT2", "WT"]``).
+
+    ``baseline_mode``:
+      - ``"pooled"`` (default): every control profile across every run
+        contributes equally to a single (mu, sigma) baseline. Matches
+        the MorphologicalProfiling_Mtb R pipeline. Stable when each
+        run has few controls, but lets between-run variance leak into
+        sigma.
+      - ``"per_run"``: each run's controls form their own (mu_r,
+        sigma_r); perturbations are z-scored against their own run's
+        baseline. Removes batch effects between runs but requires
+        ≥ 2 control profiles per run for a non-degenerate sigma —
+        falls back to the pooled sigma for runs that don't qualify.
+        Requires the ``condition_col`` labels to encode run as
+        ``"<condition> @ <run_id>"``; otherwise behaves like pooled.
+
+    If no condition matches a control label, falls back to
+    ``StandardScaler`` against the full dataset — geometry stays
+    informative but values are no longer true S-scores.
     """
     import numpy as np
     import pandas as pd
@@ -450,17 +466,51 @@ def _compute_condition_sscores(
 
     control_mask = _match_controls(profiles.index.tolist(), control_labels or [])
 
-    if control_mask.any():
-        ctrl = profiles.loc[control_mask]
-        mu = ctrl.mean()
-        sigma = ctrl.std().replace(0, 1)
-        profiles = (profiles - mu) / sigma
-    else:
+    if not control_mask.any():
         from sklearn.preprocessing import StandardScaler
         vals = StandardScaler().fit_transform(profiles.values)
-        profiles = pd.DataFrame(vals, index=profiles.index, columns=profiles.columns)
+        return pd.DataFrame(vals, index=profiles.index, columns=profiles.columns)
 
-    return profiles
+    if baseline_mode == "per_run":
+        # Pull run_id out of the index labels. The library-mode
+        # convention is "<condition> @ <run_id>"; solo mode just has
+        # "<condition>". When the @ marker is missing we treat every
+        # row as the same run, which collapses to pooled behaviour.
+        run_ids = pd.Series(
+            [str(lbl).rsplit(" @ ", 1)[1] if " @ " in str(lbl) else ""
+             for lbl in profiles.index],
+            index=profiles.index,
+        )
+
+        # Pooled baseline used as a fallback when a run has fewer than
+        # two control profiles (sigma would otherwise be zero / NaN).
+        pooled_ctrl = profiles.loc[control_mask]
+        pooled_sigma = pooled_ctrl.std().replace(0, 1)
+
+        out = profiles.copy()
+        for run, idxs in run_ids.groupby(run_ids).groups.items():
+            sub_mask = pd.Series(control_mask, index=profiles.index).loc[idxs]
+            if not sub_mask.any():
+                # No controls in this run — leave its rows un-normalised
+                # (the user will see them clearly off-baseline). Could
+                # alternatively use the pooled baseline; explicit "no
+                # baseline" feels more honest.
+                continue
+            ctrl_rows = profiles.loc[idxs[sub_mask.values]]
+            mu = ctrl_rows.mean()
+            if len(ctrl_rows) < 2:
+                # std is undefined / zero — borrow the pooled sigma.
+                sigma = pooled_sigma
+            else:
+                sigma = ctrl_rows.std().replace(0, 1)
+            out.loc[idxs] = (profiles.loc[idxs] - mu) / sigma
+        return out
+
+    # Default: pooled baseline.
+    ctrl = profiles.loc[control_mask]
+    mu = ctrl.mean()
+    sigma = ctrl.std().replace(0, 1)
+    return (profiles - mu) / sigma
 
 
 def _subsample_stratified(df, max_n, group_col, rng):
@@ -853,30 +903,26 @@ def _plot_condition_plotly(
             ),
         ))
 
-    # One label per highlighted gene at the centroid of its points.
-    # We use Plotly annotations (rather than textmode markers) so the
-    # label survives all colouring modes and stays readable when a gene
-    # has multiple points spread across runs.
+    # One label per highlighted point. Multiple (run, ATc) instances of
+    # the same gene each get their own label at their own location, so
+    # spread / reproducibility is visible directly on the plot rather
+    # than only via hover.
     if has_highlight:
-        for gene in sorted(highlight_set):
-            gene_idxs = [
-                i for i, r in enumerate(meta_rows)
-                if r.get("gene", "") == gene
-            ]
-            if not gene_idxs:
+        for i, r in enumerate(meta_rows):
+            if not is_highlighted[i] or r.get("is_control"):
                 continue
-            cx = float(embedding[gene_idxs, 0].mean())
-            cy = float(embedding[gene_idxs, 1].mean())
+            cond = r.get("condition", r.get("gene", ""))
             fig.add_annotation(
-                x=cx, y=cy,
-                text=f"<b>{gene}</b>",
+                x=float(embedding[i, 0]),
+                y=float(embedding[i, 1]),
+                text=f"<b>{cond}</b>",
                 showarrow=False,
-                font=dict(size=12, color="#222"),
+                font=dict(size=11, color="#222"),
                 bgcolor="rgba(255,255,255,0.85)",
                 bordercolor="#444",
                 borderwidth=1,
-                borderpad=3,
-                yshift=16,
+                borderpad=2,
+                yshift=14,
             )
 
     fig.update_layout(
@@ -974,6 +1020,7 @@ def render_library_html(
     color_by: str = "cluster",
     feature_col: str | None = None,
     highlight_genes: list[str] | None = None,
+    baseline_mode: str = "pooled",
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
@@ -1037,6 +1084,7 @@ def render_library_html(
     profiles = _compute_condition_sscores(
         df_lib, morph_cols, "_combined_label",
         control_labels=controls,
+        baseline_mode=baseline_mode,
     )
     if len(profiles) < 2:
         return None

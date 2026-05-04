@@ -218,6 +218,7 @@ class _LibraryWorker(QObject):
         color_by: str = "cluster",
         feature_col: Optional[str] = None,
         highlight_genes: Optional[list[str]] = None,
+        baseline_mode: str = "pooled",
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -226,6 +227,7 @@ class _LibraryWorker(QObject):
         self._color_by = color_by
         self._feature_col = feature_col
         self._highlight_genes = list(highlight_genes or [])
+        self._baseline_mode = baseline_mode
 
     def run(self) -> None:
         try:
@@ -241,6 +243,7 @@ class _LibraryWorker(QObject):
                 color_by=self._color_by,
                 feature_col=self._feature_col,
                 highlight_genes=self._highlight_genes,
+                baseline_mode=self._baseline_mode,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
@@ -280,7 +283,12 @@ class AnalysisPanel(QWidget):
 
         toolbar.addWidget(QLabel("Species:"))
         self._species = QComboBox()
-        self._species.addItems([""] + SPECIES_OPTIONS)
+        # Species are not combinable on a single embedding (their
+        # control sets, condition libraries, and morphology
+        # distributions don't overlap meaningfully). Force a real
+        # selection rather than an "any species" default.
+        self._species.addItems(SPECIES_OPTIONS)
+        self._species.setCurrentText("M. tuberculosis")
         self._species.currentTextChanged.connect(
             lambda _t: self._refresh_library_view(force=True)
         )
@@ -339,6 +347,25 @@ class AnalysisPanel(QWidget):
             if self._color_by.currentData() == "feature" else None
         )
         colour_row.addWidget(self._feature_col)
+
+        colour_row.addSpacing(tokens.S4)
+        colour_row.addWidget(QLabel("Baseline:"))
+        self._baseline_mode = QComboBox()
+        self._baseline_mode.addItem("Pooled controls", userData="pooled")
+        self._baseline_mode.addItem("Per-run controls", userData="per_run")
+        self._baseline_mode.setToolTip(
+            "How to compute the S-score baseline.\n\n"
+            "Pooled: every control profile across every run contributes\n"
+            "  to a single (mu, sigma). Stable but lets between-run\n"
+            "  variance leak into sigma.\n\n"
+            "Per-run: each run's controls form their own baseline; each\n"
+            "  perturbation is z-scored against its own run's controls.\n"
+            "  Removes batch effects but needs \u22652 controls per run."
+        )
+        self._baseline_mode.currentIndexChanged.connect(
+            lambda _i: self._refresh_library_view(force=True)
+        )
+        colour_row.addWidget(self._baseline_mode)
 
         colour_row.addSpacing(tokens.S4)
         colour_row.addWidget(QLabel("Highlight gene(s):"))
@@ -427,10 +454,12 @@ class AnalysisPanel(QWidget):
             self._feature_col.currentText() or None
             if color_by == "feature" else None
         )
+        baseline_mode = self._baseline_mode.currentData() or "pooled"
         worker = _LibraryWorker(
             self._library_html_path, self._library_dir, species,
             color_by=color_by, feature_col=feature_col,
             highlight_genes=self._highlight_genes.selected(),
+            baseline_mode=baseline_mode,
         )
         self._start_worker(
             worker,

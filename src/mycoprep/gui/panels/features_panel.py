@@ -237,7 +237,11 @@ class FeaturesPanel(QWidget):
         ))
 
         self.species = QComboBox()
-        self.species.addItems(["", "M. tuberculosis", "M. smegmatis"])
+        # Plots can't combine across species, so we don't offer an
+        # "any species" choice — pick a real one. M. tuberculosis is
+        # the most common project default.
+        self.species.addItems(["M. tuberculosis", "M. smegmatis"])
+        self.species.setCurrentText("M. tuberculosis")
         lib_form.addRow("Species:", self.species)
 
         self.experiment_type = QComboBox()
