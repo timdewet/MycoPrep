@@ -34,6 +34,8 @@ Requires Python 3.10+. PyTorch + Cellpose are heavy installs; first install may 
 
 ### End-users (Windows zip)
 
+The frozen app checks GitHub on launch and shows a banner when a newer release is available. Click **View Release** to open the Releases page, then:
+
 1. Download the new `MycoPrep-windows.zip` from [Releases](https://github.com/timdewet/MycoPrep/releases).
 2. Unzip over your existing `MycoPrep\` folder, replacing the old files. Cellpose weights in `%USERPROFILE%\.cellpose\` are kept.
 3. Double-click `MycoPrep.exe`.
@@ -50,15 +52,7 @@ pip install -e .                  # re-runs if pyproject.toml or package-data ch
 
 Re-run `pip install -e .` (not just `git pull`) whenever `pyproject.toml`, dependencies, or shipped data files (e.g. `src/mycoprep/core/models/`) change — editable installs don't auto-pick up new package-data entries.
 
-### Developers rebuilding the Windows bundle
-
-After `git pull` + `pip install -e .`:
-
-```powershell
-pyinstaller packaging\mycoprep.spec
-```
-
-Output is `dist\MycoPrep\`. Zip and ship as a new release.
+The in-app update check is a no-op when running from source (it only fires for frozen PyInstaller bundles), so dev runs never show a banner.
 
 ## Run
 
@@ -129,6 +123,31 @@ PyInstaller can't cross-compile. Use one of:
 ## Releases
 
 Pre-built Windows bundles are published on the [Releases](https://github.com/timdewet/MycoPrep/releases) page. Each release ships a zipped `dist\MycoPrep\` folder — see the end-user install steps above.
+
+### Cutting a new release
+
+Releases are driven by [release-please](https://github.com/googleapis/release-please-action) and [Conventional Commits](https://www.conventionalcommits.org/). You no longer manually bump versions, tag, or run PyInstaller — the workflow does it all.
+
+**Workflow:**
+
+1. Land PRs on `main` with conventional-commit messages (see below).
+2. release-please opens (and keeps updated) a single "chore: release vX.Y.Z" PR that bumps the version in `src/mycoprep/__init__.py` and `pyproject.toml` and writes a CHANGELOG entry.
+3. When you're ready to ship, merge that PR. release-please tags the commit and creates a GitHub Release with the changelog as the body.
+4. The Windows runner builds `dist/MycoPrep/`, zips it as `MycoPrep-windows.zip`, and uploads it to the release.
+5. Installed copies of the app pick up the new release on next launch via the in-app update banner.
+
+**Conventional-commit prefixes that drive bumps:**
+
+| Prefix             | Meaning                              | Bump  |
+| ------------------ | ------------------------------------ | ----- |
+| `feat: …`          | new user-facing feature              | minor |
+| `fix: …`           | bug fix                              | patch |
+| `feat!: …` or `BREAKING CHANGE:` in the footer | breaking API/UX change | major |
+| `chore: …`, `docs: …`, `refactor: …`, `test: …`, `style: …`, `ci: …` | maintenance | none  |
+
+A PR with no `feat:` or `fix:` commits won't trigger a release — perfect for refactors, README tweaks, etc.
+
+**Manual rebuild:** if a build fails for a transient reason, re-run the failed job from the GitHub Actions UI. The release itself is already created; the rerun just rebuilds and re-uploads the asset.
 
 ## Acknowledgments
 
