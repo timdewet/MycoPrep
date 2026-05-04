@@ -13,10 +13,12 @@ from .api import (
     consolidate_features,
     extract_features_tiff,
 )
+from .feature_library import FeatureLibrary
 from .qc_plots import make_qc_plots
 
 __all__ = [
     "ExtractOpts",
+    "FeatureLibrary",
     "consolidate_crops",
     "consolidate_features",
     "extract_features_tiff",

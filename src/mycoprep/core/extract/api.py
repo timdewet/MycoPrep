@@ -56,6 +56,12 @@ class ExtractOpts:
     # Outputs to <features_dir>/qc_plots/.
     make_qc_plots: bool = True
 
+    # Feature library — accumulates features across runs for clustering
+    add_to_library: bool = False
+    library_dir: Optional[Path] = None   # default: ~/.mycoprep/feature_library/
+    species: str = ""                    # e.g. "M. tuberculosis"
+    experiment_type: str = "knockdown"   # "knockdown" or "drug"
+
     # Single-cell crops
     save_crops: bool = True
     crop_size: int = 96

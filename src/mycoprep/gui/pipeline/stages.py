@@ -20,6 +20,7 @@ from mycoprep.core.api import (
     segment_tiff,
     split_plate,
 )
+from mycoprep.core.extract.feature_library import FeatureLibrary
 
 from .context import RunContext
 
@@ -575,12 +576,38 @@ class ExtractStage:
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"Per-well crops OK but consolidation failed: {e}")
 
+        # Register with the feature library (opt-in).
+        all_pq = ctx.features_dir / "all_features.parquet"
+        library_dir = getattr(opts, "library_dir", None)
+        if outputs and getattr(opts, "add_to_library", False) and all_pq.exists():
+            try:
+                lib = FeatureLibrary(library_dir)
+                source_czi = ""
+                acq_dt = ""
+                lib.register_run(
+                    run_id=run_id,
+                    features_parquet=all_pq,
+                    species=getattr(opts, "species", ""),
+                    experiment_type=getattr(opts, "experiment_type", "knockdown"),
+                    source_czi=source_czi,
+                    acquisition_datetime=acq_dt,
+                )
+                progress_cb(1.0, f"Registered run '{run_id}' in feature library")
+            except Exception as e:  # noqa: BLE001
+                progress_cb(1.0, f"Library registration failed: {e}")
+
         # Auto-QC plots — runs after consolidation so the plots use the
         # canonical ``all_features.parquet``. Off via ``opts.make_qc_plots``
         # for users who don't want the matplotlib import at end of run.
         if outputs and getattr(opts, "make_qc_plots", True):
             try:
-                make_qc_plots(ctx.features_dir, progress_cb=progress_cb)
+                make_qc_plots(
+                    ctx.features_dir,
+                    library_dir=library_dir,
+                    species=getattr(opts, "species", ""),
+                    current_run_id=run_id,
+                    progress_cb=progress_cb,
+                )
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"qc_plots skipped ({e})")
 

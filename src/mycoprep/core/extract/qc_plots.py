@@ -11,6 +11,9 @@ Plots written to ``<features_dir>/qc_plots/``:
 - ``length_vs_intensity_facets.png`` — per-cell scatter facets per mutant.
 - ``intensity_variation.png`` — CV + dynamic range bar charts.
 - ``intensity_distributions.png`` — log-scale ridge of per-cell intensity.
+- ``morphology_clustering_run.png`` — UMAP + HDBSCAN on current run.
+- ``morphology_clustering_library.png`` — same with library context (when
+  a feature library is available).
 
 Failures (e.g. missing parquet, headless matplotlib not installed) are
 caught and reported via the progress callback — they should never block
@@ -48,6 +51,9 @@ def _pick_intensity_col(frame) -> str:
 def make_qc_plots(
     features_dir: Path,
     *,
+    library_dir: Optional[Path] = None,
+    species: str = "",
+    current_run_id: str = "",
     progress_cb: ProgressCB = _noop,
 ) -> Optional[Path]:
     """Generate QC plots in ``<features_dir>/qc_plots/`` from
@@ -329,5 +335,491 @@ def make_qc_plots(
                      dpi=160, bbox_inches="tight")
         plt.close(fig5)
 
+    # ── Figure 6: morphology clustering ──────────────────────────────────
+    try:
+        _morphology_cluster_plots(
+            df,
+            out_dir=out_dir,
+            palette=palette,
+            atc_states=atc_states,
+            library_dir=library_dir,
+            species=species,
+            current_run_id=current_run_id,
+            progress_cb=progress_cb,
+        )
+    except Exception as e:  # noqa: BLE001
+        progress_cb(0.95, f"qc_plots: clustering skipped ({e})")
+
     progress_cb(1.0, f"qc_plots: wrote → {out_dir.name}/")
     return out_dir
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Morphology clustering helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MORPHOLOGY_COLS_PREFERRED = [
+    "length_um",
+    "width_median_um",
+    "width_mean_um",
+    "width_max_um",
+    "width_min_um",
+    "width_std_um",
+    "area_um2_subpixel",
+    "area_um2",
+    "perimeter_um_subpixel",
+    "perimeter_um",
+    "eccentricity",
+    "solidity",
+    "sinuosity",
+    "feret_diameter_max_um",
+    "major_axis_length_um",
+    "minor_axis_length_um",
+]
+
+
+def _select_morphology_cols(df) -> list[str]:
+    """Pick morphology columns present in *df*, preferring subpixel variants."""
+    import pandas as pd
+
+    available = set(df.columns)
+    selected: list[str] = []
+    seen_base: set[str] = set()
+    for col in _MORPHOLOGY_COLS_PREFERRED:
+        base = col.replace("_subpixel", "")
+        if base in seen_base:
+            continue
+        if col in available:
+            selected.append(col)
+            seen_base.add(base)
+        elif base in available and base != col:
+            selected.append(base)
+            seen_base.add(base)
+    return selected
+
+
+def _compute_condition_sscores(df, morph_cols, condition_col="condition"):
+    """Compute per-condition S-score profiles (mean + CV, Z-scored vs controls)."""
+    import numpy as np
+    import pandas as pd
+
+    def _cv(s):
+        m = s.mean()
+        return s.std() / m if m != 0 else 0.0
+
+    means = df.groupby(condition_col)[morph_cols].mean()
+    cvs = df.groupby(condition_col)[morph_cols].agg(_cv)
+    cvs.columns = [c + "_CV" for c in cvs.columns]
+
+    profiles = pd.concat([means, cvs], axis=1)
+
+    # Z-score vs controls (conditions containing "WT" or "DMSO" or ATc-)
+    control_mask = profiles.index.str.contains(
+        r"WT|DMSO|wildtype|control", case=False, regex=True
+    )
+    if control_mask.any():
+        ctrl = profiles.loc[control_mask]
+        mu = ctrl.mean()
+        sigma = ctrl.std().replace(0, 1)
+        profiles = (profiles - mu) / sigma
+    else:
+        from sklearn.preprocessing import StandardScaler
+        vals = StandardScaler().fit_transform(profiles.values)
+        profiles = pd.DataFrame(vals, index=profiles.index, columns=profiles.columns)
+
+    return profiles
+
+
+def _subsample_stratified(df, max_n, group_col, rng):
+    """Subsample to at most *max_n* rows, stratified by *group_col*."""
+    if len(df) <= max_n:
+        return df
+    groups = df[group_col].unique()
+    per_group = max(1, max_n // len(groups))
+    parts = []
+    for g in groups:
+        sub = df[df[group_col] == g]
+        if len(sub) > per_group:
+            sub = sub.sample(n=per_group, random_state=rng)
+        parts.append(sub)
+    return __import__("pandas").concat(parts, ignore_index=True)
+
+
+def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
+                       min_cluster_size=15, random_state=42):
+    """PCA → UMAP → HDBSCAN.  Returns (embedding_2d, cluster_labels)."""
+    import numpy as np
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import HDBSCAN
+
+    try:
+        import umap
+    except ImportError:
+        raise ImportError("umap-learn is required for clustering plots")
+
+    n_samples, n_features = X_scaled.shape
+    n_components = min(n_features, n_samples, 50)
+    if n_components >= 2:
+        pca = PCA(n_components=min(n_components, 0.95), random_state=random_state)
+        X_pca = pca.fit_transform(X_scaled)
+    else:
+        X_pca = X_scaled
+
+    effective_neighbors = min(n_neighbors, n_samples - 1)
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=max(2, effective_neighbors),
+        min_dist=min_dist,
+        random_state=random_state,
+    )
+    embedding = reducer.fit_transform(X_pca)
+
+    effective_min_cluster = min(min_cluster_size, max(2, n_samples // 10))
+    clusterer = HDBSCAN(min_cluster_size=effective_min_cluster)
+    labels = clusterer.fit_predict(embedding)
+
+    return embedding, labels
+
+
+def _plot_umap_panels(
+    embedding, labels_condition, labels_cluster, palette_condition,
+    title_prefix, ax_left, ax_right, highlight_mask=None,
+    experiment_types=None,
+):
+    """Draw a pair of UMAP panels: left=condition-colored, right=cluster-colored."""
+    import numpy as np
+
+    # --- Left: condition ---
+    conditions = sorted(set(labels_condition))
+    for cond in conditions:
+        mask = np.array(labels_condition) == cond
+        color = palette_condition.get(cond, "#888888")
+        s = 8 if highlight_mask is None else np.where(
+            highlight_mask & mask, 12, 3
+        )[mask]
+        alpha = 0.7 if highlight_mask is None else np.where(
+            highlight_mask & mask, 0.8, 0.2
+        )[mask]
+        ax_left.scatter(
+            embedding[mask, 0], embedding[mask, 1],
+            s=s, alpha=alpha, color=color, label=cond, edgecolors="none",
+        )
+    ax_left.set_title(f"{title_prefix} — by condition", fontsize=10)
+    ax_left.set_xlabel("UMAP 1"); ax_left.set_ylabel("UMAP 2")
+    ax_left.legend(fontsize=7, frameon=False, markerscale=2, loc="best")
+    for sp in ("top", "right"):
+        ax_left.spines[sp].set_visible(False)
+
+    # --- Right: cluster ---
+    unique_clusters = sorted(set(labels_cluster))
+    cmap = __import__("matplotlib").colormaps.get_cmap("tab10")
+    for cl in unique_clusters:
+        mask = np.array(labels_cluster) == cl
+        color = "#cccccc" if cl == -1 else cmap(cl % 10)
+        label = "noise" if cl == -1 else f"cluster {cl}"
+        s = 8 if highlight_mask is None else np.where(
+            highlight_mask & mask, 12, 3
+        )[mask]
+        alpha = 0.7 if highlight_mask is None else np.where(
+            highlight_mask & mask, 0.8, 0.2
+        )[mask]
+        ax_right.scatter(
+            embedding[mask, 0], embedding[mask, 1],
+            s=s, alpha=alpha, color=color, label=label, edgecolors="none",
+        )
+    ax_right.set_title(f"{title_prefix} — by cluster", fontsize=10)
+    ax_right.set_xlabel("UMAP 1"); ax_right.set_ylabel("UMAP 2")
+    ax_right.legend(fontsize=7, frameon=False, markerscale=2, loc="best")
+    for sp in ("top", "right"):
+        ax_right.spines[sp].set_visible(False)
+
+
+def _plot_condition_panels(
+    profiles, embedding, labels_cluster,
+    title_prefix, ax_left, ax_right,
+    highlight_mask=None, experiment_types=None,
+):
+    """Draw condition-level panels with experiment-type markers."""
+    import numpy as np
+
+    conds = profiles.index.tolist()
+    cmap = __import__("matplotlib").colormaps.get_cmap("tab20")
+
+    markers = {"knockdown": "o", "drug": "^"}
+    default_marker = "o"
+
+    # --- Left: colored by condition, shaped by experiment type ---
+    for i, cond in enumerate(conds):
+        exp_type = experiment_types[i] if experiment_types else "knockdown"
+        marker = markers.get(exp_type, default_marker)
+        s = 80 if highlight_mask is None or highlight_mask[i] else 30
+        alpha = 0.9 if highlight_mask is None or highlight_mask[i] else 0.35
+        edgecolor = "black" if highlight_mask is None or highlight_mask[i] else "none"
+        ax_left.scatter(
+            embedding[i, 0], embedding[i, 1],
+            s=s, alpha=alpha, color=cmap(i % 20),
+            marker=marker, edgecolors=edgecolor, linewidths=0.8,
+        )
+        if highlight_mask is None or highlight_mask[i]:
+            ax_left.annotate(
+                cond, (embedding[i, 0], embedding[i, 1]),
+                fontsize=6, alpha=0.8,
+                xytext=(4, 4), textcoords="offset points",
+            )
+    ax_left.set_title(f"{title_prefix} — S-scores by condition", fontsize=10)
+    ax_left.set_xlabel("Component 1"); ax_left.set_ylabel("Component 2")
+    for sp in ("top", "right"):
+        ax_left.spines[sp].set_visible(False)
+
+    # --- Right: colored by cluster ---
+    unique_clusters = sorted(set(labels_cluster))
+    cmap_cl = __import__("matplotlib").colormaps.get_cmap("tab10")
+    for cl in unique_clusters:
+        mask = np.array(labels_cluster) == cl
+        color = "#cccccc" if cl == -1 else cmap_cl(cl % 10)
+        label = "noise" if cl == -1 else f"cluster {cl}"
+        idxs = np.where(mask)[0]
+        for i in idxs:
+            exp_type = experiment_types[i] if experiment_types else "knockdown"
+            marker = markers.get(exp_type, default_marker)
+            s = 80 if highlight_mask is None or highlight_mask[i] else 30
+            ax_right.scatter(
+                embedding[i, 0], embedding[i, 1],
+                s=s, alpha=0.8, color=color, marker=marker,
+                edgecolors="black" if highlight_mask is None or highlight_mask[i] else "none",
+                linewidths=0.6,
+            )
+        ax_right.scatter([], [], color=color, label=label, marker="o")
+    ax_right.set_title(f"{title_prefix} — by cluster", fontsize=10)
+    ax_right.set_xlabel("Component 1"); ax_right.set_ylabel("Component 2")
+    ax_right.legend(fontsize=7, frameon=False, loc="best")
+    for sp in ("top", "right"):
+        ax_right.spines[sp].set_visible(False)
+
+
+def _morphology_cluster_plots(
+    df_current,
+    *,
+    out_dir,
+    palette,
+    atc_states,
+    library_dir=None,
+    species="",
+    current_run_id="",
+    progress_cb=_noop,
+):
+    """Generate solo and library clustering plots."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from sklearn.preprocessing import StandardScaler
+
+    morph_cols = _select_morphology_cols(df_current)
+    if len(morph_cols) < 3:
+        progress_cb(0.9, "qc_plots: too few morphology columns for clustering")
+        return
+
+    progress_cb(0.85, "qc_plots: building clustering figures")
+
+    if "condition" not in df_current.columns:
+        df_current = df_current.copy()
+        df_current["condition"] = (
+            df_current.get("mutant", pd.Series("unknown", index=df_current.index)).astype(str)
+            + " "
+            + df_current.get("atc", pd.Series("", index=df_current.index)).astype(str)
+        ).str.strip()
+
+    # --- Solo run plot ---
+    rng = np.random.RandomState(42)
+    df_solo = df_current.dropna(subset=morph_cols).copy()
+    if len(df_solo) < 30:
+        progress_cb(0.9, "qc_plots: too few cells for clustering")
+        return
+
+    df_solo = _subsample_stratified(df_solo, 5000, "condition", rng)
+    X_solo = StandardScaler().fit_transform(df_solo[morph_cols].values)
+    emb_solo, labels_solo = _run_umap_hdbscan(X_solo)
+
+    conditions_solo = df_solo["condition"].tolist()
+    cond_palette = dict(palette)
+    for c in set(conditions_solo):
+        if c not in cond_palette:
+            atc_match = [a for a in atc_states if a in c]
+            cond_palette[c] = palette.get(atc_match[0], "#888888") if atc_match else "#888888"
+
+    # Cell-level solo
+    fig_solo, axes_solo = plt.subplots(2, 2, figsize=(14, 12))
+    _plot_umap_panels(
+        emb_solo, conditions_solo, labels_solo, cond_palette,
+        "Cell-level", axes_solo[0, 0], axes_solo[0, 1],
+    )
+
+    # Condition-level solo
+    profiles_solo = _compute_condition_sscores(df_solo, morph_cols, "condition")
+    if len(profiles_solo) >= 2:
+        X_prof = profiles_solo.values
+        n_cond = len(profiles_solo)
+        if n_cond >= 6:
+            emb_cond, lbl_cond = _run_umap_hdbscan(
+                X_prof, n_neighbors=min(5, n_cond - 1),
+                min_cluster_size=max(2, n_cond // 5),
+            )
+        else:
+            from sklearn.decomposition import PCA as _PCA
+            n_comp = min(2, X_prof.shape[1], n_cond)
+            emb_cond = _PCA(n_components=n_comp).fit_transform(X_prof)
+            if emb_cond.shape[1] == 1:
+                emb_cond = np.column_stack([emb_cond, np.zeros(n_cond)])
+            lbl_cond = np.full(n_cond, 0)
+
+        _plot_condition_panels(
+            profiles_solo, emb_cond, lbl_cond,
+            "Condition-level", axes_solo[1, 0], axes_solo[1, 1],
+        )
+    else:
+        axes_solo[1, 0].text(0.5, 0.5, "Not enough conditions", transform=axes_solo[1, 0].transAxes, ha="center")
+        axes_solo[1, 0].axis("off")
+        axes_solo[1, 1].axis("off")
+
+    fig_solo.suptitle("Morphological clustering — current run", fontsize=13, y=1.0)
+    fig_solo.tight_layout()
+    fig_solo.savefig(out_dir / "morphology_clustering_run.png", dpi=160, bbox_inches="tight")
+    plt.close(fig_solo)
+    progress_cb(0.9, "qc_plots: solo clustering done")
+
+    # --- Library comparison plot ---
+    if library_dir is None:
+        return
+
+    try:
+        from .feature_library import FeatureLibrary
+        lib = FeatureLibrary(library_dir)
+        df_lib = lib.load_species(species)
+    except Exception:
+        return
+
+    if df_lib.empty:
+        return
+
+    progress_cb(0.92, "qc_plots: building library comparison figure")
+
+    lib_morph_cols = [c for c in morph_cols if c in df_lib.columns]
+    if len(lib_morph_cols) < 3:
+        return
+
+    # Add condition column to library data
+    if "condition" not in df_lib.columns:
+        parts = df_lib["well"].astype(str).str.split("__", expand=True) if "well" in df_lib.columns else None
+        if parts is not None:
+            atc_lib = parts[0].str.replace("_focused", "", regex=False)
+            mutant_lib = parts[2] if 2 in parts.columns else df_lib["well"].astype(str)
+            df_lib["condition"] = (mutant_lib.astype(str) + " " + atc_lib.astype(str)).str.strip()
+        else:
+            df_lib["condition"] = "library"
+
+    # Tag source
+    df_current_tagged = df_current.copy()
+    df_current_tagged["_is_current_run"] = True
+    df_lib["_is_current_run"] = False
+
+    combined = pd.concat(
+        [df_current_tagged[lib_morph_cols + ["condition", "_is_current_run"]],
+         df_lib[lib_morph_cols + ["condition", "_is_current_run"]]],
+        ignore_index=True,
+    ).dropna(subset=lib_morph_cols)
+
+    if len(combined) < 30:
+        return
+
+    # Subsample library, keep all current run
+    current_mask = combined["_is_current_run"].values.astype(bool)
+    n_current = current_mask.sum()
+    n_lib_budget = max(1000, 5000 - n_current)
+    lib_part = combined[~current_mask]
+    if len(lib_part) > n_lib_budget:
+        lib_part = lib_part.sample(n=n_lib_budget, random_state=rng)
+    combined = pd.concat([combined[current_mask], lib_part], ignore_index=True)
+    current_mask = combined["_is_current_run"].values.astype(bool)
+
+    X_combined = StandardScaler().fit_transform(combined[lib_morph_cols].values)
+    emb_lib, labels_lib = _run_umap_hdbscan(X_combined)
+
+    conditions_lib = combined["condition"].tolist()
+    for c in set(conditions_lib):
+        if c not in cond_palette:
+            cond_palette[c] = "#888888"
+
+    fig_lib, axes_lib = plt.subplots(2, 2, figsize=(14, 12))
+
+    # Cell-level with library
+    _plot_umap_panels(
+        emb_lib, conditions_lib, labels_lib, cond_palette,
+        "Cell-level (library)", axes_lib[0, 0], axes_lib[0, 1],
+        highlight_mask=current_mask,
+    )
+
+    # Condition-level with library
+    combined["_exp_type"] = "knockdown"
+    if "_library_experiment_type" in df_lib.columns:
+        lib_types = df_lib["_library_experiment_type"].values
+    else:
+        lib_types = None
+
+    profiles_lib = _compute_condition_sscores(combined, lib_morph_cols, "condition")
+    if len(profiles_lib) >= 2:
+        X_prof_lib = profiles_lib.values
+        n_cond_lib = len(profiles_lib)
+
+        # Determine experiment types per condition
+        exp_types_per_cond = []
+        for cond in profiles_lib.index:
+            sub = combined[combined["condition"] == cond]
+            if "_library_experiment_type" in sub.columns:
+                types = sub["_library_experiment_type"].dropna().unique()
+                exp_types_per_cond.append(types[0] if len(types) > 0 else "knockdown")
+            else:
+                exp_types_per_cond.append("knockdown")
+
+        # Highlight current run conditions
+        cond_highlight = []
+        for cond in profiles_lib.index:
+            sub = combined[combined["condition"] == cond]
+            cond_highlight.append(sub["_is_current_run"].any())
+
+        if n_cond_lib >= 6:
+            emb_cond_lib, lbl_cond_lib = _run_umap_hdbscan(
+                X_prof_lib,
+                n_neighbors=min(5, n_cond_lib - 1),
+                min_cluster_size=max(2, n_cond_lib // 5),
+            )
+        else:
+            from sklearn.decomposition import PCA as _PCA
+            n_comp = min(2, X_prof_lib.shape[1], n_cond_lib)
+            emb_cond_lib = _PCA(n_components=n_comp).fit_transform(X_prof_lib)
+            if emb_cond_lib.shape[1] == 1:
+                emb_cond_lib = np.column_stack([emb_cond_lib, np.zeros(n_cond_lib)])
+            lbl_cond_lib = np.full(n_cond_lib, 0)
+
+        _plot_condition_panels(
+            profiles_lib, emb_cond_lib, lbl_cond_lib,
+            "Condition-level (library)", axes_lib[1, 0], axes_lib[1, 1],
+            highlight_mask=cond_highlight,
+            experiment_types=exp_types_per_cond,
+        )
+    else:
+        axes_lib[1, 0].text(0.5, 0.5, "Not enough conditions", transform=axes_lib[1, 0].transAxes, ha="center")
+        axes_lib[1, 0].axis("off")
+        axes_lib[1, 1].axis("off")
+
+    run_label = current_run_id or "current"
+    n_lib_runs = len(lib.list_runs(species=species))
+    fig_lib.suptitle(
+        f"Morphological clustering — '{run_label}' vs library ({n_lib_runs} runs, species: {species or 'all'})",
+        fontsize=12, y=1.0,
+    )
+    fig_lib.tight_layout()
+    fig_lib.savefig(out_dir / "morphology_clustering_library.png", dpi=160, bbox_inches="tight")
+    plt.close(fig_lib)
+    progress_cb(0.95, "qc_plots: library clustering done")
