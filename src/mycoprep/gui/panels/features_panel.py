@@ -103,6 +103,7 @@ class FeaturesPanel(QWidget):
     """Options for the Features stage."""
 
     optionsChanged = pyqtSignal()
+    openLibraryBrowserRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -259,13 +260,26 @@ class FeaturesPanel(QWidget):
         lib_dir_widget.setLayout(lib_dir_row)
         lib_form.addRow("Library dir:", lib_dir_widget)
 
+        lib_buttons = QHBoxLayout()
         self._import_btn = QPushButton("Import existing parquet\u2026")
         self._import_btn.setToolTip(
             "Register an already-processed all_features.parquet into the "
             "library without rerunning the pipeline."
         )
         self._import_btn.clicked.connect(self._import_existing_parquet)
-        lib_form.addRow("", self._import_btn)
+        lib_buttons.addWidget(self._import_btn)
+
+        self._browse_lib_btn = QPushButton("Browse library\u2026")
+        self._browse_lib_btn.setToolTip(
+            "Open the library browser to view, filter, and manage registered runs."
+        )
+        self._browse_lib_btn.clicked.connect(self.openLibraryBrowserRequested.emit)
+        lib_buttons.addWidget(self._browse_lib_btn)
+        lib_buttons.addStretch(1)
+
+        lib_buttons_widget = QWidget()
+        lib_buttons_widget.setLayout(lib_buttons)
+        lib_form.addRow("", lib_buttons_widget)
 
         # Disable library sub-widgets when the master checkbox is off.
         self._lib_widgets = (

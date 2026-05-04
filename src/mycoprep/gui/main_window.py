@@ -36,6 +36,7 @@ from .pipeline.runner import BulkPipelineRunner, PipelineRunner
 from .ui import icons, tokens
 from .ui.elevation import apply_shadow
 from .ui.nav_sidebar import NavEntry, NavSidebar, StageStatus
+from .widgets.library_browser import LibraryBrowser
 from .widgets.live_preview import LivePreviewPanel
 
 
@@ -89,6 +90,14 @@ class _ModelDetailsWindow(QMainWindow):
         self.setCentralWidget(inspector)
 
 
+class _LibraryBrowserWindow(QMainWindow):
+    def __init__(self, browser: LibraryBrowser, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Feature Library Browser")
+        self.resize(1100, 600)
+        self.setCentralWidget(browser)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -112,6 +121,7 @@ class MainWindow(QMainWindow):
         self._runner: PipelineRunner | None = None
         self._labeller_window: _LabelTrainerWindow | None = None
         self._model_details_window: _ModelDetailsWindow | None = None
+        self._library_browser_window: _LibraryBrowserWindow | None = None
 
         self.input_panel = InputPanel()
         self.layout_panel = LayoutPanel()
@@ -157,6 +167,7 @@ class MainWindow(QMainWindow):
         self.run_panel.stageEnablesChanged.connect(self._recompute_stage_readiness)
         self.classify_panel.openLabelTrainerRequested.connect(self._open_label_trainer)
         self.classify_panel.showModelDetailsRequested.connect(self._open_model_details)
+        self.features_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
 
         # Stage-state tracking for sidebar status dots.
         self._stage_status: dict[str, StageStatus] = {e.key: StageStatus.IDLE for e in NAV_ENTRIES}
@@ -743,6 +754,19 @@ class MainWindow(QMainWindow):
         self._model_details_window.show()
         self._model_details_window.raise_()
         self._model_details_window.activateWindow()
+
+    def _open_library_browser(self) -> None:
+        # Use the library_dir currently configured in the FeaturesPanel.
+        lib_dir_text = self.features_panel.library_dir.text().strip()
+        lib_dir = Path(lib_dir_text) if lib_dir_text else None
+        if self._library_browser_window is None:
+            browser = LibraryBrowser(library_dir=lib_dir, parent=self)
+            self._library_browser_window = _LibraryBrowserWindow(browser, parent=self)
+        else:
+            self._library_browser_window.centralWidget().set_library_dir(lib_dir)
+        self._library_browser_window.show()
+        self._library_browser_window.raise_()
+        self._library_browser_window.activateWindow()
 
     # ---------------------------------------------------------------- run state -> sidebar
 
