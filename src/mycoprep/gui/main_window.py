@@ -318,11 +318,26 @@ class MainWindow(QMainWindow):
         self._main_splitter.setHandleWidth(6)
         self._main_splitter.addWidget(self._stack)
         self._main_splitter.addWidget(self.live_preview)
-        # Default split: ~45% options, ~55% preview. Restored from
-        # QSettings in _restore_state if a saved width is available.
-        self._main_splitter.setSizes([520, 640])
-        self._main_splitter.setStretchFactor(0, 0)
+        # Default split: 50/50. Both children get Expanding size policies
+        # so Qt distributes available width by stretch factors instead of
+        # honouring the stack's larger sizeHint, and we also seed equal
+        # initial sizes. ``_user_dragged_splitter`` flips to True if the
+        # user manually moves the handle, after which we preserve their
+        # ratio rather than snapping back.
+        from PyQt6.QtWidgets import QSizePolicy
+        self._stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self.live_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self._main_splitter.setSizes([1000, 1000])
+        self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 1)
+        self._user_dragged_splitter = False
+        self._main_splitter.splitterMoved.connect(
+            lambda _pos, _idx: setattr(self, "_user_dragged_splitter", True)
+        )
         body_l.addWidget(self._main_splitter, stretch=1)
 
         # Compose
@@ -400,9 +415,35 @@ class MainWindow(QMainWindow):
         # tabs, hidden on input / plate / run.
         from .widgets.live_preview.panel import RENDER_TAB_KEYS
         show_preview = entry.key in RENDER_TAB_KEYS
+        was_visible = self.live_preview.isVisible()
         self.live_preview.setVisible(show_preview)
         if show_preview:
             self.live_preview.set_current_tab(entry.key)
+            # Re-impose a 50/50 split when the preview comes back from
+            # being hidden — otherwise child size hints in the stack
+            # dominate and squeeze it to a sliver. Skip if the user has
+            # dragged the handle, so we don't clobber their choice.
+            # Defer to QTimer.singleShot(0) so Qt finishes its initial
+            # show-driven layout pass first; otherwise our setSizes is
+            # immediately overridden by sizeHint-based redistribution.
+            if not was_visible and not self._user_dragged_splitter:
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, self._reset_main_splitter_to_half)
+
+    def _reset_main_splitter_to_half(self) -> None:
+        if self._user_dragged_splitter:
+            return
+        # Two-step apply: Qt's splitter uses child sizeHints during the
+        # initial layout pass that follows setVisible(True), and a
+        # synchronous setSizes runs *before* that pass, getting
+        # overridden. Pumping events first lets Qt finish the show-
+        # driven layout, then we apply our sizes on top.
+        QApplication.processEvents()
+        total = self._main_splitter.width()
+        if total <= 0:
+            return
+        half = total // 2
+        self._main_splitter.setSizes([half, total - half])
 
     # ------------------------------------------------------------------ persistence
 
