@@ -201,15 +201,21 @@ class NavSidebar(QFrame):
             # Insert a thin grey separator the first time we transition
             # from a pipeline entry to a non-pipeline entry.
             if prev_was_pipeline and not entry.pipeline and i > 0:
+                # Visual break: gap above + thin line + gap below.
+                # The QFrame container holds a HLine drawn against the
+                # sidebar background so the gaps look intentional rather
+                # than like a misaligned line.
+                root.addSpacing(tokens.S3)
                 divider = QFrame()
                 divider.setObjectName("navDivider")
                 divider.setFrameShape(QFrame.Shape.HLine)
                 divider.setFixedHeight(1)
                 divider.setStyleSheet(
                     f"background-color: {tokens.active().border}; "
-                    f"margin: {tokens.S2}px {tokens.S4}px;"
+                    f"margin: 0 {tokens.S5}px;"
                 )
                 root.addWidget(divider)
+                root.addSpacing(tokens.S3)
             item = _NavItem(
                 entry.label, entry.icon, self,
                 show_status=entry.pipeline,
