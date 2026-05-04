@@ -499,16 +499,21 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
         X_pca = X_scaled
 
     effective_neighbors = min(n_neighbors, n_samples - 1)
+    # n_jobs=1 explicit so seeded reproducibility doesn't trigger a warning
+    # about parallelism being disabled.
     reducer = umap.UMAP(
         n_components=2,
         n_neighbors=max(2, effective_neighbors),
         min_dist=min_dist,
         random_state=random_state,
+        n_jobs=1,
     )
     embedding = reducer.fit_transform(X_pca)
 
     effective_min_cluster = min(min_cluster_size, max(2, n_samples // 10))
-    clusterer = HDBSCAN(min_cluster_size=effective_min_cluster)
+    # copy=False explicit to silence the sklearn 1.10 default-change warning;
+    # we do not mutate ``embedding`` after fitting.
+    clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
     labels = clusterer.fit_predict(embedding)
 
     return embedding, labels
@@ -834,7 +839,7 @@ def render_library_html(
     )
     fig = _plot_condition_plotly(profiles, embedding, lbl_cluster, meta, title)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(out_path, include_plotlyjs="cdn", full_html=True)
+    fig.write_html(out_path, include_plotlyjs=True, full_html=True)
     return out_path
 
 
@@ -869,7 +874,7 @@ def _render_clustering_figure(
         )
         plotly_fig.write_html(
             out_dir / f"{base_name}.html",
-            include_plotlyjs="cdn",
+            include_plotlyjs=True,
             full_html=True,
         )
     except Exception as e:  # noqa: BLE001
