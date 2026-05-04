@@ -727,18 +727,24 @@ def _morphology_cluster_plots(
     progress_cb(0.9, "qc_plots: solo clustering done")
 
     # --- Library comparison plot ---
-    if library_dir is None:
-        return
-
+    # ``library_dir=None`` is fine — FeatureLibrary falls back to the
+    # default location (``~/.mycoprep/feature_library/``). Skip only when
+    # the library itself has no registered runs for the requested species.
     try:
         from .feature_library import FeatureLibrary
         lib = FeatureLibrary(library_dir)
         df_lib = lib.load_species(species)
         lib_index = lib.list_runs(species=species or None)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        progress_cb(0.92, f"qc_plots: library load failed ({e})")
         return
 
     if df_lib.empty:
+        sp_label = species or "any species"
+        progress_cb(
+            0.92,
+            f"qc_plots: library at {lib.library_dir} has no runs for {sp_label}, skipping comparison plot",
+        )
         return
 
     # Combine the current run's control_labels with any registered with
