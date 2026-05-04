@@ -364,11 +364,6 @@ class AnalysisPanel(QWidget):
 
         root.addLayout(colour_row)
 
-        self._set_placeholder(
-            "Feature library",
-            "Loading\u2026 (will appear here once the library has data).",
-        )
-
     # ------------------------------------------------------------------
     # External wiring
     # ------------------------------------------------------------------
