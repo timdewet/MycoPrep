@@ -83,6 +83,14 @@ class AnalysisPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(tokens.S3)
 
+        # ── Interactive plot view (top, largest) ───────────────────────
+        self._web_view = QWebEngineView()
+        self._web_view.setMinimumHeight(420)
+        root.addWidget(self._web_view, stretch=3)
+
+        # ── Bottom: re-run controls (left) | library browser (right) ───
+        self._bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+
         # ── Re-run clustering on existing features ────────────────────
         cluster_box = QGroupBox("Re-run clustering on existing features")
         cluster_form = QFormLayout(cluster_box)
@@ -162,26 +170,20 @@ class AnalysisPanel(QWidget):
         self._status.setWordWrap(True)
         cluster_form.addRow("", self._status)
 
-        root.addWidget(cluster_box)
+        self._bottom_splitter.addWidget(cluster_box)
 
-        # ── Splitter: interactive plot (left) | library browser (right) ──
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        self._web_view = QWebEngineView()
-        self._web_view.setMinimumHeight(360)
-        self._splitter.addWidget(self._web_view)
-
+        # ── Library browser (right of bottom splitter) ─────────────────
         lib_box = QGroupBox("Feature library")
         lib_layout = QVBoxLayout(lib_box)
         lib_layout.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
         self._library_browser = LibraryBrowser()
         self._library_browser.libraryChanged.connect(self._refresh_library_view)
         lib_layout.addWidget(self._library_browser)
-        self._splitter.addWidget(lib_box)
+        self._bottom_splitter.addWidget(lib_box)
 
-        self._splitter.setStretchFactor(0, 3)
-        self._splitter.setStretchFactor(1, 2)
-        root.addWidget(self._splitter, stretch=1)
+        self._bottom_splitter.setStretchFactor(0, 1)
+        self._bottom_splitter.setStretchFactor(1, 1)
+        root.addWidget(self._bottom_splitter, stretch=2)
 
         self._set_placeholder(
             "Feature library", "Loading\u2026 (will appear here once the library has data).",

@@ -546,11 +546,14 @@ def _embed_profiles(profiles):
     return emb, lbl
 
 
-def _condition_meta_table(combined_df, profile_labels, label_col):
+def _condition_meta_table(
+    combined_df, profile_labels, label_col,
+    control_labels: list[str] | None = None,
+):
     """Resolve per-profile metadata used by the static + interactive plots.
 
     Returns a list of dicts in profile order with: condition, run_id,
-    experiment_type, n_cells, is_current_run.
+    experiment_type, n_cells, is_current_run, is_control.
     """
     import pandas as pd
 
@@ -561,7 +564,7 @@ def _condition_meta_table(combined_df, profile_labels, label_col):
             rows.append({
                 "label": label, "condition": label, "run_id": "",
                 "experiment_type": "knockdown", "n_cells": 0,
-                "is_current_run": False,
+                "is_current_run": False, "is_control": False,
             })
             continue
         cond = sub["condition"].iloc[0] if "condition" in sub.columns else label
@@ -581,25 +584,44 @@ def _condition_meta_table(combined_df, profile_labels, label_col):
             "experiment_type": exp_type or "knockdown",
             "n_cells": int(len(sub)),
             "is_current_run": is_current,
+            "is_control": False,
         })
+
+    # Tag controls using the same whole-word matching as S-score baseline
+    # selection — the condition label, not the run-tagged combined label.
+    if control_labels:
+        cond_arr = [r["condition"] for r in rows]
+        ctrl_mask = _match_controls(cond_arr, control_labels)
+        for r, is_ctrl in zip(rows, ctrl_mask):
+            r["is_control"] = bool(is_ctrl)
     return rows
+
+
+_CONTROL_COLOR = "#9aa0a6"   # mid-grey, distinguishable in both light and dark
 
 
 def _plot_condition_panels_static(
     profiles, embedding, labels_cluster, meta_rows,
     title, ax_left, ax_right,
 ):
-    """Static matplotlib version: condition-colored | cluster-colored."""
+    """Static matplotlib version: condition-colored | cluster-colored.
+
+    Controls are rendered in grey on both panels so the baseline reference
+    is visually consistent across the two views.
+    """
     import numpy as np
 
     cmap = __import__("matplotlib").colormaps.get_cmap("tab20")
     cmap_cl = __import__("matplotlib").colormaps.get_cmap("tab10")
     markers = {"knockdown": "o", "drug": "^"}
 
-    # Build a stable color per condition (ignoring run_id duplicates).
+    # Stable color per non-control condition (controls all share grey).
     cond_index: dict[str, int] = {}
     for r in meta_rows:
-        cond_index.setdefault(r["condition"], len(cond_index))
+        if not r["is_control"]:
+            cond_index.setdefault(r["condition"], len(cond_index))
+
+    has_control = any(r["is_control"] for r in meta_rows)
 
     # --- Left: condition-colored, shaped by experiment type ---
     for i, r in enumerate(meta_rows):
@@ -608,10 +630,14 @@ def _plot_condition_panels_static(
         s = 90 if is_curr else 35
         alpha = 0.95 if is_curr else 0.5
         ec = "black" if is_curr else "none"
+        color = (
+            _CONTROL_COLOR
+            if r["is_control"]
+            else cmap(cond_index[r["condition"]] % 20)
+        )
         ax_left.scatter(
             embedding[i, 0], embedding[i, 1],
-            s=s, alpha=alpha,
-            color=cmap(cond_index[r["condition"]] % 20),
+            s=s, alpha=alpha, color=color,
             marker=marker, edgecolors=ec, linewidths=0.8,
         )
         if is_curr:
@@ -620,20 +646,25 @@ def _plot_condition_panels_static(
                 fontsize=6, alpha=0.8,
                 xytext=(4, 4), textcoords="offset points",
             )
+    if has_control:
+        ax_left.scatter([], [], color=_CONTROL_COLOR, label="control", marker="o")
+        ax_left.legend(fontsize=7, frameon=False, loc="best")
     ax_left.set_title(f"{title} — by condition", fontsize=10)
     ax_left.set_xlabel("Component 1"); ax_left.set_ylabel("Component 2")
     for sp in ("top", "right"):
         ax_left.spines[sp].set_visible(False)
 
-    # --- Right: cluster-colored ---
+    # --- Right: cluster-colored (controls still grey, override cluster) ---
+    seen_legend: set[str] = set()
     for cl in sorted(set(labels_cluster)):
         mask = np.array(labels_cluster) == cl
-        color = "#cccccc" if cl == -1 else cmap_cl(cl % 10)
-        label = "noise" if cl == -1 else f"cluster {cl}"
+        cluster_color = "#cccccc" if cl == -1 else cmap_cl(cl % 10)
+        cluster_label = "noise" if cl == -1 else f"cluster {cl}"
         for i in np.where(mask)[0]:
             r = meta_rows[i]
             marker = markers.get(r["experiment_type"], "o")
             is_curr = r["is_current_run"]
+            color = _CONTROL_COLOR if r["is_control"] else cluster_color
             ax_right.scatter(
                 embedding[i, 0], embedding[i, 1],
                 s=90 if is_curr else 35, alpha=0.85,
@@ -641,7 +672,12 @@ def _plot_condition_panels_static(
                 edgecolors="black" if is_curr else "none",
                 linewidths=0.6,
             )
-        ax_right.scatter([], [], color=color, label=label, marker="o")
+        # Legend entry for the cluster — drawn from a non-control swatch.
+        if cluster_label not in seen_legend:
+            ax_right.scatter([], [], color=cluster_color, label=cluster_label, marker="o")
+            seen_legend.add(cluster_label)
+    if has_control and "control" not in seen_legend:
+        ax_right.scatter([], [], color=_CONTROL_COLOR, label="control", marker="o")
     ax_right.set_title(f"{title} — by cluster", fontsize=10)
     ax_right.set_xlabel("Component 1"); ax_right.set_ylabel("Component 2")
     ax_right.legend(fontsize=7, frameon=False, loc="best")
@@ -657,6 +693,8 @@ def _plot_condition_plotly(
 
     Returns a ``plotly.graph_objects.Figure`` ready to ``write_html``.
     Hover shows: condition, run_id, experiment_type, # cells, top S-scores.
+    Controls are drawn in grey on both panels so the baseline reference
+    is visually consistent.
     """
     import numpy as np
     import plotly.graph_objects as go
@@ -677,8 +715,9 @@ def _plot_condition_plotly(
         top_lines = [
             f"  {feat_cols[j]}: {vals.iloc[j]:+.2f}" for j in top_idx
         ]
+        ctrl_tag = " · control" if r.get("is_control") else ""
         ht = (
-            f"<b>{r['condition']}</b>"
+            f"<b>{r['condition']}</b>{ctrl_tag}"
             f"{(' · ' + r['run_id']) if r['run_id'] else ''}"
             f"<br>type: {r['experiment_type']}"
             f"<br>cells: {r['n_cells']:,}"
@@ -686,9 +725,43 @@ def _plot_condition_plotly(
         )
         hover_text.append(ht)
 
-    # --- Left: condition-colored ---
-    for cond in sorted({r["condition"] for r in meta_rows}):
-        idxs = [i for i, r in enumerate(meta_rows) if r["condition"] == cond]
+    # --- Left: condition-colored (controls greyed) ---
+    # Draw a single grey trace for all controls first so they share a
+    # legend entry; then per-condition traces for non-controls.
+    ctrl_idxs = [i for i, r in enumerate(meta_rows) if r["is_control"]]
+    if ctrl_idxs:
+        for exp_type in ("knockdown", "drug"):
+            sel = [i for i in ctrl_idxs if meta_rows[i]["experiment_type"] == exp_type]
+            if not sel:
+                continue
+            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
+            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
+            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
+            fig.add_trace(
+                go.Scatter(
+                    x=embedding[sel, 0], y=embedding[sel, 1],
+                    mode="markers",
+                    name="control",
+                    legendgroup="control",
+                    showlegend=(exp_type == "knockdown"),
+                    marker=dict(
+                        size=sizes,
+                        color=_CONTROL_COLOR,
+                        symbol=symbol,
+                        line=dict(width=line_widths, color="black"),
+                    ),
+                    hovertext=[hover_text[i] for i in sel],
+                    hoverinfo="text",
+                ),
+                row=1, col=1,
+            )
+
+    non_ctrl_conditions = sorted({
+        r["condition"] for r in meta_rows if not r["is_control"]
+    })
+    for cond in non_ctrl_conditions:
+        idxs = [i for i, r in enumerate(meta_rows)
+                if r["condition"] == cond and not r["is_control"]]
         for exp_type in ("knockdown", "drug"):
             sel = [i for i in idxs if meta_rows[i]["experiment_type"] == exp_type]
             if not sel:
@@ -714,13 +787,46 @@ def _plot_condition_plotly(
                 row=1, col=1,
             )
 
-    # --- Right: cluster-colored ---
+    # --- Right: cluster-colored (controls still grey) ---
     palette = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
     ]
+
+    if ctrl_idxs:
+        for exp_type in ("knockdown", "drug"):
+            sel = [i for i in ctrl_idxs if meta_rows[i]["experiment_type"] == exp_type]
+            if not sel:
+                continue
+            symbol = "circle" if exp_type == "knockdown" else "triangle-up"
+            sizes = [22 if meta_rows[i]["is_current_run"] else 12 for i in sel]
+            line_widths = [2 if meta_rows[i]["is_current_run"] else 0 for i in sel]
+            fig.add_trace(
+                go.Scatter(
+                    x=embedding[sel, 0], y=embedding[sel, 1],
+                    mode="markers",
+                    name="control",
+                    legendgroup="ctrl-r",
+                    showlegend=(exp_type == "knockdown"),
+                    marker=dict(
+                        size=sizes,
+                        color=_CONTROL_COLOR,
+                        symbol=symbol,
+                        line=dict(width=line_widths, color="black"),
+                    ),
+                    hovertext=[hover_text[i] for i in sel],
+                    hoverinfo="text",
+                ),
+                row=1, col=2,
+            )
+
     for cl in sorted(set(labels_cluster)):
-        idxs = [i for i, _ in enumerate(meta_rows) if labels_cluster[i] == cl]
+        idxs = [
+            i for i, _ in enumerate(meta_rows)
+            if labels_cluster[i] == cl and not meta_rows[i]["is_control"]
+        ]
+        if not idxs:
+            continue
         color = "#cccccc" if cl == -1 else palette[cl % len(palette)]
         name = "noise" if cl == -1 else f"cluster {cl}"
         for exp_type in ("knockdown", "drug"):
@@ -830,7 +936,10 @@ def render_library_html(
     if len(profiles) < 2:
         return None
 
-    meta = _condition_meta_table(df_lib, profiles.index, "_combined_label")
+    meta = _condition_meta_table(
+        df_lib, profiles.index, "_combined_label",
+        control_labels=controls,
+    )
     embedding, lbl_cluster = _embed_profiles(profiles)
 
     n_runs = len(lib_index)
@@ -933,7 +1042,10 @@ def _morphology_cluster_plots(
         df_solo, morph_cols, "condition",
         control_labels=control_labels or [],
     )
-    meta_solo = _condition_meta_table(df_solo, profiles_solo.index, "condition")
+    meta_solo = _condition_meta_table(
+        df_solo, profiles_solo.index, "condition",
+        control_labels=control_labels or [],
+    )
     _render_clustering_figure(
         profiles_solo, meta_solo,
         title="Morphological clustering — current run",
@@ -1022,6 +1134,7 @@ def _morphology_cluster_plots(
     )
     meta_lib = _condition_meta_table(
         combined, profiles_lib.index, "_combined_label",
+        control_labels=combined_controls,
     )
 
     n_lib_runs = len(lib.list_runs(species=species or None))
