@@ -579,8 +579,12 @@ def _condition_meta_table(
             else "knockdown"
         )
         is_current = bool(sub.get("_is_current_run", pd.Series([True])).any())
+        # Gene is the first whitespace-separated token of the condition
+        # ("<gene> <ATc-/+>"). Stable enough that we don't need a
+        # separate column.
+        gene = str(cond).split()[0] if str(cond).strip() else ""
         rows.append({
-            "label": label, "condition": cond, "run_id": run_id,
+            "label": label, "condition": cond, "gene": gene, "run_id": run_id,
             "experiment_type": exp_type or "knockdown",
             "n_cells": int(len(sub)),
             "is_current_run": is_current,
@@ -680,6 +684,7 @@ def _plot_condition_plotly(
     profiles, embedding, labels_cluster, meta_rows, title,
     color_by: str = "cluster",
     feature_col: str | None = None,
+    highlight_genes: list[str] | None = None,
     top_features_per_point: int = 5,
 ):
     """Build an interactive Plotly figure: single scatter, configurable colour.
@@ -691,6 +696,9 @@ def _plot_condition_plotly(
         (an S-score column from ``profiles``); controls excluded from the
         gradient and overlaid as grey circles for reference
 
+    ``highlight_genes``: when non-empty, points whose ``gene`` is not in
+    the list are dimmed (smaller, semi-transparent, no edges). Highlighted
+    points are drawn at full size and emphasised.
     Returns a ``plotly.graph_objects.Figure`` ready to ``write_html``.
     """
     import numpy as np
@@ -699,9 +707,25 @@ def _plot_condition_plotly(
     fig = go.Figure()
     hover_text = _build_hover_text(profiles, meta_rows, top_features_per_point)
 
-    n = len(meta_rows)
-    sizes = np.array([22 if r["is_current_run"] else 12 for r in meta_rows])
-    line_widths = np.array([2 if r["is_current_run"] else 0 for r in meta_rows])
+    highlight_set = {g for g in (highlight_genes or []) if g}
+    has_highlight = bool(highlight_set)
+    is_highlighted = np.array(
+        [(not has_highlight) or (r.get("gene", "") in highlight_set)
+         for r in meta_rows],
+        dtype=bool,
+    )
+
+    sizes = np.array([
+        (22 if r["is_current_run"] else 12) if is_highlighted[i]
+        else 7
+        for i, r in enumerate(meta_rows)
+    ])
+    line_widths = np.array([
+        (2 if r["is_current_run"] else 0) if is_highlighted[i]
+        else 0
+        for i, r in enumerate(meta_rows)
+    ])
+    opacities = np.where(is_highlighted, 0.95, 0.25)
     is_ctrl = np.array([r["is_control"] for r in meta_rows], dtype=bool)
     exp_types = [r["experiment_type"] for r in meta_rows]
 
@@ -728,6 +752,7 @@ def _plot_condition_plotly(
                     size=sizes[sel].tolist(),
                     color=_CONTROL_COLOR,
                     symbol=symbol,
+                    opacity=opacities[sel].tolist(),
                     line=dict(width=line_widths[sel].tolist(), color="black"),
                 ),
                 hovertext=[hover_text[i] for i in sel],
@@ -758,6 +783,7 @@ def _plot_condition_plotly(
                         size=sizes[sel].tolist(),
                         color=color,
                         symbol=symbol,
+                        opacity=opacities[sel].tolist(),
                         line=dict(width=line_widths[sel].tolist(), color="black"),
                     ),
                     hovertext=[hover_text[i] for i in sel],
@@ -785,6 +811,7 @@ def _plot_condition_plotly(
                         size=sizes[sel].tolist(),
                         color=color,
                         symbol=symbol,
+                        opacity=opacities[sel].tolist(),
                         line=dict(width=line_widths[sel].tolist(), color="black"),
                     ),
                     hovertext=[hover_text[i] for i in sel],
@@ -812,6 +839,7 @@ def _plot_condition_plotly(
                     color=feature_vals[sel].tolist(),
                     coloraxis="coloraxis",
                     symbol=symbol,
+                    opacity=opacities[sel].tolist(),
                     line=dict(width=line_widths[sel].tolist(), color="black"),
                 ),
                 hovertext=[hover_text[i] for i in sel],
@@ -827,7 +855,7 @@ def _plot_condition_plotly(
 
     fig.update_layout(
         title=dict(text=title, x=0.5, xanchor="center"),
-        height=560,
+        autosize=True,
         margin=dict(l=40, r=20, t=80, b=40),
         legend=dict(font=dict(size=10)),
         plot_bgcolor="white",
@@ -835,6 +863,56 @@ def _plot_condition_plotly(
         yaxis=dict(title="Component 2", showgrid=True, gridcolor="#eee"),
     )
     return fig
+
+
+def _make_plot_html_fullheight(html_path: "Path") -> None:
+    """Inject a small CSS block into a plotly-generated HTML so the
+    ``html`` and ``body`` elements take up the full viewport — without
+    this, the body defaults to ``height: auto`` and the plot div sits
+    inside extra whitespace at the bottom of the page."""
+    try:
+        text = html_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    style = (
+        "<style>"
+        "html,body{height:100%;margin:0;padding:0;}"
+        ".plotly-graph-div{height:100% !important;width:100% !important;}"
+        "</style>"
+    )
+    if "</head>" in text and style not in text:
+        text = text.replace("</head>", style + "</head>", 1)
+        try:
+            html_path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def library_gene_list(
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+) -> list[str]:
+    """Return the sorted unique gene/mutant tokens registered in the library.
+
+    The condition convention is ``"<gene> <ATc-/+>"``, so we split on the
+    first whitespace and dedupe. Used to populate the GUI's "highlight
+    genes" multi-select.
+    """
+    from .feature_library import FeatureLibrary
+
+    try:
+        lib = FeatureLibrary(library_dir)
+        df = lib.load_species(species)
+    except Exception:  # noqa: BLE001
+        return []
+    if df.empty or "well" not in df.columns:
+        return []
+    parts = df["well"].astype(str).str.split("__", expand=True)
+    if 2 not in parts.columns:
+        return []
+    mutants = parts[2].astype(str).str.strip()
+    return sorted({m for m in mutants.unique() if m and m != "nan"})
 
 
 def library_feature_columns(
@@ -869,12 +947,15 @@ def render_library_html(
     species: str = "",
     color_by: str = "cluster",
     feature_col: str | None = None,
+    highlight_genes: list[str] | None = None,
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
     Useful for the Analysis page's default view: shows each
     (run, condition) S-score profile as a point, with hover info and
     a configurable colouring (``cluster`` / ``run_id`` / ``feature``).
+    When ``highlight_genes`` is non-empty, points whose mutant/gene is
+    not in the list are dimmed.
     Returns the written path, or ``None`` if the library has no usable
     data for *species*.
     """
@@ -947,9 +1028,20 @@ def render_library_html(
     fig = _plot_condition_plotly(
         profiles, embedding, lbl_cluster, meta, title,
         color_by=color_by, feature_col=feature_col,
+        highlight_genes=highlight_genes or [],
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(out_path, include_plotlyjs=True, full_html=True)
+    fig.write_html(
+        out_path,
+        include_plotlyjs=True,
+        full_html=True,
+        default_height="100vh",
+        config={"responsive": True},
+    )
+    # Patch the generated HTML so html/body fill the viewport — plotly's
+    # default_height covers the plot div, but the surrounding body still
+    # defaults to ``height: auto`` which leaves whitespace beneath.
+    _make_plot_html_fullheight(out_path)
     return out_path
 
 
@@ -982,11 +1074,15 @@ def _render_clustering_figure(
         plotly_fig = _plot_condition_plotly(
             profiles, embedding, lbl_cluster, meta_rows, title,
         )
+        html_out = out_dir / f"{base_name}.html"
         plotly_fig.write_html(
-            out_dir / f"{base_name}.html",
+            html_out,
             include_plotlyjs=True,
             full_html=True,
+            default_height="100vh",
+            config={"responsive": True},
         )
+        _make_plot_html_fullheight(html_out)
     except Exception as e:  # noqa: BLE001
         progress_cb(0.95, f"qc_plots: {base_name}.html skipped ({e})")
 

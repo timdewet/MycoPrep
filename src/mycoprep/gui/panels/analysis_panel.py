@@ -18,16 +18,18 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QObject, Qt, QThread, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QProgressBar,
     QPushButton,
     QStackedLayout,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +51,91 @@ p{{margin:6px 0;font-size:13px;}}
 <p>{body}</p>
 </body></html>
 """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-select dropdown — QToolButton with a popup of checkable actions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _MultiSelectButton(QToolButton):
+    """A button that opens a popup of checkable items.
+
+    The label summarises the current selection ("(none)", "<single name>",
+    or "N selected"). Emits ``selectionChanged`` whenever the user toggles
+    an entry.
+    """
+
+    selectionChanged = pyqtSignal(list)
+
+    def __init__(self, placeholder: str = "(none)", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._placeholder = placeholder
+        self._items: list[str] = []
+        self._checked: set[str] = set()
+        self._menu = QMenu(self)
+        self.setMenu(self._menu)
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.setMinimumWidth(180)
+        self.setText(placeholder)
+
+    def set_items(self, items: list[str]) -> None:
+        self._menu.clear()
+        self._items = list(items)
+        self._checked = {c for c in self._checked if c in items}
+        if self._items:
+            clear_action = QAction("Clear selection", self._menu)
+            clear_action.triggered.connect(self.clear_selection)
+            self._menu.addAction(clear_action)
+            self._menu.addSeparator()
+        for item in self._items:
+            action = QAction(item, self._menu)
+            action.setCheckable(True)
+            action.setChecked(item in self._checked)
+            action.triggered.connect(
+                lambda _checked, n=item: self._toggle(n)
+            )
+            self._menu.addAction(action)
+        self._update_label()
+
+    def selected(self) -> list[str]:
+        return [n for n in self._items if n in self._checked]
+
+    def set_selected(self, names: list[str]) -> None:
+        self._checked = {n for n in names if n in self._items}
+        # Refresh the menu's checked states
+        for action in self._menu.actions():
+            if action.isCheckable():
+                action.setChecked(action.text() in self._checked)
+        self._update_label()
+
+    def clear_selection(self) -> None:
+        if not self._checked:
+            return
+        self._checked.clear()
+        for action in self._menu.actions():
+            if action.isCheckable():
+                action.setChecked(False)
+        self._update_label()
+        self.selectionChanged.emit(self.selected())
+
+    def _toggle(self, name: str) -> None:
+        if name in self._checked:
+            self._checked.discard(name)
+        else:
+            self._checked.add(name)
+        self._update_label()
+        self.selectionChanged.emit(self.selected())
+
+    def _update_label(self) -> None:
+        n = len(self._checked)
+        if n == 0:
+            self.setText(self._placeholder)
+        elif n == 1:
+            self.setText(next(iter(self._checked)))
+        else:
+            self.setText(f"{n} selected")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +217,7 @@ class _LibraryWorker(QObject):
         species: str,
         color_by: str = "cluster",
         feature_col: Optional[str] = None,
+        highlight_genes: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -137,6 +225,7 @@ class _LibraryWorker(QObject):
         self._species = species
         self._color_by = color_by
         self._feature_col = feature_col
+        self._highlight_genes = list(highlight_genes or [])
 
     def run(self) -> None:
         try:
@@ -151,6 +240,7 @@ class _LibraryWorker(QObject):
                 species=self._species,
                 color_by=self._color_by,
                 feature_col=self._feature_col,
+                highlight_genes=self._highlight_genes,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
@@ -250,6 +340,18 @@ class AnalysisPanel(QWidget):
         )
         colour_row.addWidget(self._feature_col)
 
+        colour_row.addSpacing(tokens.S4)
+        colour_row.addWidget(QLabel("Highlight gene(s):"))
+        self._highlight_genes = _MultiSelectButton("(none)")
+        self._highlight_genes.setToolTip(
+            "Highlight points whose mutant/gene matches the selected "
+            "name(s); other points are dimmed. Empty = no highlighting."
+        )
+        self._highlight_genes.selectionChanged.connect(
+            lambda _names: self._refresh_library_view(force=True)
+        )
+        colour_row.addWidget(self._highlight_genes)
+
         colour_row.addStretch(1)
 
         self._status = QLabel("")
@@ -320,10 +422,11 @@ class AnalysisPanel(QWidget):
             return
 
         species = self._species.currentText().strip()
-        # Make sure the feature dropdown reflects the current library state
-        # before we kick off the worker (so a feature-mode render finds a
-        # valid column, not a stale one from a different species).
+        # Refresh combos that depend on library state before kicking off
+        # the worker (so a feature-mode render finds a valid column and
+        # the gene highlighter offers the right names).
         self._populate_feature_combo()
+        self._populate_gene_combo()
         color_by = self._color_by.currentData() or "cluster"
         feature_col = (
             self._feature_col.currentText() or None
@@ -332,6 +435,7 @@ class AnalysisPanel(QWidget):
         worker = _LibraryWorker(
             self._library_html_path, self._library_dir, species,
             color_by=color_by, feature_col=feature_col,
+            highlight_genes=self._highlight_genes.selected(),
         )
         self._start_worker(
             worker,
@@ -352,6 +456,20 @@ class AnalysisPanel(QWidget):
                 return
         # Re-render with the new colouring.
         self._refresh_library_view(force=True)
+
+    def _populate_gene_combo(self) -> None:
+        """Refresh the gene multi-select with the current library's genes."""
+        from mycoprep.core.extract.qc_plots import library_gene_list
+
+        species = self._species.currentText().strip()
+        try:
+            genes = library_gene_list(
+                library_dir=self._library_dir, species=species,
+            )
+        except Exception:  # noqa: BLE001
+            genes = []
+        # set_items preserves selections that are still valid.
+        self._highlight_genes.set_items(genes)
 
     def _populate_feature_combo(self) -> None:
         """Populate the feature combo from the library if not already done.
