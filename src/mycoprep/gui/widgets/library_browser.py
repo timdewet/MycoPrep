@@ -35,7 +35,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from mycoprep.core.extract.feature_library import FeatureLibrary
+from mycoprep.core.extract.feature_library import (
+    FeatureLibrary,
+    derive_run_id_from_parquet,
+)
 
 from ..ui import tokens
 
@@ -162,13 +165,19 @@ class LibraryBrowser(QWidget):
 
         actions.addStretch(1)
 
+        self._edit_btn = QPushButton("Edit selected\u2026")
+        self._edit_btn.setToolTip("Change species or experiment type for the selected run.")
+        self._edit_btn.clicked.connect(self._edit_selected)
+        self._edit_btn.setEnabled(False)
+        actions.addWidget(self._edit_btn)
+
         self._remove_btn = QPushButton("Remove selected")
         self._remove_btn.clicked.connect(self._remove_selected)
         self._remove_btn.setEnabled(False)
         actions.addWidget(self._remove_btn)
         root.addLayout(actions)
 
-        self._table.itemSelectionChanged.connect(self._update_remove_enabled)
+        self._table.itemSelectionChanged.connect(self._update_action_enabled)
 
         # Initial load
         self.refresh()
@@ -261,8 +270,10 @@ class LibraryBrowser(QWidget):
         header = f"<b>{total_runs}</b> run(s), <b>{total_cells:,}</b> cells\n\n"
         self._summary_label.setText(header + "\n".join(lines))
 
-    def _update_remove_enabled(self) -> None:
-        self._remove_btn.setEnabled(bool(self._table.selectionModel().selectedRows()))
+    def _update_action_enabled(self) -> None:
+        rows = self._table.selectionModel().selectedRows()
+        self._remove_btn.setEnabled(bool(rows))
+        self._edit_btn.setEnabled(len(rows) == 1)
 
     def _selected_run_ids(self) -> list[str]:
         rows = self._table.selectionModel().selectedRows()
@@ -272,6 +283,50 @@ class LibraryBrowser(QWidget):
             if item is not None:
                 ids.append(item.text())
         return ids
+
+    def _edit_selected(self) -> None:
+        run_ids = self._selected_run_ids()
+        if len(run_ids) != 1:
+            return
+        run_id = run_ids[0]
+        # Look up current values from the cached index.
+        runs = getattr(self, "_all_runs", None)
+        if runs is None or runs.empty:
+            return
+        match = runs[runs["run_id"] == run_id]
+        if match.empty:
+            return
+        current_species = str(match.iloc[0].get("species", ""))
+        current_type = str(match.iloc[0].get("experiment_type", "knockdown"))
+
+        species_options = ["M. tuberculosis", "M. smegmatis"]
+        try:
+            sp_idx = species_options.index(current_species)
+        except ValueError:
+            sp_idx = 0
+        species, ok = QInputDialog.getItem(
+            self, "Edit species", f"Species for '{run_id}':",
+            species_options, sp_idx, False,
+        )
+        if not ok:
+            return
+
+        type_options = ["knockdown", "drug"]
+        try:
+            t_idx = type_options.index(current_type)
+        except ValueError:
+            t_idx = 0
+        exp_type, ok = QInputDialog.getItem(
+            self, "Edit experiment type", f"Type for '{run_id}':",
+            type_options, t_idx, False,
+        )
+        if not ok:
+            return
+
+        lib = FeatureLibrary(self._library_dir)
+        lib.update_run(run_id, species=species, experiment_type=exp_type)
+        self.refresh()
+        self.libraryChanged.emit()
 
     def _remove_selected(self) -> None:
         run_ids = self._selected_run_ids()
@@ -304,9 +359,15 @@ class LibraryBrowser(QWidget):
         if not path:
             return
 
-        species, ok = QInputDialog.getText(
-            self, "Species", "Species (e.g. M. tuberculosis):",
-            text=self._species_filter.currentText(),
+        species_options = ["M. tuberculosis", "M. smegmatis"]
+        current = self._species_filter.currentText()
+        try:
+            current_idx = species_options.index(current)
+        except ValueError:
+            current_idx = 0
+        species, ok = QInputDialog.getItem(
+            self, "Species", "Species:",
+            species_options, current_idx, False,
         )
         if not ok:
             return
@@ -320,7 +381,7 @@ class LibraryBrowser(QWidget):
 
         run_id, ok = QInputDialog.getText(
             self, "Run ID", "Run ID:",
-            text=Path(path).parent.name or "imported",
+            text=derive_run_id_from_parquet(Path(path)),
         )
         if not ok or not run_id.strip():
             return

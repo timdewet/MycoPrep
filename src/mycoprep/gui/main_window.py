@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .panels.analysis_panel import AnalysisPanel
 from .panels.features_panel import FeaturesPanel
 from .panels.input_panel import InputMode, InputPanel
 from .panels.label_train_panel import LabelTrainPanel
@@ -71,6 +72,7 @@ NAV_ENTRIES = [
     NavEntry("segment",  "Segment & Classify", "segment"),
     NavEntry("features", "Features",           "features"),
     NavEntry("run",      "Run",                "run"),
+    NavEntry("analysis", "Analysis",           "analysis"),
 ]
 
 
@@ -129,6 +131,7 @@ class MainWindow(QMainWindow):
         self.segclass_panel = SegmentClassifyPanel()
         self.features_panel = FeaturesPanel()
         self.run_panel = RunPanel()
+        self.analysis_panel = AnalysisPanel()
         self.label_train_panel = LabelTrainPanel()
         self.live_preview = LivePreviewPanel()
 
@@ -168,6 +171,9 @@ class MainWindow(QMainWindow):
         self.classify_panel.openLabelTrainerRequested.connect(self._open_label_trainer)
         self.classify_panel.showModelDetailsRequested.connect(self._open_model_details)
         self.features_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
+        # Keep the Analysis panel's embedded library browser pointed at the
+        # same library directory the user picks in FeaturesPanel.
+        self.features_panel.library_dir.textChanged.connect(self._sync_analysis_library_dir)
 
         # Stage-state tracking for sidebar status dots.
         self._stage_status: dict[str, StageStatus] = {e.key: StageStatus.IDLE for e in NAV_ENTRIES}
@@ -253,7 +259,7 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.setContentsMargins(0, 0, 0, 0)
         # Pages that should fill the page (their own widgets manage stretch).
-        FILL_KEYS = {"plate", "segment", "run"}
+        FILL_KEYS = {"plate", "segment", "run", "analysis"}
         for entry, panel in zip(NAV_ENTRIES, [
             self.input_panel,
             self.layout_panel,
@@ -261,6 +267,7 @@ class MainWindow(QMainWindow):
             self.segclass_panel,
             self.features_panel,
             self.run_panel,
+            self.analysis_panel,
         ]):
             wrap = QWidget()
             wv = QVBoxLayout(wrap)
@@ -373,6 +380,8 @@ class MainWindow(QMainWindow):
         if not (0 <= idx < len(NAV_ENTRIES)):
             return
         entry = NAV_ENTRIES[idx]
+        if entry.key == "analysis":
+            self.analysis_panel.refresh_library()
         # The sidebar tracks which keys are visible (e.g. plate is hidden in
         # bulk mode); use that to drive the step counter.
         visible_entries = [e for e in NAV_ENTRIES if e.key in self._sidebar._visible_keys]
@@ -754,6 +763,10 @@ class MainWindow(QMainWindow):
         self._model_details_window.show()
         self._model_details_window.raise_()
         self._model_details_window.activateWindow()
+
+    def _sync_analysis_library_dir(self, text: str) -> None:
+        text = (text or "").strip()
+        self.analysis_panel.set_library_dir(Path(text) if text else None)
 
     def _open_library_browser(self) -> None:
         # Use the library_dir currently configured in the FeaturesPanel.

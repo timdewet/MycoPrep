@@ -132,13 +132,16 @@ def library_add(
 ) -> None:
     """Import an existing all_features.parquet into the library."""
     from pathlib import Path
-    from .extract.feature_library import FeatureLibrary
+    from .extract.feature_library import (
+        FeatureLibrary,
+        derive_run_id_from_parquet,
+    )
 
     pq = Path(parquet_path)
     if not pq.exists():
         typer.echo(f"File not found: {pq}")
         raise typer.Exit(code=1)
-    rid = run_id or pq.parent.name or "imported"
+    rid = run_id or derive_run_id_from_parquet(pq)
     lib = FeatureLibrary(Path(library_dir) if library_dir else None)
     lib.register_run(
         run_id=rid,
@@ -147,6 +150,36 @@ def library_add(
         experiment_type=experiment_type,
     )
     typer.echo(f"Registered '{rid}' ({species or 'unknown'}, {experiment_type}) in library.")
+
+
+@library_app.command("update")
+def library_update(
+    run_id: str = typer.Argument(..., help="Run ID to update."),
+    species: str = typer.Option("", help="New species value."),
+    experiment_type: str = typer.Option(
+        "", "--type", help="New experiment type (knockdown / drug)."
+    ),
+    library_dir: str = typer.Option(
+        "", "--dir", help="Library directory."
+    ),
+) -> None:
+    """Update species and/or experiment type for a registered run."""
+    from pathlib import Path
+    from .extract.feature_library import FeatureLibrary
+
+    if not species and not experiment_type:
+        typer.echo("Provide --species and/or --type to update.")
+        raise typer.Exit(code=1)
+    lib = FeatureLibrary(Path(library_dir) if library_dir else None)
+    if lib.update_run(
+        run_id,
+        species=species or None,
+        experiment_type=experiment_type or None,
+    ):
+        typer.echo(f"Updated '{run_id}'.")
+    else:
+        typer.echo(f"Run '{run_id}' not found in library.")
+        raise typer.Exit(code=1)
 
 
 @library_app.command("remove")

@@ -236,8 +236,8 @@ class FeaturesPanel(QWidget):
             "into the library after extraction completes.",
         ))
 
-        self.species = QLineEdit()
-        self.species.setPlaceholderText("e.g. M. tuberculosis")
+        self.species = QComboBox()
+        self.species.addItems(["", "M. tuberculosis", "M. smegmatis"])
         lib_form.addRow("Species:", self.species)
 
         self.experiment_type = QComboBox()
@@ -304,8 +304,8 @@ class FeaturesPanel(QWidget):
             cb.toggled.connect(self._emit_options_changed)
         for sb in (self.crop_size, self.crop_pad):
             sb.valueChanged.connect(self._emit_options_changed)
-        for le in (self.species, self.library_dir):
-            le.textChanged.connect(self._emit_options_changed)
+        self.library_dir.textChanged.connect(self._emit_options_changed)
+        self.species.currentTextChanged.connect(self._emit_options_changed)
         self.experiment_type.currentTextChanged.connect(self._emit_options_changed)
         # The channel multi-select widgets emit selection signals through
         # their internal QListWidget; hook those up too.
@@ -348,15 +348,18 @@ class FeaturesPanel(QWidget):
         )
         if not path:
             return
-        from mycoprep.core.extract.feature_library import FeatureLibrary
+        from mycoprep.core.extract.feature_library import (
+            FeatureLibrary,
+            derive_run_id_from_parquet,
+        )
 
         lib_dir_text = self.library_dir.text().strip()
         lib = FeatureLibrary(Path(lib_dir_text) if lib_dir_text else None)
-        run_id = Path(path).parent.name or "imported"
+        run_id = derive_run_id_from_parquet(Path(path))
         lib.register_run(
             run_id=run_id,
             features_parquet=Path(path),
-            species=self.species.text().strip(),
+            species=self.species.currentText().strip(),
             experiment_type=self.experiment_type.currentText(),
         )
 
@@ -378,7 +381,7 @@ class FeaturesPanel(QWidget):
             make_qc_plots=self.make_qc_plots.isChecked(),
             add_to_library=self.add_to_library.isChecked(),
             library_dir=Path(lib_dir_text) if lib_dir_text else None,
-            species=self.species.text().strip(),
+            species=self.species.currentText().strip(),
             experiment_type=self.experiment_type.currentText(),
             save_crops=self.save_crops.isChecked(),
             crop_size=int(self.crop_size.value()),
@@ -400,7 +403,7 @@ class FeaturesPanel(QWidget):
             "make_qc_plots": self.make_qc_plots.isChecked(),
             "add_to_library": self.add_to_library.isChecked(),
             "library_dir": self.library_dir.text(),
-            "species": self.species.text(),
+            "species": self.species.currentText(),
             "experiment_type": self.experiment_type.currentText(),
             "save_crops": self.save_crops.isChecked(),
             "crop_size": int(self.crop_size.value()),
@@ -445,7 +448,9 @@ class FeaturesPanel(QWidget):
             if "library_dir" in s:
                 self.library_dir.setText(str(s["library_dir"]))
             if "species" in s:
-                self.species.setText(str(s["species"]))
+                idx = self.species.findText(str(s["species"]))
+                if idx >= 0:
+                    self.species.setCurrentIndex(idx)
             if "experiment_type" in s:
                 idx = self.experiment_type.findText(str(s["experiment_type"]))
                 if idx >= 0:

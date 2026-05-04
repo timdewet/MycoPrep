@@ -162,6 +162,27 @@ class FeatureLibrary:
         self._write_index(idx)
         return True
 
+    def update_run(
+        self,
+        run_id: str,
+        species: Optional[str] = None,
+        experiment_type: Optional[str] = None,
+    ) -> bool:
+        """Update species and/or experiment_type for an existing run.
+
+        Returns True if the run was found and at least one field updated.
+        """
+        idx = self._read_index()
+        mask = idx["run_id"] == run_id
+        if not mask.any():
+            return False
+        if species is not None:
+            idx.loc[mask, "species"] = species
+        if experiment_type is not None:
+            idx.loc[mask, "experiment_type"] = experiment_type
+        self._write_index(idx)
+        return True
+
     def summary(self) -> pd.DataFrame:
         """Aggregated summary: species x experiment_type counts."""
         idx = self._read_index()
@@ -174,6 +195,23 @@ class FeatureLibrary:
             .agg(n_runs=("run_id", "size"), total_cells=("n_cells", "sum"))
             .reset_index()
         )
+
+
+_FEATURE_DIR_NAMES = {"04_features", "features"}
+
+
+def derive_run_id_from_parquet(parquet_path: Path) -> str:
+    """Best-effort run_id from an ``all_features.parquet`` path.
+
+    Walks past conventional feature-subdir names (``04_features``,
+    ``features``) so the result names the *output* directory rather than
+    the per-stage subdir.
+    """
+    p = Path(parquet_path).resolve()
+    parent = p.parent
+    if parent.name in _FEATURE_DIR_NAMES and parent.parent != parent:
+        return parent.parent.name or "imported"
+    return parent.name or "imported"
 
 
 def _condition_labels(df: pd.DataFrame) -> set[str]:
