@@ -21,6 +21,7 @@ from PyQt6.QtCore import QObject, Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -263,6 +264,7 @@ class _LibraryWorker(QObject):
         feature_col: Optional[str] = None,
         highlight_genes: Optional[list[str]] = None,
         baseline_mode: str = "pooled",
+        batch_correct: bool = True,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -272,6 +274,7 @@ class _LibraryWorker(QObject):
         self._feature_col = feature_col
         self._highlight_genes = list(highlight_genes or [])
         self._baseline_mode = baseline_mode
+        self._batch_correct = batch_correct
 
     def run(self) -> None:
         try:
@@ -288,6 +291,7 @@ class _LibraryWorker(QObject):
                 feature_col=self._feature_col,
                 highlight_genes=self._highlight_genes,
                 baseline_mode=self._baseline_mode,
+                batch_correct=self._batch_correct,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
@@ -420,6 +424,21 @@ class AnalysisPanel(QWidget):
         colour_row.addWidget(self._baseline_mode)
 
         colour_row.addSpacing(tokens.S4)
+        self._batch_correct = QCheckBox("Batch correct")
+        self._batch_correct.setChecked(True)
+        self._batch_correct.setToolTip(
+            "Apply Harmony batch correction to align PCA embeddings\n"
+            "across runs before UMAP. Recommended when combining\n"
+            "data from multiple experiments — controls from different\n"
+            "runs should converge instead of clustering per-experiment.\n\n"
+            "Requires the harmonypy package; silently skipped otherwise."
+        )
+        self._batch_correct.stateChanged.connect(
+            lambda _s: self._refresh_library_view(force=True)
+        )
+        colour_row.addWidget(self._batch_correct)
+
+        colour_row.addSpacing(tokens.S4)
         colour_row.addWidget(QLabel("Highlight gene(s):"))
         self._highlight_genes = _MultiSelectButton("(none)")
         self._highlight_genes.setToolTip(
@@ -520,6 +539,7 @@ class AnalysisPanel(QWidget):
             color_by=color_by, feature_col=feature_col,
             highlight_genes=self._highlight_genes.selected(),
             baseline_mode=baseline_mode,
+            batch_correct=self._batch_correct.isChecked(),
         )
         self._start_worker(
             worker,
