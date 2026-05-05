@@ -404,9 +404,17 @@ class InputPanel(QWidget):
         add_files_btn = QPushButton("Add files");    add_files_btn.clicked.connect(self._bulk_add_files)
         add_folder_btn = QPushButton("Add folder");  add_folder_btn.clicked.connect(self._bulk_add_folder)
         remove_btn = QPushButton("Remove selected"); remove_btn.clicked.connect(self._bulk_remove_selected)
+        remap_btn = QPushButton("Remap paths\u2026")
+        remap_btn.setToolTip(
+            "Re-base the file paths in the table — useful when a layout "
+            "saved on one machine is opened on another (e.g. the same "
+            "Dropbox folder mounted at a different OS path)."
+        )
+        remap_btn.clicked.connect(self._bulk_remap_paths)
         save_csv_btn = QPushButton("Save batch CSV");  save_csv_btn.clicked.connect(self._bulk_save_csv)
         load_csv_btn = QPushButton("Load batch CSV");  load_csv_btn.clicked.connect(self._bulk_load_csv)
-        for b in (add_files_btn, add_folder_btn, remove_btn, save_csv_btn, load_csv_btn):
+        for b in (add_files_btn, add_folder_btn, remove_btn,
+                   remap_btn, save_csv_btn, load_csv_btn):
             bar.addWidget(b)
         bar.addStretch(1)
         bv.addLayout(bar)
@@ -609,6 +617,106 @@ class InputPanel(QWidget):
         self._bulk_layout.remove_rows(rows)
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Removed {len(rows)} row(s).")
+
+    def _bulk_remap_paths(self) -> None:
+        """Re-base CZI paths in the bulk table from a user-picked root.
+
+        Finds every row whose ``czi_path`` is not currently a file and
+        prompts for a new root folder. For each missing row we look for
+        the same basename either directly under the new folder or in a
+        single-level subdirectory; the first match wins. Survivors are
+        left untouched and reported back so the user can fix them by
+        hand.
+        """
+        df = self._bulk_layout.df
+        if df.empty:
+            QMessageBox.information(self, "Nothing to remap", "The bulk table is empty.")
+            return
+
+        missing_idx = []
+        sample_missing: str | None = None
+        for i, p in enumerate(df["czi_path"].astype(str).tolist()):
+            if not p.strip():
+                continue
+            if not Path(p).exists():
+                missing_idx.append(i)
+                if sample_missing is None:
+                    sample_missing = p
+
+        if not missing_idx:
+            QMessageBox.information(
+                self, "All paths resolve",
+                "Every CZI path in the table already points at an existing file.",
+            )
+            return
+
+        prompt = (
+            f"{len(missing_idx)} of {len(df)} CZI path(s) cannot be found.\n\n"
+        )
+        if sample_missing:
+            prompt += f"Example: {sample_missing}\n\n"
+        prompt += (
+            "Pick a folder that contains those CZIs (or one of their "
+            "parent folders) and the table will be rewritten using "
+            "the matching filenames it finds."
+        )
+        QMessageBox.information(self, "Remap CZI paths", prompt)
+
+        # Default the dialog to the output dir if we have one.
+        start = str(self._out_dir) if self._out_dir else str(Path.home())
+        new_root = QFileDialog.getExistingDirectory(
+            self, "Select folder containing the CZIs", start,
+        )
+        if not new_root:
+            return
+        new_root_path = Path(new_root)
+
+        # Build a basename → resolved path index, scanning the picked
+        # folder one level deep so users can point at a parent that has
+        # several samples-by-date subdirectories.
+        index: dict[str, Path] = {}
+        try:
+            for child in new_root_path.iterdir():
+                if child.is_file() and child.suffix.lower() == ".czi":
+                    index.setdefault(child.name, child)
+            for sub in new_root_path.iterdir():
+                if sub.is_dir():
+                    for child in sub.iterdir():
+                        if child.is_file() and child.suffix.lower() == ".czi":
+                            index.setdefault(child.name, child)
+        except OSError as e:
+            QMessageBox.warning(self, "Folder unreadable", str(e))
+            return
+
+        if not index:
+            QMessageBox.warning(
+                self, "No CZIs found",
+                f"No .czi files were found directly under {new_root_path} "
+                "or its immediate subdirectories.",
+            )
+            return
+
+        remapped = 0
+        unresolved: list[str] = []
+        for i in missing_idx:
+            old = str(df.at[i, "czi_path"])
+            basename = Path(old.replace("\\", "/")).name
+            match = index.get(basename)
+            if match is None:
+                unresolved.append(basename)
+                continue
+            df.at[i, "czi_path"] = str(match)
+            remapped += 1
+
+        self._bulk_model.set_layout(self._bulk_layout)
+        msg = f"Remapped {remapped} of {len(missing_idx)} missing path(s)."
+        if unresolved:
+            head = ", ".join(unresolved[:5])
+            if len(unresolved) > 5:
+                head += f", and {len(unresolved) - 5} more"
+            msg += f"\n\nStill missing: {head}"
+        QMessageBox.information(self, "Remap complete", msg)
+        self._refresh_bulk_status(extra=msg.split("\n", 1)[0])
 
     def _bulk_save_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
