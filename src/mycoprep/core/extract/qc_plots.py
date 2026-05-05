@@ -867,7 +867,7 @@ def _plot_condition_plotly(
                     hoverinfo="text",
                 ))
 
-    elif color_by in ("run_id", "condition", "reporter", "replica"):
+    elif color_by in ("run_id", "condition", "atc", "reporter", "replica"):
         # Categorical colouring keyed on whatever meta-row attribute the
         # user picked. Empty/missing values get bucketed under "(unknown)".
         key = color_by

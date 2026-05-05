@@ -625,7 +625,7 @@ class LivePreviewPanel(QWidget):
             if not cond:
                 # Inactive well — skip; only labelled wells are samples.
                 continue
-            scenes = list(row.get("scene_indices") or [])
+            scenes = _parse_scene_indices(row.get("scene_indices"))
             source_czi = str(row.get("source_czi", "") or "").strip()
             czi_path = czi_by_name.get(source_czi)
             if czi_path is None:
@@ -642,7 +642,7 @@ class LivePreviewPanel(QWidget):
                 scene_indices = None
             else:
                 fov_count = len(scenes)
-                scene_indices = [int(s) for s in scenes]
+                scene_indices = scenes
             well = str(row.get("well", "") or "").strip() or "?"
             label = _build_label(
                 prefix=well,
@@ -1339,6 +1339,42 @@ class LivePreviewPanel(QWidget):
 # ---------------------------------------------------------------------------
 # FOV-count probes — cheap metadata reads, no full hyperstack load.
 # ---------------------------------------------------------------------------
+
+def _parse_scene_indices(raw) -> list[int]:
+    """Coerce a layout row's ``scene_indices`` value to a list of ints.
+
+    Accepts:
+      - ``None`` / empty → ``[]``
+      - a list / tuple / numpy array of int-likes → those ints
+      - a string like ``"0;1;2"``, ``"0,1,2"``, or ``"[0, 1, 2]"`` —
+        split on ``[;, \\s]`` and parsed. ``list("0;1;2")`` would yield
+        per-character iteration which previously crashed with
+        ``ValueError: invalid literal for int() with base 10: ';'``.
+    """
+    import re
+
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        cleaned = raw.strip().strip("[](){}")
+        if not cleaned:
+            return []
+        tokens = re.split(r"[;,\s]+", cleaned)
+        out: list[int] = []
+        for t in tokens:
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                out.append(int(t))
+            except ValueError:
+                continue
+        return out
+    try:
+        return [int(s) for s in raw]
+    except (TypeError, ValueError):
+        return []
+
 
 def _count_tiff_fovs(path: Path) -> int:
     try:

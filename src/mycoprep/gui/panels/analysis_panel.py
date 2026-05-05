@@ -381,7 +381,10 @@ class AnalysisPanel(QWidget):
         self._color_by = QComboBox()
         self._color_by.addItem("Cluster", userData="cluster")
         self._color_by.addItem("Run ID", userData="run_id")
-        self._color_by.addItem("Condition", userData="condition")
+        # "Condition" colours by the inducer/treatment state alone
+        # ("ATc-", "ATc+", drug concentration, etc.). The gene/mutant
+        # is separate — use the highlight-genes selector for that.
+        self._color_by.addItem("Condition", userData="atc")
         self._color_by.addItem("Reporter", userData="reporter")
         self._color_by.addItem("Replica", userData="replica")
         self._color_by.addItem("Feature gradient\u2026", userData="feature")
