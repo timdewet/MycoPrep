@@ -400,6 +400,16 @@ def _select_morphology_cols(df) -> list[str]:
     return selected
 
 
+def _extract_run_ids(profile_index) -> "np.ndarray":
+    """Extract run_id from 'condition @ run_id' index labels."""
+    import numpy as np
+
+    return np.array([
+        str(lbl).rsplit(" @ ", 1)[1] if " @ " in str(lbl) else ""
+        for lbl in profile_index
+    ])
+
+
 def _match_controls(condition_labels, control_labels: list[str]) -> "np.ndarray":
     """Boolean mask: which entries in *condition_labels* are controls.
 
@@ -529,11 +539,12 @@ def _subsample_stratified(df, max_n, group_col, rng):
 
 
 def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
-                       min_cluster_size=15, random_state=42):
-    """PCA → UMAP → HDBSCAN.  Returns (embedding_2d, cluster_labels)."""
+                       min_cluster_size=15, random_state=42,
+                       batch_labels=None):
+    """PCA → [Harmony] → UMAP → HDBSCAN.  Returns (embedding_2d, cluster_labels)."""
     import numpy as np
-    from sklearn.decomposition import PCA
     from sklearn.cluster import HDBSCAN
+    from sklearn.decomposition import PCA
 
     try:
         import umap
@@ -548,9 +559,26 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
     else:
         X_pca = X_scaled
 
+    # Harmony batch correction: align PCA embeddings across runs.
+    if batch_labels is not None:
+        unique_batches = np.unique(batch_labels)
+        if len(unique_batches) >= 2:
+            try:
+                import harmonypy
+                import pandas as pd
+
+                ho = harmonypy.run_harmony(
+                    X_pca,
+                    pd.DataFrame({"run_id": batch_labels}),
+                    vars_use="run_id",
+                    max_iter_harmony=20,
+                    nclust=min(max(2, n_samples // 5), 20),
+                )
+                X_pca = ho.Z_corr
+            except ImportError:
+                pass
+
     effective_neighbors = min(n_neighbors, n_samples - 1)
-    # n_jobs=1 explicit so seeded reproducibility doesn't trigger a warning
-    # about parallelism being disabled.
     reducer = umap.UMAP(
         n_components=2,
         n_neighbors=max(2, effective_neighbors),
@@ -561,8 +589,6 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
     embedding = reducer.fit_transform(X_pca)
 
     effective_min_cluster = min(min_cluster_size, max(2, n_samples // 10))
-    # copy=False explicit to silence the sklearn 1.10 default-change warning;
-    # we do not mutate ``embedding`` after fitting.
     clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
     labels = clusterer.fit_predict(embedding)
 
@@ -575,16 +601,25 @@ def _embed_profiles(profiles):
     Uses UMAP+HDBSCAN when there are at least 6 conditions (UMAP needs
     enough neighbours to behave); falls back to PCA + a single dummy
     cluster otherwise. Returns (embedding[N×2], cluster_labels[N]).
+
+    Batch labels are auto-extracted from the profile index (expects
+    'condition @ run_id' format) and passed to Harmony for inter-run
+    alignment when multiple runs are present.
     """
     import numpy as np
 
     X = profiles.values
     n = len(profiles)
+
+    batch_labels = _extract_run_ids(profiles.index)
+    has_batches = len(set(batch_labels) - {""}) >= 2
+
     if n >= 6:
         emb, lbl = _run_umap_hdbscan(
             X,
             n_neighbors=min(5, n - 1),
             min_cluster_size=max(2, n // 5),
+            batch_labels=batch_labels if has_batches else None,
         )
     else:
         from sklearn.decomposition import PCA as _PCA
