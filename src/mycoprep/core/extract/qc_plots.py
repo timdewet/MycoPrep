@@ -55,6 +55,7 @@ def make_qc_plots(
     species: str = "",
     current_run_id: str = "",
     control_labels: Optional[list[str]] = None,
+    batch_correct: bool = True,
     progress_cb: ProgressCB = _noop,
 ) -> Optional[Path]:
     """Generate QC plots in ``<features_dir>/qc_plots/`` from
@@ -347,6 +348,7 @@ def make_qc_plots(
             species=species,
             current_run_id=current_run_id,
             control_labels=control_labels or [],
+            batch_correct=batch_correct,
             progress_cb=progress_cb,
         )
     except Exception as e:  # noqa: BLE001
@@ -595,24 +597,29 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
     return embedding, labels
 
 
-def _embed_profiles(profiles):
+def _embed_profiles(profiles, *, batch_correct: bool = True):
     """2D embedding + cluster labels from a per-condition S-score table.
 
     Uses UMAP+HDBSCAN when there are at least 6 conditions (UMAP needs
     enough neighbours to behave); falls back to PCA + a single dummy
     cluster otherwise. Returns (embedding[N×2], cluster_labels[N]).
 
-    Batch labels are auto-extracted from the profile index (expects
-    'condition @ run_id' format) and passed to Harmony for inter-run
-    alignment when multiple runs are present.
+    When *batch_correct* is True (default), batch labels are auto-extracted
+    from the profile index (expects 'condition @ run_id' format) and
+    passed to Harmony for inter-run alignment when multiple runs are
+    present. Set to False to disable batch correction.
     """
     import numpy as np
 
     X = profiles.values
     n = len(profiles)
 
-    batch_labels = _extract_run_ids(profiles.index)
-    has_batches = len(set(batch_labels) - {""}) >= 2
+    if batch_correct:
+        batch_labels = _extract_run_ids(profiles.index)
+        has_batches = len(set(batch_labels) - {""}) >= 2
+    else:
+        batch_labels = None
+        has_batches = False
 
     if n >= 6:
         emb, lbl = _run_umap_hdbscan(
@@ -1269,6 +1276,7 @@ def render_library_html(
     feature_col: str | None = None,
     highlight_genes: list[str] | None = None,
     baseline_mode: str = "pooled",
+    batch_correct: bool = True,
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
@@ -1341,7 +1349,7 @@ def render_library_html(
         df_lib, profiles.index, "_combined_label",
         control_labels=controls,
     )
-    embedding, lbl_cluster = _embed_profiles(profiles)
+    embedding, lbl_cluster = _embed_profiles(profiles, batch_correct=batch_correct)
 
     n_runs = len(lib_index)
     title = (
@@ -1369,6 +1377,7 @@ def render_library_html(
 
 def _render_clustering_figure(
     profiles, meta_rows, *, title, out_dir, base_name, progress_cb=_noop,
+    batch_correct: bool = True,
 ):
     """Render a condition-level clustering figure as both PNG and HTML."""
     import matplotlib
@@ -1379,7 +1388,7 @@ def _render_clustering_figure(
         progress_cb(0.9, f"qc_plots: {base_name}: <2 conditions, skipping")
         return
 
-    embedding, lbl_cluster = _embed_profiles(profiles)
+    embedding, lbl_cluster = _embed_profiles(profiles, batch_correct=batch_correct)
 
     # Static PNG (single panel — cluster-colored)
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
@@ -1419,6 +1428,7 @@ def _morphology_cluster_plots(
     species="",
     current_run_id="",
     control_labels: list[str] | None = None,
+    batch_correct: bool = True,
     progress_cb=_noop,
 ):
     """Generate condition-level S-score clustering plots (static PNG + Plotly HTML).
@@ -1470,6 +1480,7 @@ def _morphology_cluster_plots(
         title="Morphological clustering — current run",
         out_dir=out_dir, base_name="morphology_clustering_run",
         progress_cb=progress_cb,
+        batch_correct=batch_correct,
     )
     progress_cb(0.9, "qc_plots: solo clustering done")
 
@@ -1566,5 +1577,6 @@ def _morphology_cluster_plots(
         title=title,
         out_dir=out_dir, base_name="morphology_clustering_library",
         progress_cb=progress_cb,
+        batch_correct=batch_correct,
     )
     progress_cb(0.95, "qc_plots: library clustering done")
