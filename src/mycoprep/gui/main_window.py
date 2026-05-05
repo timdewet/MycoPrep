@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 import mycoprep
 
+from .panels.analysis_panel import AnalysisPanel
 from .panels.features_panel import FeaturesPanel
 from .panels.input_panel import InputMode, InputPanel
 from .panels.label_train_panel import LabelTrainPanel
@@ -39,6 +40,7 @@ from .ui import icons, tokens
 from .ui.elevation import apply_shadow
 from .ui.nav_sidebar import NavEntry, NavSidebar, StageStatus
 from .updater import ReleaseInfo, UpdateChecker
+from .widgets.library_browser import LibraryBrowser
 from .widgets.live_preview import LivePreviewPanel
 
 
@@ -73,6 +75,7 @@ NAV_ENTRIES = [
     NavEntry("segment",  "Segment & Classify", "segment"),
     NavEntry("features", "Features",           "features"),
     NavEntry("run",      "Run",                "run"),
+    NavEntry("analysis", "Analysis",           "analysis", pipeline=False),
 ]
 
 
@@ -90,6 +93,14 @@ class _ModelDetailsWindow(QMainWindow):
         self.setWindowTitle("Classifier Model Details")
         self.resize(720, 380)
         self.setCentralWidget(inspector)
+
+
+class _LibraryBrowserWindow(QMainWindow):
+    def __init__(self, browser: LibraryBrowser, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Feature Library Browser")
+        self.resize(1100, 600)
+        self.setCentralWidget(browser)
 
 
 class MainWindow(QMainWindow):
@@ -115,6 +126,7 @@ class MainWindow(QMainWindow):
         self._runner: PipelineRunner | None = None
         self._labeller_window: _LabelTrainerWindow | None = None
         self._model_details_window: _ModelDetailsWindow | None = None
+        self._library_browser_window: _LibraryBrowserWindow | None = None
         self._pending_update: ReleaseInfo | None = None
 
         self.input_panel = InputPanel()
@@ -123,6 +135,7 @@ class MainWindow(QMainWindow):
         self.segclass_panel = SegmentClassifyPanel()
         self.features_panel = FeaturesPanel()
         self.run_panel = RunPanel()
+        self.analysis_panel = AnalysisPanel()
         self.label_train_panel = LabelTrainPanel()
         self.live_preview = LivePreviewPanel()
 
@@ -161,6 +174,11 @@ class MainWindow(QMainWindow):
         self.run_panel.stageEnablesChanged.connect(self._recompute_stage_readiness)
         self.classify_panel.openLabelTrainerRequested.connect(self._open_label_trainer)
         self.classify_panel.showModelDetailsRequested.connect(self._open_model_details)
+        self.features_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
+        self.analysis_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
+        # Keep the Analysis panel's library plot pointed at the same
+        # library directory the user picks in FeaturesPanel.
+        self.features_panel.library_dir.textChanged.connect(self._sync_analysis_library_dir)
 
         # Stage-state tracking for sidebar status dots.
         self._stage_status: dict[str, StageStatus] = {e.key: StageStatus.IDLE for e in NAV_ENTRIES}
@@ -193,10 +211,6 @@ class MainWindow(QMainWindow):
             segment_opts=self.segment_panel.opts,
             classify_opts=self.classify_panel.opts,
             features_opts=self.features_panel.opts,
-            # Pass the InputPanel's phase_channel through verbatim —
-            # ``None`` is the "auto-detect by skewness" sentinel, which
-            # the worker resolves from the actual image data once focus
-            # has loaded it.
             phase_channel=lambda: self.input_panel.phase_channel,
             channel_labels=lambda: self.input_panel.channel_labels,
         )
@@ -252,7 +266,7 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.setContentsMargins(0, 0, 0, 0)
         # Pages that should fill the page (their own widgets manage stretch).
-        FILL_KEYS = {"plate", "segment", "run"}
+        FILL_KEYS = {"plate", "segment", "run", "analysis"}
         for entry, panel in zip(NAV_ENTRIES, [
             self.input_panel,
             self.layout_panel,
@@ -260,6 +274,7 @@ class MainWindow(QMainWindow):
             self.segclass_panel,
             self.features_panel,
             self.run_panel,
+            self.analysis_panel,
         ]):
             wrap = QWidget()
             wv = QVBoxLayout(wrap)
@@ -303,14 +318,39 @@ class MainWindow(QMainWindow):
 
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._main_splitter.setChildrenCollapsible(False)
-        self._main_splitter.setHandleWidth(1)
+        # Wider handle than the visible line so the drag area is easy to
+        # grab — the stylesheet renders only the central pixel as a line
+        # but the hit zone extends a few px on either side.
+        self._main_splitter.setHandleWidth(6)
         self._main_splitter.addWidget(self._stack)
         self._main_splitter.addWidget(self.live_preview)
-        # Default split: ~45% options, ~55% preview. Restored from
-        # QSettings in _restore_state if a saved width is available.
-        self._main_splitter.setSizes([520, 640])
-        self._main_splitter.setStretchFactor(0, 0)
+        # Default split: 50/50. Both children get Expanding size policies
+        # so Qt distributes available width by stretch factors instead of
+        # honouring the stack's larger sizeHint, and we also seed equal
+        # initial sizes. ``_user_dragged_splitter`` flips to True if the
+        # user manually moves the handle, after which we preserve their
+        # ratio rather than snapping back.
+        from PyQt6.QtWidgets import QSizePolicy
+        self._stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self.live_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        # QStackedWidget reports its minimumSizeHint as the maximum across
+        # all child pages — and the Segment & Classify model inspector is
+        # 660 px wide, plus padding, so the stack would otherwise refuse
+        # to shrink below ~700 px regardless of which tab is showing.
+        # Cap the minimum so the user can drag the splitter freely.
+        self._stack.setMinimumWidth(200)
+        self.live_preview.setMinimumWidth(200)
+        self._main_splitter.setSizes([1000, 1000])
+        self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 1)
+        self._user_dragged_splitter = False
+        self._main_splitter.splitterMoved.connect(
+            lambda _pos, _idx: setattr(self, "_user_dragged_splitter", True)
+        )
         body_l.addWidget(self._main_splitter, stretch=1)
 
         # Compose
@@ -433,6 +473,8 @@ class MainWindow(QMainWindow):
         if not (0 <= idx < len(NAV_ENTRIES)):
             return
         entry = NAV_ENTRIES[idx]
+        if entry.key == "analysis":
+            self.analysis_panel.refresh_library()
         # The sidebar tracks which keys are visible (e.g. plate is hidden in
         # bulk mode); use that to drive the step counter.
         visible_entries = [e for e in NAV_ENTRIES if e.key in self._sidebar._visible_keys]
@@ -447,9 +489,35 @@ class MainWindow(QMainWindow):
         # tabs, hidden on input / plate / run.
         from .widgets.live_preview.panel import RENDER_TAB_KEYS
         show_preview = entry.key in RENDER_TAB_KEYS
+        was_visible = self.live_preview.isVisible()
         self.live_preview.setVisible(show_preview)
         if show_preview:
             self.live_preview.set_current_tab(entry.key)
+            # Re-impose a 50/50 split when the preview comes back from
+            # being hidden — otherwise child size hints in the stack
+            # dominate and squeeze it to a sliver. Skip if the user has
+            # dragged the handle, so we don't clobber their choice.
+            # Defer to QTimer.singleShot(0) so Qt finishes its initial
+            # show-driven layout pass first; otherwise our setSizes is
+            # immediately overridden by sizeHint-based redistribution.
+            if not was_visible and not self._user_dragged_splitter:
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, self._reset_main_splitter_to_half)
+
+    def _reset_main_splitter_to_half(self) -> None:
+        if self._user_dragged_splitter:
+            return
+        # Two-step apply: Qt's splitter uses child sizeHints during the
+        # initial layout pass that follows setVisible(True), and a
+        # synchronous setSizes runs *before* that pass, getting
+        # overridden. Pumping events first lets Qt finish the show-
+        # driven layout, then we apply our sizes on top.
+        QApplication.processEvents()
+        total = self._main_splitter.width()
+        if total <= 0:
+            return
+        half = total // 2
+        self._main_splitter.setSizes([half, total - half])
 
     # ------------------------------------------------------------------ persistence
 
@@ -464,6 +532,7 @@ class MainWindow(QMainWindow):
             s.setValue("window/nav_index", self._stack.currentIndex())
             s.setValue("window/main_splitter", self._main_splitter.saveState())
             s.setValue("input_panel", json.dumps(self.input_panel.state()))
+            s.setValue("layout_panel", json.dumps(self.layout_panel.state()))
             s.setValue("focus_panel", json.dumps(self.focus_panel.state()))
             s.setValue("segment_panel", json.dumps(self.segment_panel.state()))
             s.setValue("classify_panel", json.dumps(self.classify_panel.state()))
@@ -501,6 +570,7 @@ class MainWindow(QMainWindow):
             print(f"[mycoprep] live_preview restore failed: {e}", file=sys.stderr)
         for key, panel in (
             ("input_panel",    self.input_panel),
+            ("layout_panel",   self.layout_panel),
             ("focus_panel",    self.focus_panel),
             ("segment_panel",  self.segment_panel),
             ("classify_panel", self.classify_panel),
@@ -716,11 +786,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_channels_changed(self) -> None:
-        self.focus_panel.set_phase_channel(self.input_panel.phase_channel)
         ch = self.input_panel.phase_channel
-        ch_int = ch if isinstance(ch, int) else 0
-        self.label_train_panel.set_phase_channel(ch_int)
-        self.live_preview.set_phase_channel(ch_int)
+        self.focus_panel.set_phase_channel(ch)
+        self.label_train_panel.set_phase_channel(ch)
+        self.live_preview.set_phase_channel(ch)
         labels = self.input_panel.channel_labels or []
         self.features_panel.set_channels(list(labels))
 
@@ -815,6 +884,40 @@ class MainWindow(QMainWindow):
         self._model_details_window.raise_()
         self._model_details_window.activateWindow()
 
+    def _sync_analysis_library_dir(self, text: str) -> None:
+        text = (text or "").strip()
+        self.analysis_panel.set_library_dir(Path(text) if text else None)
+
+    def _resolve_control_labels(self, mode: InputMode) -> str:
+        """Pick the user-typed control labels from the appropriate panel.
+
+        Plate runs prefer the LayoutPanel's value (it lives next to the
+        well editor), falling back to the InputPanel. Single-file / bulk
+        runs only use the InputPanel.
+        """
+        if mode == InputMode.SINGLE_PLATE:
+            return (self.layout_panel.control_labels
+                    or self.input_panel.control_labels)
+        return self.input_panel.control_labels
+
+    def _open_library_browser(self) -> None:
+        # Use the library_dir currently configured in the FeaturesPanel.
+        lib_dir_text = self.features_panel.library_dir.text().strip()
+        lib_dir = Path(lib_dir_text) if lib_dir_text else None
+        if self._library_browser_window is None:
+            browser = LibraryBrowser(library_dir=lib_dir, parent=self)
+            # Push library mutations (import / edit / remove) back to the
+            # Analysis page so its plot stays in sync.
+            browser.libraryChanged.connect(
+                self.analysis_panel.on_library_changed_external
+            )
+            self._library_browser_window = _LibraryBrowserWindow(browser, parent=self)
+        else:
+            self._library_browser_window.centralWidget().set_library_dir(lib_dir)
+        self._library_browser_window.show()
+        self._library_browser_window.raise_()
+        self._library_browser_window.activateWindow()
+
     # ---------------------------------------------------------------- run state -> sidebar
 
     def _on_stage_run_started(self, name: str) -> None:
@@ -832,6 +935,14 @@ class MainWindow(QMainWindow):
         # Outputs now exist on disk for stages that just ran — re-evaluate so
         # any newly-produced output sets its sidebar dot green.
         self._recompute_stage_readiness()
+        # The Features stage may have just registered a new run in the
+        # feature library — refresh the Analysis page's interactive plot
+        # so it reflects the new data on next visit (or right now if the
+        # user is already on the Analysis tab).
+        try:
+            self.analysis_panel.on_pipeline_finished()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_run_all_failed(self, msg: str) -> None:
         self._run_active = False
@@ -857,6 +968,8 @@ class MainWindow(QMainWindow):
             if czi is None or not czi_paths:
                 QMessageBox.warning(self, "Missing input", "Select a CZI file.")
                 return
+            features_opts = self.features_panel.opts()
+            features_opts.control_labels = self._resolve_control_labels(mode)
             ctx = RunContext(
                 czi_path=czi,
                 czi_paths=list(czi_paths),
@@ -870,9 +983,8 @@ class MainWindow(QMainWindow):
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
-                features_opts=self.features_panel.opts(),
-                phase_channel=(self.input_panel.phase_channel
-                               if isinstance(self.input_panel.phase_channel, int) else 0),
+                features_opts=features_opts,
+                phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
             self._runner = PipelineRunner(
@@ -885,6 +997,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Validation failed", "\n".join(issues))
                 return
             entries = bulk.active_rows().to_dict(orient="records")
+            features_opts = self.features_panel.opts()
+            features_opts.control_labels = self._resolve_control_labels(mode)
             ctx = BulkRunContext(
                 czi_entries=entries,
                 output_dir=out,
@@ -895,9 +1009,8 @@ class MainWindow(QMainWindow):
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
-                features_opts=self.features_panel.opts(),
-                phase_channel=(self.input_panel.phase_channel
-                               if isinstance(self.input_panel.phase_channel, int) else 0),
+                features_opts=features_opts,
+                phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
             self._runner = BulkPipelineRunner(

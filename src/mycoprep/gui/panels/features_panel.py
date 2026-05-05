@@ -9,16 +9,21 @@ straightforward.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -98,6 +103,7 @@ class FeaturesPanel(QWidget):
     """Options for the Features stage."""
 
     optionsChanged = pyqtSignal()
+    openLibraryBrowserRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -214,20 +220,97 @@ class FeaturesPanel(QWidget):
         )
 
         root.addWidget(crops_box)
+
+        # ── Feature library ───────────────────────────────────────
+        lib_box = QGroupBox("Feature library (cross-experiment clustering)")
+        lib_form = QFormLayout(lib_box)
+        lib_form.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
+        lib_form.setHorizontalSpacing(tokens.S4)
+        lib_form.setVerticalSpacing(tokens.S3)
+
+        self.add_to_library = QCheckBox("Register this run in the feature library")
+        self.add_to_library.setChecked(False)
+        lib_form.addRow("", _with_helper(
+            self.add_to_library,
+            "When enabled, the consolidated all_features.parquet is copied "
+            "into the library after extraction completes.",
+        ))
+
+        self.species = QComboBox()
+        # Plots can't combine across species, so we don't offer an
+        # "any species" choice — pick a real one. M. tuberculosis is
+        # the most common project default.
+        self.species.addItems(["M. tuberculosis", "M. smegmatis"])
+        self.species.setCurrentText("M. tuberculosis")
+        lib_form.addRow("Species:", self.species)
+
+        self.experiment_type = QComboBox()
+        self.experiment_type.addItems(["knockdown", "drug"])
+        lib_form.addRow("Experiment type:", _with_helper(
+            self.experiment_type,
+            "Label this run as a genetic knockdown or drug treatment "
+            "experiment. Used to distinguish points in clustering plots.",
+        ))
+
+        lib_dir_row = QHBoxLayout()
+        self.library_dir = QLineEdit()
+        self.library_dir.setPlaceholderText("~/.mycoprep/feature_library/")
+        lib_dir_row.addWidget(self.library_dir)
+        self._lib_browse_btn = QPushButton("Browse\u2026")
+        self._lib_browse_btn.setFixedWidth(80)
+        self._lib_browse_btn.clicked.connect(self._browse_library_dir)
+        lib_dir_row.addWidget(self._lib_browse_btn)
+        lib_dir_widget = QWidget()
+        lib_dir_widget.setLayout(lib_dir_row)
+        lib_form.addRow("Library dir:", lib_dir_widget)
+
+        lib_buttons = QHBoxLayout()
+        self._import_btn = QPushButton("Import existing parquet\u2026")
+        self._import_btn.setToolTip(
+            "Register an already-processed all_features.parquet into the "
+            "library without rerunning the pipeline."
+        )
+        self._import_btn.clicked.connect(self._import_existing_parquet)
+        lib_buttons.addWidget(self._import_btn)
+
+        self._browse_lib_btn = QPushButton("Browse library\u2026")
+        self._browse_lib_btn.setToolTip(
+            "Open the library browser to view, filter, and manage registered runs."
+        )
+        self._browse_lib_btn.clicked.connect(self.openLibraryBrowserRequested.emit)
+        lib_buttons.addWidget(self._browse_lib_btn)
+        lib_buttons.addStretch(1)
+
+        lib_buttons_widget = QWidget()
+        lib_buttons_widget.setLayout(lib_buttons)
+        lib_form.addRow("", lib_buttons_widget)
+
+        # Disable library sub-widgets when the master checkbox is off.
+        self._lib_widgets = (
+            self.species, self.experiment_type, self.library_dir,
+            self._lib_browse_btn,
+        )
+        self.add_to_library.toggled.connect(self._refresh_library_enable)
+
+        root.addWidget(lib_box)
         root.addStretch(1)
 
         self._refresh_crops_enable(self.save_crops.isChecked())
+        self._refresh_library_enable(self.add_to_library.isChecked())
 
         # Fan in option signals → optionsChanged.
         for cb in (
             self.do_morphology, self.do_intensity, self.do_midline,
             self.do_refine_contour, self.save_csv, self.make_qc_plots,
             self.save_crops, self.include_mask, self.mask_background,
-            self.normalise_per_crop,
+            self.normalise_per_crop, self.add_to_library,
         ):
             cb.toggled.connect(self._emit_options_changed)
         for sb in (self.crop_size, self.crop_pad):
             sb.valueChanged.connect(self._emit_options_changed)
+        self.library_dir.textChanged.connect(self._emit_options_changed)
+        self.species.currentTextChanged.connect(self._emit_options_changed)
+        self.experiment_type.currentTextChanged.connect(self._emit_options_changed)
         # The channel multi-select widgets emit selection signals through
         # their internal QListWidget; hook those up too.
         self.intensity_channels._list.itemSelectionChanged.connect(self._emit_options_changed)
@@ -253,6 +336,37 @@ class FeaturesPanel(QWidget):
         for w in self._crops_widgets:
             w.setEnabled(enabled)
 
+    def _refresh_library_enable(self, enabled: bool) -> None:
+        for w in self._lib_widgets:
+            w.setEnabled(enabled)
+
+    def _browse_library_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select library directory")
+        if d:
+            self.library_dir.setText(d)
+
+    def _import_existing_parquet(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select all_features.parquet", "",
+            "Parquet files (*.parquet);;All files (*)",
+        )
+        if not path:
+            return
+        from mycoprep.core.extract.feature_library import (
+            FeatureLibrary,
+            derive_run_id_from_parquet,
+        )
+
+        lib_dir_text = self.library_dir.text().strip()
+        lib = FeatureLibrary(Path(lib_dir_text) if lib_dir_text else None)
+        run_id = derive_run_id_from_parquet(Path(path))
+        lib.register_run(
+            run_id=run_id,
+            features_parquet=Path(path),
+            species=self.species.currentText().strip(),
+            experiment_type=self.experiment_type.currentText(),
+        )
+
     # ─────────────────────────────────────────────────────────────
     # Options / persistence
     # ─────────────────────────────────────────────────────────────
@@ -260,6 +374,7 @@ class FeaturesPanel(QWidget):
     def opts(self) -> ExtractOpts:
         sel_intensity = self.intensity_channels.selected_indices() or None
         sel_crop = self.crop_channels.selected_indices() or None
+        lib_dir_text = self.library_dir.text().strip()
         return ExtractOpts(
             morphology=self.do_morphology.isChecked(),
             intensity=self.do_intensity.isChecked(),
@@ -268,6 +383,10 @@ class FeaturesPanel(QWidget):
             fluorescence_channels=sel_intensity,
             save_csv=self.save_csv.isChecked(),
             make_qc_plots=self.make_qc_plots.isChecked(),
+            add_to_library=self.add_to_library.isChecked(),
+            library_dir=Path(lib_dir_text) if lib_dir_text else None,
+            species=self.species.currentText().strip(),
+            experiment_type=self.experiment_type.currentText(),
             save_crops=self.save_crops.isChecked(),
             crop_size=int(self.crop_size.value()),
             crop_pad=int(self.crop_pad.value()),
@@ -286,6 +405,10 @@ class FeaturesPanel(QWidget):
             "intensity_channels": self.intensity_channels.selected_indices(),
             "save_csv": self.save_csv.isChecked(),
             "make_qc_plots": self.make_qc_plots.isChecked(),
+            "add_to_library": self.add_to_library.isChecked(),
+            "library_dir": self.library_dir.text(),
+            "species": self.species.currentText(),
+            "experiment_type": self.experiment_type.currentText(),
             "save_crops": self.save_crops.isChecked(),
             "crop_size": int(self.crop_size.value()),
             "crop_pad": int(self.crop_pad.value()),
@@ -324,6 +447,18 @@ class FeaturesPanel(QWidget):
                 self.mask_background.setChecked(bool(s["mask_background"]))
             if "normalise_per_crop" in s:
                 self.normalise_per_crop.setChecked(bool(s["normalise_per_crop"]))
+            if "add_to_library" in s:
+                self.add_to_library.setChecked(bool(s["add_to_library"]))
+            if "library_dir" in s:
+                self.library_dir.setText(str(s["library_dir"]))
+            if "species" in s:
+                idx = self.species.findText(str(s["species"]))
+                if idx >= 0:
+                    self.species.setCurrentIndex(idx)
+            if "experiment_type" in s:
+                idx = self.experiment_type.findText(str(s["experiment_type"]))
+                if idx >= 0:
+                    self.experiment_type.setCurrentIndex(idx)
             if "intensity_channels" in s:
                 self.intensity_channels.set_selected_indices(list(s["intensity_channels"] or []))
             if "crop_channels" in s:

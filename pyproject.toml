@@ -26,10 +26,14 @@ dependencies = [
     "PyQt6>=6.5",
     "pyqtgraph>=0.13",
     "qtawesome>=1.3",
+    "umap-learn>=0.5",
+    "plotly>=5.20",
+    "PyQt6-WebEngine>=6.5",
 ]
 
 [project.optional-dependencies]
 napari = ["napari"]
+profiling = ["harmonypy>=0.0.9"]
 test = ["pytest>=8", "pytest-qt>=4"]
 
 [project.scripts]

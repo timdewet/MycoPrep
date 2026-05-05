@@ -368,22 +368,41 @@ def classify_filter_tiff(
     data, _meta = load_hyperstack(tiff_path)        # (N_FOV, C, Y, X)
     n_fov = data.shape[0]
 
-    # IMPORTANT: use the value from `opts` (i.e. the Segment/Classify panel),
-    # NOT a freshly-detected one from the TIFF metadata. The trained CNN's
-    # rule-based companion filters (MIN_AREA_UM2 / MAX_AREA_UM2) were
-    # calibrated to whatever pixel-size constant the *training script* used
-    # (13.8767 by default). Substituting the file's "true" pixel size at
-    # inference time would shift the decision boundary and reject good cells.
-    pixels_per_um = opts.pixels_per_um
+    # The trained CNN's rule-based companion filters (MIN_AREA_UM2 /
+    # MAX_AREA_UM2) were calibrated to whatever pixel-size constant the
+    # *training script* used (13.8767 by default). The classifier's
+    # decision boundary is therefore tied to ``opts.pixels_per_um``,
+    # not the file's true scale — substituting the detected value at
+    # inference would shift the boundary and reject good cells.
+    #
+    # The *output* TIFF, however, must carry the **real** pixel size so
+    # downstream consumers (extract_features_tiff) compute lengths and
+    # widths in correct microns. We keep two scales:
+    #   - filter_pixels_per_um:    opts value, used by detect_debris /
+    #                              detect_clumps (training-time constant)
+    #   - output_pixels_per_um:    auto-detected from the input TIFF,
+    #                              written into the saved hyperstack's
+    #                              metadata
+    filter_pixels_per_um = opts.pixels_per_um
+    detected_px = _read_pixels_per_um(tiff_path)
+    output_pixels_per_um = (
+        detected_px if detected_px is not None else opts.pixels_per_um
+    )
+    pixels_per_um = filter_pixels_per_um  # legacy local name
 
     # Log which channel we're feeding the CNN as phase so wrong assignments
     # are diagnosable in the run log.
     embedded = _read_imagej_labels(tiff_path)
+    px_msg = (
+        f"filter px/µm = {filter_pixels_per_um:.4f}  ·  "
+        f"output px/µm = {output_pixels_per_um:.4f} "
+        f"({'detected' if detected_px is not None else 'fallback'})"
+    )
     if embedded and 0 <= phase_channel < len(embedded):
         progress_cb(0.03, f"Phase channel = {phase_channel} ('{embedded[phase_channel]}'); "
-                          f"input channels: {embedded}  ·  filter px/µm = {pixels_per_um}")
+                          f"input channels: {embedded}  ·  {px_msg}")
     else:
-        progress_cb(0.03, f"Phase channel = {phase_channel}  ·  filter px/µm = {pixels_per_um}")
+        progress_cb(0.03, f"Phase channel = {phase_channel}  ·  {px_msg}")
 
     # Mask is the last channel; image channels are everything else.
     from skimage.measure import label as sk_label
@@ -497,7 +516,10 @@ def classify_filter_tiff(
         condition_name=tiff_path.stem + "__filtered",
         filenames=[f"fov_{i:03d}" for i in range(stacked.shape[0])],
         channel_labels=channel_labels,
-        pixels_per_um=pixels_per_um,
+        # Use the *real* per-image pixel size in the saved metadata so
+        # extract_features_tiff produces correct microns. The CNN filter
+        # used ``filter_pixels_per_um`` above; that's a separate concern.
+        pixels_per_um=output_pixels_per_um,
     )
 
     # Carry the acquisition sidecar from the input TIFF to the classified

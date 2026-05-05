@@ -20,6 +20,7 @@ from mycoprep.core.api import (
     segment_tiff,
     split_plate,
 )
+from mycoprep.core.extract.feature_library import FeatureLibrary
 
 from .context import RunContext
 
@@ -46,6 +47,13 @@ def _scaled_cb(outer: ProgressCB, base: float, span: float) -> ProgressCB:
     def inner(f: float, msg: str) -> None:
         outer(base + f * span, msg)
     return inner
+
+
+def _parse_control_labels(text: str) -> list[str]:
+    """Comma-separated control labels → list of stripped non-empty tokens."""
+    if not text:
+        return []
+    return [t.strip() for t in str(text).split(",") if t and t.strip()]
 
 
 def _iter_tiffs(directory: Path) -> list[Path]:
@@ -575,12 +583,43 @@ class ExtractStage:
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"Per-well crops OK but consolidation failed: {e}")
 
+        # Register with the feature library (opt-in).
+        all_pq = ctx.features_dir / "all_features.parquet"
+        library_dir = getattr(opts, "library_dir", None)
+        if outputs and getattr(opts, "add_to_library", False) and all_pq.exists():
+            try:
+                lib = FeatureLibrary(library_dir)
+                source_czi = ""
+                acq_dt = ""
+                lib.register_run(
+                    run_id=run_id,
+                    features_parquet=all_pq,
+                    species=getattr(opts, "species", ""),
+                    experiment_type=getattr(opts, "experiment_type", "knockdown"),
+                    source_czi=source_czi,
+                    acquisition_datetime=acq_dt,
+                    control_labels=getattr(opts, "control_labels", ""),
+                )
+                progress_cb(1.0, f"Registered run '{run_id}' in feature library")
+            except Exception as e:  # noqa: BLE001
+                progress_cb(1.0, f"Library registration failed: {e}")
+
         # Auto-QC plots — runs after consolidation so the plots use the
         # canonical ``all_features.parquet``. Off via ``opts.make_qc_plots``
         # for users who don't want the matplotlib import at end of run.
         if outputs and getattr(opts, "make_qc_plots", True):
             try:
-                make_qc_plots(ctx.features_dir, progress_cb=progress_cb)
+                control_labels = _parse_control_labels(
+                    getattr(opts, "control_labels", "")
+                )
+                make_qc_plots(
+                    ctx.features_dir,
+                    library_dir=library_dir,
+                    species=getattr(opts, "species", ""),
+                    current_run_id=run_id,
+                    control_labels=control_labels,
+                    progress_cb=progress_cb,
+                )
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"qc_plots skipped ({e})")
 
