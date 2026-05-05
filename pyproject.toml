@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 napari = ["napari"]
+profiling = ["harmonypy>=0.0.9"]
 test = ["pytest>=8", "pytest-qt>=4"]
 
 [project.scripts]
