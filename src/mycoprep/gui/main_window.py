@@ -6,9 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QSettings, QSize, Qt as _Qt
+from PyQt6.QtCore import QByteArray, QSettings, QSize, Qt as _Qt, QTimer, QUrl
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QDesktopServices, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,6 +25,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import mycoprep
+
 from .panels.analysis_panel import AnalysisPanel
 from .panels.features_panel import FeaturesPanel
 from .panels.input_panel import InputMode, InputPanel
@@ -37,6 +39,7 @@ from .pipeline.runner import BulkPipelineRunner, PipelineRunner
 from .ui import icons, tokens
 from .ui.elevation import apply_shadow
 from .ui.nav_sidebar import NavEntry, NavSidebar, StageStatus
+from .updater import ReleaseInfo, UpdateChecker
 from .widgets.library_browser import LibraryBrowser
 from .widgets.live_preview import LivePreviewPanel
 
@@ -124,6 +127,7 @@ class MainWindow(QMainWindow):
         self._labeller_window: _LabelTrainerWindow | None = None
         self._model_details_window: _ModelDetailsWindow | None = None
         self._library_browser_window: _LibraryBrowserWindow | None = None
+        self._pending_update: ReleaseInfo | None = None
 
         self.input_panel = InputPanel()
         self.layout_panel = LayoutPanel()
@@ -190,6 +194,12 @@ class MainWindow(QMainWindow):
         self._on_input_mode_changed(self.input_panel.mode)
         self._restore_state()
         self._refresh_input_status()
+
+        # Background GitHub Releases poll. No-ops in dev mode (not frozen);
+        # deferred so the main window paints before the network call.
+        self._update_checker = UpdateChecker(self)
+        self._update_checker.updateAvailable.connect(self._on_update_available)
+        QTimer.singleShot(2000, self._update_checker.check)
 
     # ------------------------------------------------------------------ live preview
 
@@ -350,6 +360,7 @@ class MainWindow(QMainWindow):
         v.setSpacing(0)
         v.addWidget(self._header)
         v.addWidget(header_div)
+        v.addWidget(self._build_update_banner())
         v.addWidget(body, stretch=1)
         self.setCentralWidget(wrap)
 
@@ -394,6 +405,66 @@ class MainWindow(QMainWindow):
                 form.setFieldGrowthPolicy(
                     QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
                 )
+
+    # ------------------------------------------------------------------ updates
+
+    def _build_update_banner(self) -> QWidget:
+        """Thin banner shown when a newer GitHub release exists.
+
+        Hidden by default; ``_on_update_available`` flips it on. Lives
+        between the header and the body so it never overlaps panel
+        content.
+        """
+        banner = QFrame()
+        banner.setObjectName("updateBanner")
+        banner.setVisible(False)
+        h = QHBoxLayout(banner)
+        h.setContentsMargins(tokens.S5, tokens.S2, tokens.S5, tokens.S2)
+        h.setSpacing(tokens.S3)
+
+        self._update_msg = QLabel("")
+        self._update_msg.setObjectName("updateBannerMsg")
+        self._update_msg.setWordWrap(True)
+        h.addWidget(self._update_msg, stretch=1)
+
+        view_btn = QPushButton("View Release")
+        view_btn.setObjectName("updateBannerView")
+        view_btn.clicked.connect(self._on_update_view_clicked)
+        h.addWidget(view_btn)
+
+        dismiss_btn = QPushButton("Dismiss")
+        dismiss_btn.setObjectName("updateBannerDismiss")
+        dismiss_btn.clicked.connect(self._on_update_dismiss_clicked)
+        h.addWidget(dismiss_btn)
+
+        self._update_banner = banner
+        return banner
+
+    def _on_update_available(self, info: ReleaseInfo) -> None:
+        # Honour a per-version dismissal so we don't nag on every launch
+        # for the same release.
+        dismissed = self._settings().value("updates/dismissed_version", "", type=str)
+        if dismissed == info.version:
+            return
+        self._pending_update = info
+        self._update_msg.setText(
+            f"MycoPrep {info.tag} is available — you're running v{mycoprep.__version__}."
+        )
+        self._update_banner.setVisible(True)
+
+    def _on_update_view_clicked(self) -> None:
+        info = self._pending_update
+        url = (info.release_url if info else "") or \
+            "https://github.com/timdewet/MycoPrep/releases"
+        QDesktopServices.openUrl(QUrl(url))
+        self._update_banner.setVisible(False)
+
+    def _on_update_dismiss_clicked(self) -> None:
+        if self._pending_update is not None:
+            self._settings().setValue(
+                "updates/dismissed_version", self._pending_update.version
+            )
+        self._update_banner.setVisible(False)
 
     # ------------------------------------------------------------------ nav
 

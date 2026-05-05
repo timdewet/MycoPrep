@@ -600,6 +600,8 @@ class InputPanel(QWidget):
         n = self._bulk_layout.add_files([Path(p) for p in paths])
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Added {n} file(s).")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of CZIs")
@@ -608,6 +610,8 @@ class InputPanel(QWidget):
         n = self._bulk_layout.add_folder(Path(folder))
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Added {n} file(s) from {folder}.")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_remove_selected(self) -> None:
         sel = self._bulk_table.selectionModel().selectedRows() if self._bulk_table.selectionModel() else []
@@ -617,6 +621,8 @@ class InputPanel(QWidget):
         self._bulk_layout.remove_rows(rows)
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Removed {len(rows)} row(s).")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_remap_paths(self) -> None:
         """Re-base CZI paths in the bulk table from a user-picked root.
@@ -743,6 +749,8 @@ class InputPanel(QWidget):
             return
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Loaded {len(self._bulk_layout.df)} row(s) from {path}.")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _refresh_bulk_status(self, extra: str = "") -> None:
         n_total = len(self._bulk_layout.df)
