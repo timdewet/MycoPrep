@@ -72,6 +72,28 @@ class MidlineFeatures:
     # equivalents for downstream distribution analysis.
     area_um2_subpixel: float
     perimeter_um_subpixel: float
+    # Derived from the existing midline + sub-pixel contour without any
+    # extra heavy computation.
+    width_amplitude_um: float
+    width_variation: float
+    aspect_ratio: float
+    circularity_subpixel: float
+    pole_width_um: float
+    pole_taper: float
+    # MicrobeJ-style contour features derived from the sub-pixel contour
+    # spline. Angularity = |angle change| between successive tangents on
+    # an arc-length-uniform resampling. Curvature = mean / std / max of
+    # the signed curvature κ = (x'·y'' − y'·x'') / (x'² + y'²)^(3/2)
+    # evaluated on the closed-periodic spline.
+    angularity_mean: float
+    angularity_max: float
+    angularity_median: float
+    angularity_std: float
+    angularity_amplitude: float
+    angularity_variation: float
+    curvature_mean: float
+    curvature_std: float
+    curvature_max: float
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -375,6 +397,140 @@ def _subpixel_widths_px(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# MicrobeJ-style contour shape: angularity + curvature
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _resample_contour_uniform_arc(
+    contour: np.ndarray, n_samples: int = 100,
+) -> Optional[np.ndarray]:
+    """Resample a closed contour at uniform arc-length spacing.
+
+    Closes the contour explicitly, computes cumulative arc length, then
+    interpolates ``n_samples`` points spaced uniformly in arc-length so
+    that downstream tangent / curvature stats aren't biased by the raw
+    contour's vertex density (which can be uneven, especially after
+    snap-and-spline refinement).
+    """
+    if contour is None or len(contour) < 4:
+        return None
+    closed = np.vstack([contour, contour[:1]])
+    diffs = np.diff(closed, axis=0)
+    seg_lens = np.linalg.norm(diffs, axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total = cum[-1]
+    if total <= 0:
+        return None
+    # Uniform arc-length parameter, dropping the last (= first) point so
+    # the ``n_samples`` returned positions form a closed loop without
+    # duplication.
+    targets = np.linspace(0.0, total, n_samples, endpoint=False)
+    ys = np.interp(targets, cum, closed[:, 0])
+    xs = np.interp(targets, cum, closed[:, 1])
+    return np.column_stack([ys, xs])
+
+
+def _angularity_stats(uniform_contour: np.ndarray) -> dict[str, float]:
+    """|Angle change| between successive tangents on a closed uniform contour.
+
+    For each vertex i: tangent_i = (p_{i+1} - p_{i-1}) (central difference,
+    periodic wrap). Angle between successive tangents is taken as the
+    absolute angle of the cross-product / dot-product, in radians,
+    folded into ``[0, π]``.
+
+    Returns a dict with mean / max / median / std / amplitude / variation
+    of the |angle| series. ``amplitude = max − min``,
+    ``variation = std / mean``.
+    """
+    p = uniform_contour
+    n = len(p)
+    if n < 4:
+        return {k: float("nan") for k in
+                ("mean", "max", "median", "std", "amplitude", "variation")}
+    nxt = np.roll(p, -1, axis=0)
+    prv = np.roll(p, 1, axis=0)
+    tangents = nxt - prv
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    tangents = tangents / norms
+    # Successive-tangent angle: signed via cross, magnitude folded into
+    # [0, π]. ``arctan2(|cross|, dot)`` is numerically stabler than
+    # ``arccos(dot)``.
+    t1 = tangents
+    t2 = np.roll(tangents, -1, axis=0)
+    cross = t1[:, 0] * t2[:, 1] - t1[:, 1] * t2[:, 0]
+    dot = (t1 * t2).sum(axis=1)
+    ang = np.abs(np.arctan2(np.abs(cross), dot))  # [0, π]
+    mean = float(np.mean(ang))
+    return {
+        "mean": mean,
+        "max": float(np.max(ang)),
+        "median": float(np.median(ang)),
+        "std": float(np.std(ang)),
+        "amplitude": float(np.max(ang) - np.min(ang)),
+        "variation": float(np.std(ang) / mean) if mean > 1e-9 else 0.0,
+    }
+
+
+def _curvature_stats(uniform_contour: np.ndarray) -> dict[str, float]:
+    """Mean / std / max |κ| on a closed periodic cubic-spline fit.
+
+    Fits ``splprep`` with periodic boundary on the uniform-arc contour,
+    evaluates first and second derivatives, computes signed curvature
+    κ = (x'·y'' − y'·x'') / (x'² + y'²)^(3/2), and returns summary
+    statistics of |κ|. Returns NaN entries on spline failure (very small
+    or pathological cells).
+    """
+    p = uniform_contour
+    n = len(p)
+    if n < 8:
+        return {"mean": float("nan"), "std": float("nan"), "max": float("nan")}
+    try:
+        from scipy.interpolate import splev, splprep
+        tck, _ = splprep(
+            [p[:, 1], p[:, 0]], s=float(n) * 0.5, per=True, k=3,
+        )
+        u = np.linspace(0.0, 1.0, n, endpoint=False)
+        x1, y1 = splev(u, tck, der=1)
+        x2, y2 = splev(u, tck, der=2)
+        denom = (x1 * x1 + y1 * y1) ** 1.5
+        denom = np.where(denom < 1e-9, 1e-9, denom)
+        kappa = np.abs((x1 * y2 - y1 * x2) / denom)
+        return {
+            "mean": float(np.mean(kappa)),
+            "std": float(np.std(kappa)),
+            "max": float(np.max(kappa)),
+        }
+    except Exception:  # noqa: BLE001
+        return {"mean": float("nan"), "std": float("nan"), "max": float("nan")}
+
+
+def _pole_widths(dense_widths_um: np.ndarray, frac: float = 0.1) -> tuple[float, float]:
+    """Mean width over the two pole regions and a pole/mid taper ratio.
+
+    ``frac`` is the arc fraction at each pole counted toward the pole
+    width — default 0.1 means widths in [0, 0.1] ∪ [0.9, 1] of the dense
+    width vector. Mid width = mean of widths in [0.4, 0.6].
+    Returns ``(pole_width_um, pole_taper)`` where ``pole_taper`` is
+    ``pole / mid`` (0.0 if mid is zero / cell is degenerate).
+    """
+    n = len(dense_widths_um)
+    if n < 4:
+        return float("nan"), float("nan")
+    k = max(1, int(round(n * frac)))
+    pole = float(np.mean(np.concatenate([
+        dense_widths_um[:k], dense_widths_um[-k:],
+    ])))
+    mid_lo = int(round(n * 0.4))
+    mid_hi = int(round(n * 0.6))
+    if mid_hi <= mid_lo:
+        mid_hi = mid_lo + 1
+    mid = float(np.mean(dense_widths_um[mid_lo:mid_hi]))
+    taper = pole / mid if mid > 1e-9 else 0.0
+    return pole, taper
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Public entry
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -446,12 +602,13 @@ def midline_features(
         # is a chunky rod's diameter. Better than nothing.
         peak_idx = np.unravel_index(int(np.argmax(dt)), dt.shape)
         d = float(dt[peak_idx])
+        diameter_um = 2 * d * px_per_um
         return MidlineFeatures(
-            length_um=2 * d * px_per_um,
-            width_median_um=2 * d * px_per_um,
-            width_mean_um=2 * d * px_per_um,
-            width_max_um=2 * d * px_per_um,
-            width_min_um=2 * d * px_per_um,
+            length_um=diameter_um,
+            width_median_um=diameter_um,
+            width_mean_um=diameter_um,
+            width_max_um=diameter_um,
+            width_min_um=diameter_um,
             width_std_um=0.0,
             max_width_position_frac=0.5,
             min_width_position_frac=0.5,
@@ -459,6 +616,21 @@ def midline_features(
             branch_count=0,
             area_um2_subpixel=area_um2_subpixel,
             perimeter_um_subpixel=perimeter_um_subpixel,
+            width_amplitude_um=0.0,
+            width_variation=0.0,
+            aspect_ratio=1.0,
+            circularity_subpixel=1.0,
+            pole_width_um=diameter_um,
+            pole_taper=1.0,
+            angularity_mean=float("nan"),
+            angularity_max=float("nan"),
+            angularity_median=float("nan"),
+            angularity_std=float("nan"),
+            angularity_amplitude=float("nan"),
+            angularity_variation=float("nan"),
+            curvature_mean=float("nan"),
+            curvature_std=float("nan"),
+            curvature_max=float("nan"),
         )
 
     midline_arr = np.asarray(midline, dtype=np.int32)
@@ -528,17 +700,67 @@ def midline_features(
     if frac_min > 0.5:
         frac_min = 1.0 - frac_min
 
+    width_median_um = float(np.median(dense_widths_um))
+    width_mean_um = float(np.mean(dense_widths_um))
+    width_max_um = float(np.max(dense_widths_um))
+    width_min_um = float(np.min(dense_widths_um))
+    width_std_um = float(np.std(dense_widths_um))
+
+    width_amplitude_um = width_max_um - width_min_um
+    width_variation = (
+        width_std_um / width_mean_um if width_mean_um > 1e-9 else 0.0
+    )
+    aspect_ratio = (
+        length_um / width_median_um if width_median_um > 1e-9 else 0.0
+    )
+    circularity_subpixel = (
+        4.0 * np.pi * area_um2_subpixel / (perimeter_um_subpixel ** 2)
+        if perimeter_um_subpixel > 1e-9 else 0.0
+    )
+    pole_width_um, pole_taper = _pole_widths(dense_widths_um)
+
+    # MicrobeJ-style contour shape stats — operate on the (already
+    # spline-smoothed if refinement was on) sub-pixel contour, resampled
+    # at uniform arc length so vertex-density variation doesn't bias the
+    # angle / curvature distributions.
+    if contour is not None:
+        uniform = _resample_contour_uniform_arc(contour, n_samples=100)
+    else:
+        uniform = None
+    if uniform is not None:
+        ang = _angularity_stats(uniform)
+        curv = _curvature_stats(uniform)
+    else:
+        ang = {k: float("nan") for k in
+               ("mean", "max", "median", "std", "amplitude", "variation")}
+        curv = {"mean": float("nan"), "std": float("nan"), "max": float("nan")}
+
     return MidlineFeatures(
         length_um=length_um,
-        width_median_um=float(np.median(dense_widths_um)),
-        width_mean_um=float(np.mean(dense_widths_um)),
-        width_max_um=float(np.max(dense_widths_um)),
-        width_min_um=float(np.min(dense_widths_um)),
-        width_std_um=float(np.std(dense_widths_um)),
+        width_median_um=width_median_um,
+        width_mean_um=width_mean_um,
+        width_max_um=width_max_um,
+        width_min_um=width_min_um,
+        width_std_um=width_std_um,
         max_width_position_frac=float(frac_max),
         min_width_position_frac=float(frac_min),
         sinuosity=float(sinuosity),
         branch_count=int(_branch_count(neigh)),
         area_um2_subpixel=float(area_um2_subpixel),
         perimeter_um_subpixel=float(perimeter_um_subpixel),
+        width_amplitude_um=width_amplitude_um,
+        width_variation=width_variation,
+        aspect_ratio=aspect_ratio,
+        circularity_subpixel=circularity_subpixel,
+        pole_width_um=pole_width_um,
+        pole_taper=pole_taper,
+        angularity_mean=ang["mean"],
+        angularity_max=ang["max"],
+        angularity_median=ang["median"],
+        angularity_std=ang["std"],
+        angularity_amplitude=ang["amplitude"],
+        angularity_variation=ang["variation"],
+        curvature_mean=curv["mean"],
+        curvature_std=curv["std"],
+        curvature_max=curv["max"],
     )

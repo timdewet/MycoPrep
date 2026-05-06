@@ -197,6 +197,22 @@ def extract_fov_features(
         branches = np.full(n_cells, -1, dtype=np.int32)
         area_subpix = np.full(n_cells, np.nan, dtype=np.float64)
         perim_subpix = np.full(n_cells, np.nan, dtype=np.float64)
+        # New shape features (Mtb-parity).
+        w_amp = np.full(n_cells, np.nan, dtype=np.float64)
+        w_var = np.full(n_cells, np.nan, dtype=np.float64)
+        aspect = np.full(n_cells, np.nan, dtype=np.float64)
+        circ_sub = np.full(n_cells, np.nan, dtype=np.float64)
+        pole_w = np.full(n_cells, np.nan, dtype=np.float64)
+        pole_t = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_mean = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_max = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_med = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_std = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_amp = np.full(n_cells, np.nan, dtype=np.float64)
+        ang_var = np.full(n_cells, np.nan, dtype=np.float64)
+        curv_mean = np.full(n_cells, np.nan, dtype=np.float64)
+        curv_std = np.full(n_cells, np.nan, dtype=np.float64)
+        curv_max = np.full(n_cells, np.nan, dtype=np.float64)
         for i, cid in enumerate(cell_ids):
             y0 = int(base["bbox-0"][i]); x0 = int(base["bbox-1"][i])
             y1 = int(base["bbox-2"][i]); x1 = int(base["bbox-3"][i])
@@ -221,6 +237,21 @@ def extract_fov_features(
             branches[i] = mf.branch_count
             area_subpix[i] = mf.area_um2_subpixel
             perim_subpix[i] = mf.perimeter_um_subpixel
+            w_amp[i] = mf.width_amplitude_um
+            w_var[i] = mf.width_variation
+            aspect[i] = mf.aspect_ratio
+            circ_sub[i] = mf.circularity_subpixel
+            pole_w[i] = mf.pole_width_um
+            pole_t[i] = mf.pole_taper
+            ang_mean[i] = mf.angularity_mean
+            ang_max[i] = mf.angularity_max
+            ang_med[i] = mf.angularity_median
+            ang_std[i] = mf.angularity_std
+            ang_amp[i] = mf.angularity_amplitude
+            ang_var[i] = mf.angularity_variation
+            curv_mean[i] = mf.curvature_mean
+            curv_std[i] = mf.curvature_std
+            curv_max[i] = mf.curvature_max
         df["length_um"] = length_um
         df["width_median_um"] = w_med
         df["width_mean_um"] = w_mean
@@ -233,6 +264,32 @@ def extract_fov_features(
         df["branch_count"] = branches
         df["area_um2_subpixel"] = area_subpix
         df["perimeter_um_subpixel"] = perim_subpix
+        df["width_amplitude_um"] = w_amp
+        df["width_variation"] = w_var
+        df["aspect_ratio"] = aspect
+        df["circularity_subpixel"] = circ_sub
+        df["pole_width_um"] = pole_w
+        df["pole_taper"] = pole_t
+        df["angularity_mean"] = ang_mean
+        df["angularity_max"] = ang_max
+        df["angularity_median"] = ang_med
+        df["angularity_std"] = ang_std
+        df["angularity_amplitude"] = ang_amp
+        df["angularity_variation"] = ang_var
+        df["curvature_mean"] = curv_mean
+        df["curvature_std"] = curv_std
+        df["curvature_max"] = curv_max
+
+        # roundness = 4·area / (π·feret_max²) — needs both subpixel area
+        # (from midline) and feret_diameter_max (from regionprops). Done
+        # here so we don't have to thread feret into midline_features.
+        feret_um = df["feret_diameter_max_um"].to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df["roundness"] = np.where(
+                feret_um > 1e-9,
+                4.0 * area_subpix / (np.pi * feret_um * feret_um),
+                np.nan,
+            )
 
     # Identifiers + provenance — these are constant for the FOV.
     cell_uids = [
