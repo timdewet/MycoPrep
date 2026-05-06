@@ -161,6 +161,8 @@ def train_supcon(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,  # GPU-batched augmentation in the loop produces 2 views
         indices=train_idx,
     )
@@ -168,6 +170,8 @@ def train_supcon(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,
         indices=val_idx,
     )

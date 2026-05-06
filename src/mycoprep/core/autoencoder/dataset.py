@@ -56,6 +56,13 @@ class HDF5CropDataset(Dataset):
         *,
         target_size: int = 128,
         in_channels: int = 1,
+        # Per-channel selection. ``image_channels=None`` uses the first
+        # ``in_channels`` non-mask channels; otherwise pick by name.
+        # ``include_mask=True`` appends the mask channel binarised at 0.5
+        # — matches the Mtb reference's 3-channel input (phase + ParB +
+        # mask).
+        image_channels: Optional[list[str]] = None,
+        include_mask: bool = True,
         # Kept for API compatibility — ignored. Augmentation is done on the
         # GPU per batch in train.py for efficiency.
         augment: bool = False,
@@ -71,6 +78,12 @@ class HDF5CropDataset(Dataset):
 
         self.target_size = target_size
         self.in_channels = in_channels
+        self._image_channels = image_channels
+        self._include_mask = bool(include_mask)
+        # Track per-file the local index of the mask channel in the
+        # selected slice (or -1 if no mask was appended) so __getitem__
+        # can binarise it after read.
+        self._mask_local_idx: list[int] = []
 
         # Build an index mapping global_idx → (file_idx, local_idx)
         self._h5_paths = [Path(p) for p in h5_paths]
@@ -87,13 +100,18 @@ class HDF5CropDataset(Dataset):
                 crop_sz = int(f.attrs.get("crop_size", f["crops"].shape[-1]))
                 channel_names = list(f.attrs.get("channel_names", []))
 
-                # Select imaging channels (drop mask)
-                ch_idx = self._select_channels(channel_names, in_channels)
+                ch_idx, mask_local = self._select_channels(
+                    channel_names,
+                    in_channels=in_channels,
+                    image_channels=image_channels,
+                    include_mask=self._include_mask,
+                )
 
                 self._file_offsets.append(total)
                 self._file_lengths.append(n)
                 self._channel_indices.append(ch_idx)
                 self._crop_sizes.append(crop_sz)
+                self._mask_local_idx.append(mask_local)
                 total += n
                 total_bytes += n * len(ch_idx) * target_size * target_size * 4
 
@@ -140,6 +158,13 @@ class HDF5CropDataset(Dataset):
                 arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
                 if arr.shape[-1] != self.target_size:
                     arr = self._batched_resize(arr, self.target_size)
+                # Binarise the mask channel post-resize so bilinear
+                # interpolation can't leave it on intermediate values.
+                mask_local = self._mask_local_idx[fi]
+                if mask_local >= 0 and mask_local < arr.shape[1]:
+                    arr[:, mask_local] = (arr[:, mask_local] >= 0.5).astype(
+                        np.float32
+                    )
                 _CROP_CACHE[cache_key] = arr
                 self._cached[fi] = arr
 
@@ -181,16 +206,61 @@ class HDF5CropDataset(Dataset):
         return np.concatenate(out_chunks, axis=0)
 
     @staticmethod
-    def _select_channels(channel_names: list[str], in_channels: int) -> list[int]:
-        """Pick the first ``in_channels`` imaging channels (skip mask)."""
-        imaging = []
-        for i, name in enumerate(channel_names):
-            if "mask" in name.lower():
-                continue
-            imaging.append(i)
-        if not imaging:
-            imaging = list(range(in_channels))
-        return imaging[:in_channels]
+    def _select_channels(
+        channel_names: list[str],
+        *,
+        in_channels: int,
+        image_channels: Optional[list[str]] = None,
+        include_mask: bool = True,
+    ) -> tuple[list[int], int]:
+        """Resolve the selected channel indices for one H5 file.
+
+        - If ``image_channels`` is provided, match each name case-
+          insensitively against ``channel_names`` and use those (in the
+          requested order) as the imaging channels.
+        - Otherwise take the first ``in_channels`` non-mask channels in
+          file order.
+        - When ``include_mask`` is True, append the mask channel (the
+          first channel whose name contains "mask") if found.
+
+        Returns ``(selected_indices, mask_local_idx)`` where
+        ``mask_local_idx`` is the position of the mask in
+        ``selected_indices`` (or -1 if no mask was appended).
+        """
+        lower_names = [str(n).lower() for n in channel_names]
+        mask_global_idx = next(
+            (i for i, n in enumerate(lower_names) if "mask" in n),
+            -1,
+        )
+
+        if image_channels is not None:
+            wanted = [str(c).lower() for c in image_channels]
+            imaging: list[int] = []
+            for w in wanted:
+                # Exact match preferred, fall back to substring containment.
+                hit = next(
+                    (i for i, n in enumerate(lower_names) if n == w),
+                    None,
+                )
+                if hit is None:
+                    hit = next(
+                        (i for i, n in enumerate(lower_names) if w in n),
+                        None,
+                    )
+                if hit is not None and hit != mask_global_idx:
+                    imaging.append(hit)
+        else:
+            imaging = [
+                i for i, n in enumerate(lower_names) if "mask" not in n
+            ]
+            if not imaging:
+                imaging = list(range(in_channels))
+            imaging = imaging[: max(0, int(in_channels))]
+
+        if include_mask and mask_global_idx >= 0:
+            selected = imaging + [mask_global_idx]
+            return selected, len(imaging)  # mask is the appended channel
+        return imaging, -1
 
     def _get_h5(self, file_idx: int):
         import h5py
@@ -243,6 +313,12 @@ class HDF5CropDataset(Dataset):
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
+
+        # Re-binarise the mask channel after the bilinear resize so
+        # downstream code sees crisp {0, 1}.
+        mask_local = self._mask_local_idx[file_idx]
+        if mask_local >= 0 and mask_local < crop.shape[0]:
+            crop[mask_local] = (crop[mask_local] >= 0.5).to(crop.dtype)
 
         # Metadata
         meta = {"global_idx": global_idx, "file_idx": file_idx}

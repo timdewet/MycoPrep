@@ -50,52 +50,119 @@ def _gaussian_kernel_2d(sigma: float, device: torch.device) -> torch.Tensor:
 def _augment_batch_gpu(
     crops: torch.Tensor, config: AutoencoderConfig
 ) -> torch.Tensor:
-    """Batched augmentation on the GPU.
+    """Per-image augmentation on the GPU.
 
-    Operates on a (B, C, H, W) tensor already on the device. Per-batch
-    rotation/flip/blur (one random choice per batch — across many batches
-    over training the augmentation distribution is still wide). Per-image
-    brightness/contrast (cheap, vectorised).
+    Operates on a (B, C, H, W) tensor already on the device. Each crop
+    in the batch gets its OWN random rotation, flip, affine perturbation,
+    brightness/contrast factor, and Gaussian noise level. This is
+    critical for SupCon: when the loss compares two augmented views per
+    cell, the two views must differ independently per cell — applying
+    one batch-wide rotation makes every "view A vs view B" comparison
+    look the same and degrades the embedding.
+
+    Augmentations applied (each per-image independent):
+    - 90° rotation × random horizontal/vertical flip × small affine
+      (shift 10%, scale 10%, in-plane rotation up to 30°). Composed into
+      a single 2×3 matrix per image and resampled with ``grid_sample``.
+    - Brightness ± ``brightness_jitter``
+    - Contrast (1 ± ``contrast_jitter``)
+    - Gaussian noise σ ∈ [0, 0.08]
+    - Gaussian blur σ ∈ [0, ``gaussian_blur_sigma``] (one sigma per
+      batch — blur with different per-image kernels is awkwardly slow).
     """
     if not config.augment:
         return crops
 
-    if config.rotation:
-        k = int(torch.randint(0, 4, (1,)).item())
-        if k > 0:
-            crops = torch.rot90(crops, k, dims=(2, 3))
+    b, c, h, w = crops.shape
+    device = crops.device
 
-    if config.flip:
-        if torch.rand(1).item() > 0.5:
-            crops = crops.flip(dims=(2,))
-        if torch.rand(1).item() > 0.5:
-            crops = crops.flip(dims=(3,))
+    do_geom = config.rotation or config.flip
+    if do_geom:
+        # Random rotation angle per image (90° steps) + random in-plane
+        # rotation up to 30° + random flip + random shift/scale, all
+        # composed into a single 2×3 affine matrix.
+        ones = torch.ones(b, device=device)
+        zeros = torch.zeros(b, device=device)
 
-    b = crops.shape[0]
+        # 90° steps from {0, 90, 180, 270} per image (rad).
+        if config.rotation:
+            k = torch.randint(0, 4, (b,), device=device)
+            theta90 = k.to(torch.float32) * (torch.pi / 2)
+        else:
+            theta90 = zeros
+        # Continuous rotation jitter: ±30°.
+        theta_extra = (torch.rand(b, device=device) * 2 - 1) * (torch.pi / 6)
+        theta = theta90 + theta_extra
+
+        # Per-image flips as ±1 sign on rotation matrix axes.
+        if config.flip:
+            sx = torch.where(
+                torch.rand(b, device=device) > 0.5, ones, -ones,
+            )
+            sy = torch.where(
+                torch.rand(b, device=device) > 0.5, ones, -ones,
+            )
+        else:
+            sx = ones
+            sy = ones
+
+        # Small per-image scale and shift.
+        scale = 1.0 + (torch.rand(b, device=device) * 2 - 1) * 0.1
+        shift_x = (torch.rand(b, device=device) * 2 - 1) * 0.1
+        shift_y = (torch.rand(b, device=device) * 2 - 1) * 0.1
+
+        cos_t = torch.cos(theta) * scale
+        sin_t = torch.sin(theta) * scale
+        # Composed matrix: rotation × flip + translation.
+        a00 = cos_t * sx
+        a01 = -sin_t * sy
+        a02 = shift_x
+        a10 = sin_t * sx
+        a11 = cos_t * sy
+        a12 = shift_y
+        affine = torch.stack(
+            [a00, a01, a02, a10, a11, a12], dim=-1
+        ).reshape(b, 2, 3)
+
+        grid = torch.nn.functional.affine_grid(
+            affine, [b, c, h, w], align_corners=False,
+        )
+        crops = torch.nn.functional.grid_sample(
+            crops, grid, mode="bilinear", padding_mode="zeros",
+            align_corners=False,
+        )
+
     if config.brightness_jitter > 0:
         delta = (
-            (torch.rand(b, 1, 1, 1, device=crops.device) * 2 - 1)
+            (torch.rand(b, 1, 1, 1, device=device) * 2 - 1)
             * config.brightness_jitter
         )
         crops = (crops + delta).clamp(0, 1)
 
     if config.contrast_jitter > 0:
         factor = 1.0 + (
-            (torch.rand(b, 1, 1, 1, device=crops.device) * 2 - 1)
+            (torch.rand(b, 1, 1, 1, device=device) * 2 - 1)
             * config.contrast_jitter
         )
         mean = crops.mean(dim=(2, 3), keepdim=True)
         crops = ((crops - mean) * factor + mean).clamp(0, 1)
 
+    # Per-image Gaussian noise (matches Mtb reference's GaussNoise σ ∈ [0, 0.08]).
+    noise_sigma_max = float(getattr(config, "gaussian_noise_sigma", 0.08))
+    if noise_sigma_max > 0:
+        sigma = (
+            torch.rand(b, 1, 1, 1, device=device) * noise_sigma_max
+        )
+        crops = (crops + torch.randn_like(crops) * sigma).clamp(0, 1)
+
     if config.gaussian_blur_sigma > 0:
         sigma = float(torch.rand(1).item() * config.gaussian_blur_sigma)
         if sigma > 0.1:
-            kernel = _gaussian_kernel_2d(sigma, crops.device)
+            kernel = _gaussian_kernel_2d(sigma, device)
             ksize = kernel.shape[-1]
-            c = crops.shape[1]
             kernel = kernel.unsqueeze(0).unsqueeze(0).expand(c, 1, -1, -1)
             crops = torch.nn.functional.conv2d(
-                crops, kernel, padding=ksize // 2, groups=c
+                crops, kernel, padding=ksize // 2, groups=c,
             )
 
     return crops
@@ -140,6 +207,8 @@ def train_autoencoder(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=config.augment,
         rotation=config.rotation,
         flip=config.flip,
@@ -152,6 +221,8 @@ def train_autoencoder(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,
         indices=val_idx,
     )

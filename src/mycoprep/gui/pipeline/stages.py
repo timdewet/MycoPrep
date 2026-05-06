@@ -691,6 +691,7 @@ class EmbeddingsStage:
         config = AutoencoderConfig(
             model_type=model_type_map.get(opts.model_type, "resnet18"),
             in_channels=opts.in_channels,
+            include_mask=getattr(opts, "include_mask", True),
             epochs=opts.epochs,
             batch_size=opts.batch_size,
         )

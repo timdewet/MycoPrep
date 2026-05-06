@@ -61,6 +61,8 @@ def extract_embeddings(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,
     )
     loader = DataLoader(
