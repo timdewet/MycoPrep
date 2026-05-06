@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor
 from PyQt6.QtWidgets import (
     QFrame,
@@ -45,7 +45,12 @@ _STATUS_TO_ICON = {
 
 
 class _StatusBadge(QLabel):
-    """Small icon badge showing the stage's status."""
+    """Small icon badge showing the stage's status.
+
+    Hidden by default — only made visible once the stage has actually entered
+    a meaningful state (running / done / error). Idle stages render no dot, so
+    the sidebar stays clean before any run has happened.
+    """
 
     SIZE = 16
 
@@ -54,12 +59,18 @@ class _StatusBadge(QLabel):
         self.setFixedSize(self.SIZE, self.SIZE)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status = StageStatus.IDLE
-        self._refresh()
+        self.setVisible(False)
         icons.on_theme_change(self._refresh)
 
     def set_status(self, s: StageStatus) -> None:
         self._status = s
-        self._refresh()
+        # Idle / disabled / ready stages don't get a dot — only show after
+        # a stage has actually started running, finished, or errored.
+        if s in (StageStatus.RUNNING, StageStatus.DONE, StageStatus.ERROR):
+            self.setVisible(True)
+            self._refresh()
+        else:
+            self.setVisible(False)
 
     def _refresh(self) -> None:
         from PyQt6.QtCore import QSize
@@ -70,16 +81,30 @@ class _StatusBadge(QLabel):
             self.setPixmap(pix)
             self.setText("")
         else:
-            # Fallback bullet glyphs when qtawesome is unavailable.
             fallback = {
-                StageStatus.IDLE:     "○",
-                StageStatus.READY:    "•",
                 StageStatus.RUNNING:  "◐",
                 StageStatus.DONE:     "✓",
                 StageStatus.ERROR:    "!",
-                StageStatus.DISABLED: "–",
-            }[self._status]
+            }.get(self._status, "")
             self.setText(fallback)
+
+
+class _NavSubheader(QLabel):
+    """Non-clickable section label (e.g. 'Image Processing') in the sidebar."""
+
+    def __init__(self, text: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self.setObjectName("navSubheader")
+        self.setContentsMargins(14, 0, 14, 0)
+        self.setStyleSheet(
+            f"color: {tokens.active().text_subtle}; "
+            f"font-size: {tokens.FS_CAPTION}px; "
+            f"font-weight: {tokens.FW_SEMIBOLD}; "
+            f"text-transform: uppercase; "
+            f"letter-spacing: 0.5px; "
+            f"background: transparent;"
+        )
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
 
 class _NavItem(QPushButton):
@@ -90,6 +115,7 @@ class _NavItem(QPushButton):
         parent: Optional[QWidget] = None,
         *,
         show_status: bool = True,
+        indent: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("navItem")
@@ -105,9 +131,11 @@ class _NavItem(QPushButton):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         # Build the row as inner child widgets so we can explicitly control
         # spacing between the icon and the label (Qt's setIcon path glues
-        # them too tightly).
+        # them too tightly). Indented items get extra left margin so they
+        # read as a sub-group.
+        left = 26 if indent else 14
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 0, 14, 0)
+        layout.setContentsMargins(left, 0, 14, 0)
         layout.setSpacing(tokens.S3)  # 12px between icon and label
 
         self._icon_lbl = QLabel()
@@ -172,6 +200,11 @@ class NavEntry:
     # separator drawn above them, visually grouping them apart from
     # the linear pipeline stages.
     pipeline: bool = True
+    # Render the entry indented (visual sub-grouping under a subheader).
+    indent: bool = False
+    # Optional non-clickable subheader rendered immediately above this entry
+    # — e.g. "Image Processing" above the four image-processing stages.
+    subheader: str = ""
 
 
 class NavSidebar(QFrame):
@@ -196,15 +229,13 @@ class NavSidebar(QFrame):
         brand.setContentsMargins(tokens.S4, tokens.S2, tokens.S4, tokens.S4)
         root.addWidget(brand)
 
+        # Subheader widgets keyed by entry key, so we can hide them when
+        # their group is hidden (e.g. Image Processing group in train mode).
+        self._subheaders: dict[str, _NavSubheader] = {}
+
         prev_was_pipeline = True
         for i, entry in enumerate(entries):
-            # Insert a thin grey separator the first time we transition
-            # from a pipeline entry to a non-pipeline entry.
             if prev_was_pipeline and not entry.pipeline and i > 0:
-                # Visual break: gap above + thin line + gap below.
-                # The QFrame container holds a HLine drawn against the
-                # sidebar background so the gaps look intentional rather
-                # than like a misaligned line.
                 root.addSpacing(tokens.S3)
                 divider = QFrame()
                 divider.setObjectName("navDivider")
@@ -216,9 +247,15 @@ class NavSidebar(QFrame):
                 )
                 root.addWidget(divider)
                 root.addSpacing(tokens.S3)
+            if entry.subheader:
+                root.addSpacing(tokens.S2)
+                sh = _NavSubheader(entry.subheader)
+                root.addWidget(sh)
+                self._subheaders[entry.key] = sh
             item = _NavItem(
                 entry.label, entry.icon, self,
                 show_status=entry.pipeline,
+                indent=entry.indent,
             )
             item.clicked.connect(lambda _checked=False, idx=i: self._on_clicked(idx))
             root.addWidget(item)
@@ -230,16 +267,31 @@ class NavSidebar(QFrame):
 
         root.addStretch(1)
 
-        # Footer
+        # Footer: live system status + GPU availability.
         footer = QWidget()
         fl = QVBoxLayout(footer)
         fl.setContentsMargins(tokens.S4, tokens.S2, tokens.S4, tokens.S2)
         fl.setSpacing(tokens.S1)
+        self._sysinfo_label = QLabel()
+        self._sysinfo_label.setObjectName("caption")
+        self._sysinfo_label.setStyleSheet(
+            f"color: {tokens.active().text_subtle}; "
+            f"font-size: {tokens.FS_CAPTION}px;"
+        )
+        self._sysinfo_label.setWordWrap(True)
+        fl.addWidget(self._sysinfo_label)
         self._gpu_label = QLabel()
         self._gpu_label.setObjectName("caption")
         fl.addWidget(self._gpu_label)
         root.addWidget(footer)
         self.set_gpu_available(False)
+
+        # Refresh sysinfo every 3s — cheap and unobtrusive.
+        self._sysinfo_timer = QTimer(self)
+        self._sysinfo_timer.setInterval(3000)
+        self._sysinfo_timer.timeout.connect(self._refresh_sysinfo)
+        self._sysinfo_timer.start()
+        self._refresh_sysinfo()
 
     def _on_clicked(self, idx: int) -> None:
         # autoExclusive handles the checked state; emit visible-index.
@@ -262,6 +314,9 @@ class NavSidebar(QFrame):
         for entry, item in zip(self._entries, self._items):
             if entry.key == key:
                 item.setVisible(visible)
+                sh = self._subheaders.get(key)
+                if sh is not None:
+                    sh.setVisible(visible)
                 if visible:
                     self._visible_keys.add(key)
                 else:
@@ -278,3 +333,38 @@ class NavSidebar(QFrame):
             if entry.key == key:
                 return i
         return -1
+
+    # ── system info footer ─────────────────────────────────────────────
+    def _refresh_sysinfo(self) -> None:
+        lines: list[str] = []
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            # Use (total - available) so the displayed GB and percent agree —
+            # `mem.used` on macOS excludes some categories that `mem.percent`
+            # counts via `available`, leading to a confusing mismatch.
+            used_gb = (mem.total - mem.available) / 1e9
+            total_gb = mem.total / 1e9
+            lines.append(
+                f"RAM: {used_gb:.1f} / {total_gb:.1f} GB ({mem.percent:.0f}%)"
+            )
+            cpu = psutil.cpu_percent(interval=None)
+            lines.append(f"CPU: {cpu:.0f}%")
+            disk = psutil.disk_usage("/")
+            lines.append(f"Disk free: {disk.free / 1e9:.1f} GB")
+        except ImportError:
+            lines.append("(install psutil for stats)")
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                idx = torch.cuda.current_device()
+                used = torch.cuda.memory_allocated(idx) / 1e9
+                total = torch.cuda.get_device_properties(idx).total_memory / 1e9
+                lines.append(f"GPU: {used:.1f} / {total:.1f} GB")
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._sysinfo_label.setText("\n".join(lines))

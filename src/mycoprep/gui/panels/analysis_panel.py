@@ -248,6 +248,163 @@ class _CompareWorker(QObject):
             self.failed.emit(str(e))
 
 
+class _EmbeddingsWorker(QObject):
+    """Render UMAP of CNN embeddings in a worker thread."""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        out_path: Path,
+        library_dir: Optional[Path],
+        species: str,
+        color_by: str = "cluster",
+        feature_col: Optional[str] = None,
+        highlight_genes: Optional[list[str]] = None,
+        batch_correct: bool = True,
+        model_type: str = "",
+    ) -> None:
+        super().__init__()
+        self._out_path = out_path
+        self._library_dir = library_dir
+        self._species = species
+        self._color_by = color_by
+        self._feature_col = feature_col
+        self._highlight_genes = list(highlight_genes or [])
+        self._batch_correct = batch_correct
+        self._model_type = model_type
+
+    def run(self) -> None:
+        try:
+            from mycoprep.core.extract.qc_plots import render_embeddings_html
+
+            self.progress.emit(10, "Loading embeddings\u2026")
+            self.progress.emit(50, "Computing UMAP\u2026")
+            written = render_embeddings_html(
+                self._out_path,
+                library_dir=self._library_dir,
+                species=self._species,
+                color_by=self._color_by,
+                feature_col=self._feature_col,
+                highlight_genes=self._highlight_genes,
+                batch_correct=self._batch_correct,
+                model_type=self._model_type,
+            )
+            self.progress.emit(100, "Done")
+            self.finished.emit(written)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+class _EmbeddingsOTWorker(QObject):
+    """Render UMAP of CNN embeddings via Optimal Transport in a worker thread."""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        out_path: Path,
+        library_dir: Optional[Path],
+        species: str,
+        color_by: str = "cluster",
+        feature_col: Optional[str] = None,
+        highlight_genes: Optional[list[str]] = None,
+        batch_correct: bool = True,
+        model_type: str = "",
+    ) -> None:
+        super().__init__()
+        self._out_path = out_path
+        self._library_dir = library_dir
+        self._species = species
+        self._color_by = color_by
+        self._feature_col = feature_col
+        self._highlight_genes = list(highlight_genes or [])
+        self._batch_correct = batch_correct
+        self._model_type = model_type
+
+    def run(self) -> None:
+        try:
+            from mycoprep.core.extract.qc_plots import render_embeddings_ot_html
+
+            self.progress.emit(5, "Loading embeddings…")
+
+            def _cb(f: float) -> None:
+                pct = int(5 + 90 * max(0.0, min(1.0, f)))
+                self.progress.emit(pct, f"Computing OT distance matrix… {pct}%")
+
+            written = render_embeddings_ot_html(
+                self._out_path,
+                library_dir=self._library_dir,
+                species=self._species,
+                color_by=self._color_by,
+                feature_col=self._feature_col,
+                highlight_genes=self._highlight_genes,
+                batch_correct=self._batch_correct,
+                model_type=self._model_type,
+                progress_cb=_cb,
+            )
+            self.progress.emit(100, "Done")
+            self.finished.emit(written)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+class _FeaturesOTWorker(QObject):
+    """Render UMAP of S-score features via Optimal Transport in a worker thread."""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        out_path: Path,
+        library_dir: Optional[Path],
+        species: str,
+        color_by: str = "cluster",
+        feature_col: Optional[str] = None,
+        highlight_genes: Optional[list[str]] = None,
+        batch_correct: bool = True,
+    ) -> None:
+        super().__init__()
+        self._out_path = out_path
+        self._library_dir = library_dir
+        self._species = species
+        self._color_by = color_by
+        self._feature_col = feature_col
+        self._highlight_genes = list(highlight_genes or [])
+        self._batch_correct = batch_correct
+
+    def run(self) -> None:
+        try:
+            from mycoprep.core.extract.qc_plots import render_features_ot_html
+
+            self.progress.emit(5, "Loading features…")
+
+            def _cb(f: float) -> None:
+                pct = int(5 + 90 * max(0.0, min(1.0, f)))
+                self.progress.emit(pct, f"Computing OT distance matrix… {pct}%")
+
+            written = render_features_ot_html(
+                self._out_path,
+                library_dir=self._library_dir,
+                species=self._species,
+                color_by=self._color_by,
+                feature_col=self._feature_col,
+                highlight_genes=self._highlight_genes,
+                batch_correct=self._batch_correct,
+                progress_cb=_cb,
+            )
+            self.progress.emit(100, "Done")
+            self.finished.emit(written)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class _LibraryWorker(QObject):
     """Render the library-only Plotly HTML in a worker thread."""
 
@@ -331,6 +488,48 @@ class AnalysisPanel(QWidget):
         toolbar.setContentsMargins(tokens.S4, tokens.S3, tokens.S4, 0)
         toolbar.setSpacing(tokens.S2)
 
+        toolbar.addWidget(QLabel("View:"))
+        self._view_mode = QComboBox()
+        self._view_mode.addItem("Feature profiles (mean)", userData="features")
+        self._view_mode.addItem("Feature profiles (OT)", userData="features_ot")
+        self._view_mode.addItem("CNN embeddings (mean)", userData="embeddings")
+        self._view_mode.addItem("CNN embeddings (OT)", userData="embeddings_ot")
+        self._view_mode.setToolTip(
+            "Mean views: UMAP of per-condition mean profiles (cosine sim).\n"
+            "OT views: UMAP of pairwise Sinkhorn (Optimal Transport) "
+            "distances between full per-condition cell distributions — "
+            "captures distribution shape, not just the mean. Reveals "
+            "heterogeneous knockdowns the mean view hides.\n\n"
+            "Feature views read S-score morphological features.\n"
+            "CNN embedding views read 512-d learned encoder features."
+        )
+        self._view_mode.currentIndexChanged.connect(
+            lambda _i: self._on_view_mode_changed()
+        )
+        toolbar.addWidget(self._view_mode)
+        toolbar.addSpacing(tokens.S3)
+
+        # Model dropdown — only meaningful in CNN embeddings mode. Lists
+        # each trained architecture (resnet18, supcon_resnet18, …) that
+        # has saved embeddings; "Latest" picks the most recently-extracted.
+        self._model_label = QLabel("Model:")
+        self._model_select = QComboBox()
+        self._model_select.addItem("Latest", userData="")
+        self._model_select.setToolTip(
+            "Which trained CNN embedding to display.\n"
+            "Each architecture (autoencoder, SupCon, …) writes its embeddings\n"
+            "to its own subdirectory and stays available for comparison."
+        )
+        self._model_select.currentIndexChanged.connect(
+            lambda _i: self._refresh_library_view(force=True)
+        )
+        toolbar.addWidget(self._model_label)
+        toolbar.addWidget(self._model_select)
+        toolbar.addSpacing(tokens.S3)
+        # Hide initially; shown when the user picks "CNN embeddings".
+        self._model_label.setVisible(False)
+        self._model_select.setVisible(False)
+
         toolbar.addWidget(QLabel("Species:"))
         self._species = QComboBox()
         # Species are not combinable on a single embedding (their
@@ -347,7 +546,7 @@ class AnalysisPanel(QWidget):
 
         self._library_btn = QPushButton("Library browser\u2026")
         self._library_btn.setToolTip(
-            "Open the feature library to add, edit, or remove registered runs."
+            "Open the morphology library to add, edit, or remove registered runs."
         )
         self._library_btn.clicked.connect(self.openLibraryBrowserRequested.emit)
         toolbar.addWidget(self._library_btn)
@@ -506,14 +705,21 @@ class AnalysisPanel(QWidget):
 
     def _library_state_changed(self) -> bool:
         species = self._species.currentText().strip()
+        view_mode = self._view_mode.currentData() or "features"
         from mycoprep.core.extract.feature_library import FeatureLibrary
         try:
             lib = FeatureLibrary(self._library_dir)
             idx_path = lib.library_dir / "library.parquet"
             mtime = idx_path.stat().st_mtime if idx_path.exists() else 0.0
+            # Embeddings live in a separate file; track its mtime too so a
+            # fresh training run is reflected on the Analysis tab even
+            # though library.parquet itself is unchanged.
+            emb_path = lib.models_dir / "embeddings" / "cnn_embeddings.parquet"
+            emb_mtime = emb_path.stat().st_mtime if emb_path.exists() else 0.0
         except Exception:  # noqa: BLE001
             mtime = 0.0
-        state = (self._library_dir, species, mtime)
+            emb_mtime = 0.0
+        state = (self._library_dir, species, view_mode, mtime, emb_mtime)
         return state != self._last_library_state
 
     def _refresh_library_view(self, force: bool = False) -> None:
@@ -534,18 +740,94 @@ class AnalysisPanel(QWidget):
             if color_by == "feature" else None
         )
         baseline_mode = self._baseline_mode.currentData() or "pooled"
-        worker = _LibraryWorker(
-            self._library_html_path, self._library_dir, species,
-            color_by=color_by, feature_col=feature_col,
-            highlight_genes=self._highlight_genes.selected(),
-            baseline_mode=baseline_mode,
-            batch_correct=self._batch_correct.isChecked(),
-        )
-        self._start_worker(
-            worker,
-            on_finished=self._on_library_render_finished,
-            status="Rendering library plot\u2026",
-        )
+
+        view_mode = self._view_mode.currentData() or "features"
+
+        if view_mode == "embeddings":
+            self._refresh_model_select()
+            worker = _EmbeddingsWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+                model_type=self._model_select.currentData() or "",
+            )
+            self._start_worker(
+                worker,
+                on_finished=self._on_library_render_finished,
+                status="Rendering embedding UMAP\u2026",
+            )
+        elif view_mode == "embeddings_ot":
+            self._refresh_model_select()
+            worker = _EmbeddingsOTWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+                model_type=self._model_select.currentData() or "",
+            )
+            self._start_worker(
+                worker,
+                on_finished=self._on_library_render_finished,
+                status="Computing OT distance matrix\u2026 (this can take a minute)",
+            )
+        elif view_mode == "features_ot":
+            worker = _FeaturesOTWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+            )
+            self._start_worker(
+                worker,
+                on_finished=self._on_library_render_finished,
+                status="Computing feature OT distance matrix\u2026",
+            )
+        else:
+            worker = _LibraryWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                baseline_mode=baseline_mode,
+                batch_correct=self._batch_correct.isChecked(),
+            )
+            self._start_worker(
+                worker,
+                on_finished=self._on_library_render_finished,
+                status="Rendering library plot\u2026",
+            )
+
+    def _on_view_mode_changed(self) -> None:
+        """Show/hide the Model selector and re-render."""
+        mode = self._view_mode.currentData() or ""
+        is_cnn = mode in ("embeddings", "embeddings_ot")
+        self._model_label.setVisible(is_cnn)
+        self._model_select.setVisible(is_cnn)
+        if is_cnn:
+            self._refresh_model_select()
+        self._refresh_library_view(force=True)
+
+    def _refresh_model_select(self) -> None:
+        """Populate the Model dropdown with available trained architectures."""
+        from mycoprep.core.extract.qc_plots import available_embedding_models
+        try:
+            models = available_embedding_models(self._library_dir)
+        except Exception:  # noqa: BLE001
+            models = []
+        prev = self._model_select.currentData() or ""
+        self._model_select.blockSignals(True)
+        self._model_select.clear()
+        self._model_select.addItem("Latest", userData="")
+        for m in models:
+            label = m["model_type"]
+            self._model_select.addItem(label, userData=label)
+        # Restore prior selection when still available.
+        if prev:
+            for i in range(self._model_select.count()):
+                if self._model_select.itemData(i) == prev:
+                    self._model_select.setCurrentIndex(i)
+                    break
+        self._model_select.blockSignals(False)
 
     def _on_color_by_changed(self, _idx: int) -> None:
         mode = self._color_by.currentData() or "cluster"
@@ -614,14 +896,20 @@ class AnalysisPanel(QWidget):
         else:
             self._web_view.setUrl(QUrl.fromLocalFile(str(written)))
             self._status.setText("")
+        view_mode = self._view_mode.currentData() or "features"
         from mycoprep.core.extract.feature_library import FeatureLibrary
         try:
             lib = FeatureLibrary(self._library_dir)
             idx_path = lib.library_dir / "library.parquet"
             mtime = idx_path.stat().st_mtime if idx_path.exists() else 0.0
+            emb_path = lib.models_dir / "embeddings" / "cnn_embeddings.parquet"
+            emb_mtime = emb_path.stat().st_mtime if emb_path.exists() else 0.0
         except Exception:  # noqa: BLE001
             mtime = 0.0
-        self._last_library_state = (self._library_dir, species, mtime)
+            emb_mtime = 0.0
+        self._last_library_state = (
+            self._library_dir, species, view_mode, mtime, emb_mtime,
+        )
 
     # ------------------------------------------------------------------
     # Worker plumbing

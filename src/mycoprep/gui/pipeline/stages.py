@@ -628,10 +628,227 @@ class ExtractStage:
         return outputs
 
 
+class EmbeddingsStage:
+    """Optional stage: train/fine-tune autoencoder and extract CNN embeddings."""
+
+    name = "Embeddings"
+    handles_own_reuse = False
+
+    def enabled(self, ctx) -> bool:
+        return bool(getattr(ctx, "do_embeddings", False))
+
+    def validate(self, ctx) -> list[str]:
+        if not self.enabled(ctx):
+            return []
+        opts = getattr(ctx, "embeddings_opts", None)
+        train_only = bool(getattr(opts, "train_only", False)) if opts else False
+        if train_only:
+            lib = FeatureLibrary(getattr(opts, "library_dir", None))
+            if not lib.crop_h5_paths():
+                return [
+                    "Train-only mode: no HDF5 crops found in the morphology "
+                    "library. Run the standard pipeline with 'Save crops' "
+                    "first to populate the library."
+                ]
+            return []
+        all_crops = ctx.features_dir / "all_crops.h5"
+        if not ctx.features_dir.exists() or not all_crops.exists():
+            return [
+                f"Embeddings needs all_crops.h5 in {ctx.features_dir}. "
+                "Enable the Features stage with HDF5 crops and run it first."
+            ]
+        return []
+
+    def output_dir(self, ctx) -> Path:
+        opts = getattr(ctx, "embeddings_opts", None)
+        if opts is not None and getattr(opts, "train_only", False):
+            return ctx.output_dir / "library_embeddings"
+        return ctx.features_dir / "embeddings"
+
+    def run(self, ctx, progress_cb: ProgressCB) -> list[Path]:
+        opts = getattr(ctx, "embeddings_opts", None)
+        if opts is None:
+            from .context import EmbeddingOpts
+            opts = EmbeddingOpts()
+
+        from mycoprep.core.autoencoder import AutoencoderConfig, extract_embeddings, train_autoencoder
+
+        progress_cb(0.0, "Preparing CNN embeddings...")
+
+        train_only = bool(getattr(opts, "train_only", False))
+        all_crops = ctx.features_dir / "all_crops.h5" if not train_only else None
+
+        if not train_only and (all_crops is None or not all_crops.exists()):
+            progress_cb(1.0, "Skipped: no all_crops.h5 found")
+            return []
+
+        model_type_map = {
+            "ResNet-18": "resnet18",
+            "Lightweight": "lightweight",
+            "ResNet-18 (SupCon)": "supcon_resnet18",
+            "Lightweight (SupCon)": "supcon_lightweight",
+        }
+        config = AutoencoderConfig(
+            model_type=model_type_map.get(opts.model_type, "resnet18"),
+            in_channels=opts.in_channels,
+            epochs=opts.epochs,
+            batch_size=opts.batch_size,
+        )
+        is_supcon = config.is_supcon
+
+        emb_dir = self.output_dir(ctx)
+        emb_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build the input list: in normal mode start with the current run's
+        # crops, in train-only mode pull only library crops.
+        # We track ``run_ids_per_file`` in parallel so extract_embeddings
+        # can write the correct run_id per cell — the h5 filename ("all_crops")
+        # is the same for every registered run and isn't usable as an ID.
+        h5_paths: list[Path] = []
+        run_ids_per_file: list[str] = []
+        if not train_only and all_crops is not None:
+            h5_paths.append(all_crops)
+            run_ids_per_file.append(ctx.output_dir.name or "current_run")
+
+        # Include library crops if requested (always in train-only mode).
+        if train_only or opts.include_library_crops:
+            lib = FeatureLibrary(opts.library_dir)
+            for rid, p in lib.crop_h5_paths_with_run_ids(
+                species=opts.species or None
+            ):
+                if p not in h5_paths:
+                    h5_paths.append(p)
+                    run_ids_per_file.append(rid)
+        if not h5_paths:
+            progress_cb(1.0, "No crops available to train on.")
+            return []
+
+        model_path = None
+        # In train-only mode, "use existing" makes no sense — coerce off.
+        use_existing = (
+            not train_only and "existing" in opts.model_source.lower()
+        )
+
+        # Pick the right trainer based on model_type. SupCon needs class
+        # labels (gene from condition_label); the autoencoder is label-free.
+        if is_supcon:
+            from mycoprep.core.autoencoder.supcon import train_supcon as _train_fn
+            trainer_label = "SupCon ResNet-18"
+        else:
+            _train_fn = train_autoencoder
+            trainer_label = "autoencoder"
+
+        if use_existing:
+            if opts.model_path and Path(opts.model_path).exists():
+                model_path = Path(opts.model_path)
+                config.model_path = model_path
+            else:
+                progress_cb(1.0, "Skipped: no model path provided")
+                return []
+        else:
+            # Auto: fine-tune library model or train from scratch
+            lib = FeatureLibrary(opts.library_dir)
+            latest = lib.latest_model(model_type=config.model_type)
+            run_id = ctx.output_dir.name
+
+            if latest and not train_only:
+                existing_path = lib.get_model_path(latest["model_name"])
+                if existing_path and existing_path.exists():
+                    config.model_path = existing_path
+                    progress_cb(0.05, f"Fine-tuning {latest['model_name']}...")
+                    summary = _train_fn(
+                        h5_paths, emb_dir, config,
+                        fine_tune=True,
+                        progress_cb=lambda f, m: progress_cb(0.05 + f * 0.40, m),
+                    )
+                    model_path = Path(summary["model_path"])
+                    lib.update_model_runs(latest["model_name"], [run_id])
+                else:
+                    latest = None
+
+            if not latest or train_only:
+                progress_cb(
+                    0.05,
+                    f"Training new {trainer_label} from library..." if train_only
+                    else f"Training new {trainer_label}...",
+                )
+                summary = _train_fn(
+                    h5_paths, emb_dir, config,
+                    progress_cb=lambda f, m: progress_cb(0.05 + f * 0.40, m),
+                )
+                model_path = Path(summary["model_path"])
+                model_name = (
+                    f"{config.model_type}_library" if train_only
+                    else f"{config.model_type}_{run_id}"
+                )
+                run_ids = [p.stem for p in h5_paths] if train_only else [run_id]
+                lib.register_model(
+                    model_name=model_name,
+                    model_path=model_path,
+                    model_type=config.model_type,
+                    run_ids=run_ids,
+                    epochs=config.epochs,
+                    val_loss=summary.get("best_val_loss", 0.0),
+                    config=config.__dict__,
+                )
+
+        # Train-only runs go straight to library re-extraction; there's no
+        # current-run h5 to extract for.
+        if train_only:
+            progress_cb(0.50, "Extracting embeddings for all library crops...")
+            # Per-model-type subdirectory so re-training with a different
+            # architecture (e.g. autoencoder → SupCon) doesn't clobber the
+            # earlier embeddings. Keeps both available for side-by-side
+            # comparison.
+            lib_emb_dir = (
+                FeatureLibrary(opts.library_dir).models_dir
+                / "embeddings"
+                / config.model_type
+            )
+            lib_emb_dir.mkdir(parents=True, exist_ok=True)
+            emb_path = extract_embeddings(
+                h5_paths, model_path, lib_emb_dir, config,
+                progress_cb=lambda f, m: progress_cb(0.50 + f * 0.45, m),
+                run_ids_per_file=run_ids_per_file,
+            )
+            progress_cb(1.0, "Library embedding training complete.")
+            return [emb_path]
+
+        progress_cb(0.50, "Extracting embeddings...")
+        emb_path = extract_embeddings(
+            h5_paths, model_path, emb_dir, config,
+            progress_cb=lambda f, m: progress_cb(0.50 + f * 0.45, m),
+            run_ids_per_file=run_ids_per_file,
+        )
+
+        # Re-extract all library crops after training to keep feature space consistent
+        if not use_existing and len(h5_paths) > 1:
+            progress_cb(0.95, "Re-extracting library embeddings for consistency...")
+            # Per-model-type subdirectory so re-training with a different
+            # architecture (e.g. autoencoder → SupCon) doesn't clobber the
+            # earlier embeddings. Keeps both available for side-by-side
+            # comparison.
+            lib_emb_dir = (
+                FeatureLibrary(opts.library_dir).models_dir
+                / "embeddings"
+                / config.model_type
+            )
+            lib_emb_dir.mkdir(parents=True, exist_ok=True)
+            extract_embeddings(
+                h5_paths, model_path, lib_emb_dir, config,
+                progress_cb=lambda f, m: progress_cb(0.95 + f * 0.04, m),
+                run_ids_per_file=run_ids_per_file,
+            )
+
+        progress_cb(1.0, "CNN embeddings complete.")
+        return [emb_path]
+
+
 ALL_STAGES: list[Stage] = [
     SplitStage(),
     FocusStage(),
     SegmentStage(),
     ClassifyStage(),
     ExtractStage(),
+    EmbeddingsStage(),
 ]

@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 import mycoprep
 
 from .panels.analysis_panel import AnalysisPanel
+from .panels.embeddings_panel import EmbeddingsPanel
 from .panels.features_panel import FeaturesPanel
 from .panels.input_panel import InputMode, InputPanel
 from .panels.label_train_panel import LabelTrainPanel
@@ -35,7 +36,9 @@ from .panels.layout_panel import LayoutPanel
 from .panels.run_panel import RunPanel
 from .panels.stage_panels import FocusPanel, SegmentClassifyPanel
 from .pipeline.context import BulkRunContext, RunContext
+from .pipeline.layout import PlateLayout
 from .pipeline.runner import BulkPipelineRunner, PipelineRunner
+from .pipeline.stages import EmbeddingsStage
 from .ui import icons, tokens
 from .ui.elevation import apply_shadow
 from .ui.nav_sidebar import NavEntry, NavSidebar, StageStatus
@@ -69,14 +72,19 @@ def _gpu_available() -> bool:
 
 # Stage keys used by the sidebar and the (key, panel, label) registry.
 NAV_ENTRIES = [
-    NavEntry("input",    "Input",              "input"),
-    NavEntry("plate",    "Plate layout",       "plate"),
-    NavEntry("focus",    "Focus",              "focus"),
-    NavEntry("segment",  "Segment & Classify", "segment"),
-    NavEntry("features", "Features",           "features"),
-    NavEntry("run",      "Run",                "run"),
-    NavEntry("analysis", "Analysis",           "analysis", pipeline=False),
+    NavEntry("input",      "Input",              "input"),
+    NavEntry("plate",      "Plate layout",       "plate"),
+    NavEntry("focus",      "Focus",              "focus",
+             indent=True, subheader="Image Processing"),
+    NavEntry("segment",    "Segment & Classify", "segment", indent=True),
+    NavEntry("features",   "Features",           "features", indent=True),
+    NavEntry("embeddings", "Embeddings",         "embeddings"),
+    NavEntry("run",        "Run",                "run"),
+    NavEntry("analysis",   "Analysis",           "analysis", pipeline=False),
 ]
+
+# Tabs hidden when the user picks "Train embeddings" mode (library-only flow).
+_TRAIN_MODE_HIDDEN_TABS = ("plate", "focus", "segment", "features")
 
 
 class _LabelTrainerWindow(QMainWindow):
@@ -98,7 +106,7 @@ class _ModelDetailsWindow(QMainWindow):
 class _LibraryBrowserWindow(QMainWindow):
     def __init__(self, browser: LibraryBrowser, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Feature Library Browser")
+        self.setWindowTitle("Morphology Library Browser")
         self.resize(1100, 600)
         self.setCentralWidget(browser)
 
@@ -134,6 +142,7 @@ class MainWindow(QMainWindow):
         self.focus_panel = FocusPanel()
         self.segclass_panel = SegmentClassifyPanel()
         self.features_panel = FeaturesPanel()
+        self.embeddings_panel = EmbeddingsPanel()
         self.run_panel = RunPanel()
         self.analysis_panel = AnalysisPanel()
         self.label_train_panel = LabelTrainPanel()
@@ -176,6 +185,7 @@ class MainWindow(QMainWindow):
         self.classify_panel.showModelDetailsRequested.connect(self._open_model_details)
         self.features_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
         self.analysis_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
+        self.embeddings_panel.openLibraryBrowserRequested.connect(self._open_library_browser)
         # Keep the Analysis panel's library plot pointed at the same
         # library directory the user picks in FeaturesPanel.
         self.features_panel.library_dir.textChanged.connect(self._sync_analysis_library_dir)
@@ -273,6 +283,7 @@ class MainWindow(QMainWindow):
             self.focus_panel,
             self.segclass_panel,
             self.features_panel,
+            self.embeddings_panel,
             self.run_panel,
             self.analysis_panel,
         ]):
@@ -385,6 +396,7 @@ class MainWindow(QMainWindow):
             self.focus_panel,
             self.segclass_panel,
             self.features_panel,
+            self.embeddings_panel,
             self.run_panel,
             self.label_train_panel,
         ):
@@ -537,6 +549,7 @@ class MainWindow(QMainWindow):
             s.setValue("segment_panel", json.dumps(self.segment_panel.state()))
             s.setValue("classify_panel", json.dumps(self.classify_panel.state()))
             s.setValue("features_panel", json.dumps(self.features_panel.state()))
+            s.setValue("embeddings_panel", json.dumps(self.embeddings_panel.state()))
             s.setValue("run_panel", json.dumps(self.run_panel.state()))
             s.setValue("live_preview", json.dumps(self.live_preview.state()))
         except Exception as e:  # noqa: BLE001
@@ -575,6 +588,7 @@ class MainWindow(QMainWindow):
             ("segment_panel",  self.segment_panel),
             ("classify_panel", self.classify_panel),
             ("features_panel", self.features_panel),
+            ("embeddings_panel", self.embeddings_panel),
             ("run_panel",      self.run_panel),
         ):
             raw = s.value(key)
@@ -687,22 +701,47 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- slots
 
     def _on_input_mode_changed(self, mode: InputMode) -> None:
-        """Plate-layout step is only meaningful in single-plate mode."""
+        """Toggle which sidebar tabs make sense for the chosen workflow.
+
+        - Plate-layout: only in single-plate mode.
+        - Image-processing stages (focus/segment/features): hidden in
+          train-embeddings mode, where there's no CZI to process.
+        - The Embeddings panel switches into "train-only" mode (hides the
+          Use-existing-model option) when this workflow is active.
+        """
+        train_mode = mode == InputMode.TRAIN_EMBEDDINGS
+
+        # Plate is single-plate-only AND must be hidden in train mode.
+        plate_visible = mode == InputMode.SINGLE_PLATE and not train_mode
+        self._sidebar.set_visible("plate", plate_visible)
         plate_idx = self._sidebar.index_of("plate")
-        visible = mode == InputMode.SINGLE_PLATE
-        self._sidebar.set_visible("plate", visible)
-        # Hide the corresponding stack page so navigation stays consistent.
         if 0 <= plate_idx < self._stack.count():
-            self._stack.widget(plate_idx).setEnabled(visible)
-            # If plate is currently selected but no longer reachable, jump to Input.
-            if not visible and self._stack.currentIndex() == plate_idx:
+            self._stack.widget(plate_idx).setEnabled(plate_visible)
+
+        # Image-processing tabs: hidden whenever we're training from library.
+        for key in ("focus", "segment", "features"):
+            self._sidebar.set_visible(key, not train_mode)
+            i = self._sidebar.index_of(key)
+            if 0 <= i < self._stack.count():
+                self._stack.widget(i).setEnabled(not train_mode)
+
+        # If the currently selected page is now hidden, jump back to Input.
+        cur_idx = self._stack.currentIndex()
+        if 0 <= cur_idx < len(NAV_ENTRIES):
+            cur_key = NAV_ENTRIES[cur_idx].key
+            if cur_key not in self._sidebar._visible_keys:
                 self._sidebar.set_current(self._sidebar.index_of("input"))
+
+        self.embeddings_panel.set_train_only_mode(train_mode)
+        self.run_panel.set_train_only_mode(train_mode)
+
         self._refresh_input_status()
         # Step counter changes when the visible set changes.
         self._on_nav_changed(self._stack.currentIndex())
 
     def _on_layout_validity_changed(self, ok: bool) -> None:
-        self._sidebar.set_status("plate", StageStatus.DONE if ok else StageStatus.IDLE)
+        # Sidebar dots are reserved for real run state (running/done/errored);
+        # form readiness no longer paints them.
         self._recompute_stage_readiness()
 
     def _on_input_reset(self) -> None:
@@ -712,78 +751,20 @@ class MainWindow(QMainWindow):
         self._refresh_preview_dirs()
 
     def _refresh_input_status(self) -> None:
-        ready = (
-            self.input_panel.output_dir is not None
-            and self.input_panel.has_czi_input
-        )
-        self._sidebar.set_status("input", StageStatus.DONE if ready else StageStatus.IDLE)
+        # Input never carries a status dot — its readiness is conveyed by
+        # field state, not by the sidebar.
         self._recompute_stage_readiness()
 
     # ---------------------------------------------------------------- readiness
 
     def _recompute_stage_readiness(self) -> None:
-        """Drive the sidebar status dots for the configurable stages.
+        """Kept as a hook for future use, but a no-op for sidebar dots.
 
-        Green = "this step won't block the Run" — either the stage is enabled
-        in the Run panel (and so will execute) or its output already exists on
-        disk from a prior run (and so will be reused). Stages that are disabled
-        AND have no prior output show as DISABLED so the user can see they'll
-        be skipped.
-
-        Input/Plate keep their existing validation-based rules (set elsewhere);
-        Run keeps its run-completion rule. Skipped during/after a live run so
-        the runner's own status updates don't get clobbered.
+        Dots now reflect *actual* run state (running / done / errored) only —
+        form readiness and on-disk output presence no longer paint them, since
+        users found the mixed signals confusing.
         """
-        if self._run_active:
-            return
-
-        out = self.input_panel.output_dir
-        enables = self.run_panel.stage_enables()
-
-        # Stage → predicate that returns True when prior output exists.
-        def _has_tiffs(d: Path) -> bool:
-            return d.exists() and (
-                any(d.glob("*.tif")) or any(d.glob("*.tiff"))
-            )
-
-        def _has_parquet(d: Path) -> bool:
-            return d.exists() and any(d.glob("*.parquet"))
-
-        focus_existing = (
-            out is not None
-            and (_has_tiffs(out / "01_focus")
-                 or _has_tiffs(out / "01_split_and_focused")
-                 or _has_tiffs(out / "01_split"))
-        )
-        segment_existing = out is not None and _has_tiffs(out / "02_segment")
-        # Classify shares the Segment & Classify panel; treat its readiness
-        # via the same sidebar dot.
-        classify_existing = out is not None and _has_tiffs(out / "03_classify")
-        features_existing = out is not None and _has_parquet(out / "04_features")
-
-        focus_ready = enables.get("Focus", False) or focus_existing
-        # The Segment & Classify tab is one entry in the sidebar — green if
-        # either Segment or Classify is enabled, or either's output is on disk.
-        segclass_ready = (
-            enables.get("Segment", False)
-            or enables.get("Classify", False)
-            or segment_existing
-            or classify_existing
-        )
-        features_ready = enables.get("Features", False) or features_existing
-
-        self._sidebar.set_status(
-            "focus",
-            StageStatus.DONE if focus_ready else StageStatus.DISABLED,
-        )
-        self._sidebar.set_status(
-            "segment",
-            StageStatus.DONE if segclass_ready else StageStatus.DISABLED,
-        )
-        self._sidebar.set_status(
-            "features",
-            StageStatus.DONE if features_ready else StageStatus.DISABLED,
-        )
+        return
 
     def _on_channels_changed(self) -> None:
         ch = self.input_panel.phase_channel
@@ -920,12 +901,30 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- run state -> sidebar
 
+    # Map runner stage names → sidebar nav keys so per-stage dots light up.
+    # Split shares the Focus tab (they live in the Image Processing group);
+    # Classify shares the Segment tab.
+    _STAGE_TO_NAV = {
+        "Split":      "focus",
+        "Focus":      "focus",
+        "Segment":    "segment",
+        "Classify":   "segment",
+        "Features":   "features",
+        "Embeddings": "embeddings",
+    }
+
     def _on_stage_run_started(self, name: str) -> None:
         self._run_active = True
         self._sidebar.set_status("run", StageStatus.RUNNING)
+        nav_key = self._STAGE_TO_NAV.get(name)
+        if nav_key:
+            self._sidebar.set_status(nav_key, StageStatus.RUNNING)
         self._status_msg.setText(f"Running: {name}")
 
     def _on_stage_run_finished(self, name: str, _n: int) -> None:
+        nav_key = self._STAGE_TO_NAV.get(name)
+        if nav_key:
+            self._sidebar.set_status(nav_key, StageStatus.DONE)
         self._status_msg.setText(f"Finished: {name}")
 
     def _on_run_all_finished(self, _manifest: object) -> None:
@@ -959,6 +958,31 @@ class MainWindow(QMainWindow):
         enables = self.run_panel.stage_enables()
         mode = self.input_panel.mode
 
+        if mode == InputMode.TRAIN_EMBEDDINGS:
+            # Library-only training: skip preflight (no CZIs/layout to validate),
+            # build a minimal context, and run only the Embeddings stage.
+            embeddings_opts = self.embeddings_panel.opts()
+            ctx = RunContext(
+                czi_path=Path(),
+                czi_paths=[],
+                output_dir=out,
+                layout=PlateLayout.empty(),
+                do_split=False,
+                do_focus=False,
+                do_segment=False,
+                do_classify=False,
+                do_features=False,
+                do_embeddings=True,
+                embeddings_opts=embeddings_opts,
+            )
+            self._runner = PipelineRunner(
+                ctx,
+                reuse_existing=False,
+                stages=[EmbeddingsStage()],
+            )
+            self._wire_runner_signals()
+            return
+
         if not self._preflight_ok(out, enables):
             return
 
@@ -980,10 +1004,12 @@ class MainWindow(QMainWindow):
                 do_segment=enables["Segment"],
                 do_classify=enables["Classify"],
                 do_features=enables.get("Features", False),
+                do_embeddings=enables.get("Embeddings", False),
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
                 features_opts=features_opts,
+                embeddings_opts=self.embeddings_panel.opts(),
                 phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
@@ -1006,10 +1032,12 @@ class MainWindow(QMainWindow):
                 do_segment=enables["Segment"],
                 do_classify=enables["Classify"],
                 do_features=enables.get("Features", False),
+                do_embeddings=enables.get("Embeddings", False),
                 focus_opts=self.focus_panel.opts(),
                 segment_opts=self.segment_panel.opts(),
                 classify_opts=self.classify_panel.opts(),
                 features_opts=features_opts,
+                embeddings_opts=self.embeddings_panel.opts(),
                 phase_channel=self.input_panel.phase_channel,
                 channel_labels=self.input_panel.channel_labels,
             )
@@ -1017,6 +1045,10 @@ class MainWindow(QMainWindow):
                 ctx, reuse_existing=self.run_panel.reuse_existing.isChecked()
             )
 
+        self._wire_runner_signals()
+
+    def _wire_runner_signals(self) -> None:
+        """Connect ``self._runner``'s signals to the run panel and start it."""
         self._runner.stagesPlanned.connect(self.run_panel.on_stages_planned)
         self._runner.stageStarted.connect(self.run_panel.on_stage_started)
         self._runner.stageProgress.connect(self.run_panel.on_stage_progress)

@@ -12,6 +12,25 @@ from .layout import PlateLayout
 
 
 @dataclass
+class EmbeddingOpts:
+    """Configuration for the optional CNN Embeddings pipeline stage."""
+
+    model_type: str = "ResNet-18"           # "ResNet-18" | "Lightweight"
+    model_source: str = "Auto (train/fine-tune)"
+    model_path: str = ""                    # only used when model_source = "Use existing model"
+    in_channels: int = 1                    # 1 = brightfield only, 2 = + fluorescence
+    epochs: int = 50
+    batch_size: int = 256
+    include_library_crops: bool = True
+    library_dir: Optional[Path] = None
+    species: str = ""
+    # When True, the stage runs without a current-run input — it pulls only
+    # library crops, trains a model, and re-extracts embeddings for the whole
+    # library. Used by the "Train embeddings" input mode.
+    train_only: bool = False
+
+
+@dataclass
 class RunContext:
     czi_path: Path
     output_dir: Path
@@ -28,12 +47,14 @@ class RunContext:
     do_segment: bool = True
     do_classify: bool = True
     do_features: bool = False
+    do_embeddings: bool = False
 
     # Per-stage options
     focus_opts: FocusOpts = field(default_factory=FocusOpts)
     segment_opts: SegmentOpts = field(default_factory=SegmentOpts)
     classify_opts: ClassifyOpts = field(default_factory=ClassifyOpts)
     features_opts: ExtractOpts = field(default_factory=ExtractOpts)
+    embeddings_opts: EmbeddingOpts = field(default_factory=EmbeddingOpts)
 
     # Channel handling (resolved early so all downstream stages agree)
     phase_channel: Optional[int] = None
@@ -84,6 +105,10 @@ class RunContext:
         return self.output_dir / "04_features"
 
     @property
+    def embeddings_dir(self) -> Path:
+        return self.output_dir / "05_embeddings"
+
+    @property
     def manifest_path(self) -> Path:
         return self.output_dir / "run_manifest.json"
 
@@ -106,12 +131,14 @@ class BulkRunContext:
     do_segment: bool = True
     do_classify: bool = True
     do_features: bool = False
+    do_embeddings: bool = False
 
     # Per-stage options (shared across all CZIs in the batch)
     focus_opts: FocusOpts = field(default_factory=FocusOpts)
     segment_opts: SegmentOpts = field(default_factory=SegmentOpts)
     classify_opts: ClassifyOpts = field(default_factory=ClassifyOpts)
     features_opts: ExtractOpts = field(default_factory=ExtractOpts)
+    embeddings_opts: EmbeddingOpts = field(default_factory=EmbeddingOpts)
 
     phase_channel: Optional[int] = None
     channel_labels: Optional[list[str]] = None
@@ -145,6 +172,10 @@ class BulkRunContext:
     @property
     def features_dir(self) -> Path:
         return self.output_dir / "04_features"
+
+    @property
+    def embeddings_dir(self) -> Path:
+        return self.output_dir / "05_embeddings"
 
     @property
     def manifest_path(self) -> Path:
