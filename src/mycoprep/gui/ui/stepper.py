@@ -192,3 +192,8 @@ class Stepper(QWidget):
         for s in self._steps.values():
             s.set_state(StepState.PENDING)
             s.set_fraction(0.0)
+
+    def set_visible(self, name: str, visible: bool) -> None:
+        """Show or hide a single step (others unchanged)."""
+        if name in self._steps:
+            self._steps[name].setVisible(visible)

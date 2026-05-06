@@ -21,7 +21,10 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas: list = []
 binaries: list = []
-hiddenimports: list = []
+# QtNetwork drives the in-app GitHub update check; force-include it so
+# the PyQt6 hook bundles the QtNetwork DLL and OpenSSL backend even
+# when the import graph misses dynamic uses.
+hiddenimports: list = ["PyQt6.QtNetwork"]
 
 # Project assets — bundled at the runtime root so ``resource_root()``
 # (in ``mycoprep/gui/_resources.py``) finds them.

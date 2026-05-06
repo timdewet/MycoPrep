@@ -1580,3 +1580,1024 @@ def _morphology_cluster_plots(
         batch_correct=batch_correct,
     )
     progress_cb(0.95, "qc_plots: library clustering done")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CNN Embedding UMAP (for the Analysis panel "CNN embeddings" view)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def available_embedding_models(library_dir: "Path | None" = None) -> list[dict]:
+    """Enumerate trained CNN embedding models with extracted parquets.
+
+    Returns a list of ``{model_type, path, mtime}`` dicts, one per
+    architecture subdirectory under ``<models_dir>/embeddings/`` that has
+    a ``cnn_embeddings.parquet``. Sorted by mtime descending (most recent
+    first). Used to populate the Analysis panel's model selector.
+    """
+    from .feature_library import FeatureLibrary
+    out: list[dict] = []
+    try:
+        lib = FeatureLibrary(library_dir)
+    except Exception:  # noqa: BLE001
+        return out
+    emb_dir = lib.models_dir / "embeddings"
+    if not emb_dir.exists():
+        return out
+    flat = emb_dir / "cnn_embeddings.parquet"
+    if flat.exists():
+        out.append({
+            "model_type": "(flat layout)",
+            "path": flat,
+            "mtime": flat.stat().st_mtime,
+        })
+    for sub in emb_dir.iterdir():
+        if sub.is_dir():
+            p = sub / "cnn_embeddings.parquet"
+            if p.exists():
+                out.append({
+                    "model_type": sub.name,
+                    "path": p,
+                    "mtime": p.stat().st_mtime,
+                })
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+
+def render_embeddings_html(
+    out_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    color_by: str = "cluster",
+    feature_col: str | None = None,
+    highlight_genes: list[str] | None = None,
+    batch_correct: bool = True,
+    model_type: str = "",
+) -> "Path | None":
+    """Render UMAP of CNN embeddings as interactive Plotly HTML.
+
+    ``model_type`` selects which trained model's embeddings to load (one
+    of the architecture subdirectories under ``<models_dir>/embeddings/``).
+    Empty string = use the most recently-modified one.
+    """
+    import pandas as pd
+
+    from .feature_library import FeatureLibrary
+
+    out_path = Path(out_path)
+    try:
+        lib = FeatureLibrary(library_dir)
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Look for embeddings under <models_dir>/embeddings/. New runs write
+    # to per-model-type subdirectories (e.g. ``embeddings/resnet18/``,
+    # ``embeddings/supcon_resnet18/``) so different architectures coexist;
+    # legacy runs wrote a flat layout directly under ``embeddings/``.
+    emb_dir = lib.models_dir / "embeddings"
+    emb_path: "Path | None" = None
+    if model_type:
+        # Explicit selection. Try subdirectory first; fall back to flat
+        # layout if the user picked the special "(flat layout)" entry.
+        cand = emb_dir / model_type / "cnn_embeddings.parquet"
+        if cand.exists():
+            emb_path = cand
+        elif model_type == "(flat layout)":
+            cand = emb_dir / "cnn_embeddings.parquet"
+            if cand.exists():
+                emb_path = cand
+    else:
+        # Latest available across all subdirectories + flat layout.
+        candidates: list["Path"] = []
+        if emb_dir.exists():
+            flat = emb_dir / "cnn_embeddings.parquet"
+            if flat.exists():
+                candidates.append(flat)
+            for sub in emb_dir.iterdir():
+                if sub.is_dir():
+                    p = sub / "cnn_embeddings.parquet"
+                    if p.exists():
+                        candidates.append(p)
+        if candidates:
+            emb_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    if emb_path is None or not emb_path.exists():
+        # Fallback: scan individual run feature dirs (very legacy layout).
+        idx = lib.list_runs(species=species or None)
+        if idx.empty:
+            return None
+        for _, row in idx.iloc[::-1].iterrows():
+            features_path = lib.library_dir / row["features_file"]
+            alt_path = features_path.parent / "embeddings" / "cnn_embeddings.parquet"
+            if alt_path.exists():
+                emb_path = alt_path
+                break
+        if emb_path is None or not emb_path.exists():
+            return None
+
+    df = pd.read_parquet(emb_path)
+    if df.empty:
+        return None
+
+    emb_cols = [c for c in df.columns if c.startswith("emb_")]
+    if len(emb_cols) < 10:
+        return None
+
+    has_multi_runs = (
+        "run_id" in df.columns and df["run_id"].nunique() > 1
+    )
+
+    # Detect biological controls from the library's per-run control_labels
+    # column. NT/NT1/NT2 etc. are independent biological replicates of the
+    # same non-targeting reagent — they're kept as separate points (they
+    # aren't more similar to themselves across runs than to each other
+    # within a run, so collapsing would be misleading), but they all
+    # contribute to the per-run NT anchor used below.
+    control_genes: set[str] = set()
+    try:
+        ctrl_idx = lib.list_runs(species=species or None)
+        # ``ctrl_idx`` is a DataFrame; `.get(col, [])` on a DataFrame
+        # returns the column Series (or default). Don't combine that with
+        # `or` — booling a Series raises "truth value is ambiguous".
+        ctrl_col = (
+            ctrl_idx["control_labels"]
+            if "control_labels" in ctrl_idx.columns
+            else []
+        )
+        for raw in ctrl_col:
+            for tok in str(raw).split(","):
+                tok = tok.strip()
+                if tok:
+                    control_genes.add(tok)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Aggregate to per-(run, condition) profiles FIRST. Harmony is then
+    # applied at this profile level rather than per-cell — the convention
+    # used in image-based morphological profiling (Nature Comms 2024
+    # 41467-024-50613-5 and similar JUMP-Cell-Painting work) and what we
+    # already do for the S-score pipeline. Profile-level Harmony is more
+    # stable with few batches: the algorithm doesn't have to invent a
+    # cell-level subcluster structure that the data may not support.
+    if has_multi_runs and "condition_label" in df.columns:
+        profiles = (
+            df.groupby(["run_id", "condition_label"])[emb_cols]
+            .mean()
+            .reset_index()
+        )
+        # For UMAP / colouring we still want a single label string per point.
+        profiles["condition_label"] = (
+            profiles["condition_label"].astype(str)
+            + " ("
+            + profiles["run_id"].astype(str)
+            + ")"
+        )
+    elif "condition_label" in df.columns:
+        profiles = df.groupby("condition_label")[emb_cols].mean().reset_index()
+        profiles["run_id"] = (
+            df["run_id"].iloc[0] if "run_id" in df.columns else "unknown"
+        )
+    else:
+        profiles = df[emb_cols].copy()
+        profiles["condition_label"] = "unknown"
+        profiles["run_id"] = "unknown"
+
+    if len(profiles) < 3:
+        return None
+
+    # Parse gene from the original condition_label (strip the trailing
+    # "(run_id)" tag we may have added when splitting by run).
+    profiles["gene"] = (
+        profiles["condition_label"]
+        .str.replace(r"\s*\([^)]*\)\s*$", "", regex=True)
+        .str.split().str[0]
+    )
+
+    is_control = profiles["gene"].isin(control_genes) if control_genes else None
+
+    # ── Pipeline order: NT-anchor → PCA → Harmony → UMAP ──
+    # This is the order used in the S-score feature pipeline. Doing
+    # NT-anchoring before PCA/Harmony is analogous to how S-scores are
+    # already control-normalised at compute time. Harmony then corrects
+    # any *residual* per-run technical variation in PCA space (where
+    # cluster geometry is well-defined and N >> dim, unlike raw 512-d
+    # where Harmony's k-means is unstable). Critical: the previous code
+    # ran Harmony BEFORE NT-anchoring, then NT-anchored on top. That
+    # subtracted slightly-different per-run NT means from already-aligned
+    # data, re-introducing batch differences that UMAP then amplified —
+    # symptom: "Harmony separates the batches".
+
+    # 1. NT-anchor (gene-level control normalisation).
+    profiles_arr = profiles[emb_cols].values.astype(float).copy()
+    can_per_run_anchor = (
+        is_control is not None
+        and is_control.sum() >= 1
+        and "run_id" in profiles.columns
+        and profiles["run_id"].nunique() > 1
+    )
+    if can_per_run_anchor:
+        run_anchors = (
+            profiles[is_control].groupby("run_id")[emb_cols].mean()
+        )
+        global_nt = profiles.loc[is_control, emb_cols].mean().values
+        for rid, group_idx in profiles.groupby("run_id").indices.items():
+            a = (
+                run_anchors.loc[rid].values
+                if rid in run_anchors.index else global_nt
+            )
+            profiles_arr[group_idx] -= a
+        anchor_label = f"per-run NT-relative ({sorted(control_genes)})"
+    elif is_control is not None and is_control.sum() >= 1:
+        profiles_arr -= profiles.loc[is_control, emb_cols].mean().values
+        anchor_label = f"NT-relative ({sorted(control_genes)})"
+    else:
+        profiles_arr -= df[emb_cols].mean().values
+        anchor_label = "global-mean centered (no controls tagged)"
+
+    profiles[emb_cols] = profiles_arr
+
+    # 2. PCA → 50-d (or fewer if data is small).
+    import numpy as np
+    emb_matrix = profiles[emb_cols].values.astype(np.float32)
+
+    try:
+        from sklearn.decomposition import PCA
+        import umap
+
+        n_components_pca = min(50, emb_matrix.shape[1], emb_matrix.shape[0] - 1)
+        pca = PCA(n_components=n_components_pca)
+        reduced = pca.fit_transform(emb_matrix)
+
+        # 3. Harmony in PCA space (more stable than raw 512-d).
+        if batch_correct and has_multi_runs:
+            try:
+                import harmonypy
+                nclust = max(2, min(20, len(profiles) // 4))
+                ho = harmonypy.run_harmony(
+                    reduced,
+                    pd.DataFrame({"run_id": profiles["run_id"].values}),
+                    vars_use="run_id",
+                    max_iter_harmony=20,
+                    nclust=nclust,
+                )
+                reduced = ho.Z_corr
+            except ImportError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 4. UMAP.
+        n_neighbors = min(15, len(profiles) - 1)
+        n_neighbors = max(2, n_neighbors)
+        reducer = umap.UMAP(
+            n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42
+        )
+        coords = reducer.fit_transform(reduced)
+    except ImportError:
+        # Fallback to PCA 2D
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=2)
+        coords = pca.fit_transform(emb_matrix)
+
+    # Defragment + add coords in one go to avoid pandas' "highly fragmented"
+    # warning that fires when a DataFrame gets many sequential `[col] = ...`
+    # assignments.
+    profiles = profiles.copy().assign(
+        umap_x=coords[:, 0], umap_y=coords[:, 1],
+    )
+
+    # Optional: overlay morphological feature from library data
+    if feature_col and color_by == "feature":
+        try:
+            lib_features = lib.load_species(species)
+            if not lib_features.empty and "well" in lib_features.columns:
+                parts = lib_features["well"].astype(str).str.split("__", expand=True)
+                atc = parts[0].str.replace("_focused", "", regex=False)
+                mutant = parts[2] if 2 in parts.columns else lib_features["well"].astype(str)
+                lib_features["_cond"] = (mutant.astype(str) + " " + atc.astype(str)).str.strip()
+                if feature_col in lib_features.columns:
+                    feat_means = lib_features.groupby("_cond")[feature_col].mean()
+                    profiles["_feature_val"] = profiles["condition_label"].map(feat_means)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Render with Plotly
+    try:
+        import plotly.express as px
+
+        if color_by == "feature" and "_feature_val" in profiles.columns:
+            fig = px.scatter(
+                profiles, x="umap_x", y="umap_y",
+                color="_feature_val",
+                hover_data=["condition_label", "run_id", "gene"],
+                color_continuous_scale="Viridis",
+                labels={"_feature_val": feature_col or "feature"},
+            )
+        elif color_by == "run_id":
+            fig = px.scatter(
+                profiles, x="umap_x", y="umap_y",
+                color="run_id",
+                hover_data=["condition_label", "gene"],
+            )
+        else:
+            fig = px.scatter(
+                profiles, x="umap_x", y="umap_y",
+                color="gene",
+                hover_data=["condition_label", "run_id"],
+            )
+
+        # Highlight genes
+        if highlight_genes:
+            hl_set = {g.lower() for g in highlight_genes}
+            profiles["_highlighted"] = profiles["gene"].str.lower().isin(hl_set)
+            for trace in fig.data:
+                if hasattr(trace, "customdata") and trace.customdata is not None:
+                    pass  # opacity handled below
+            fig.update_traces(
+                marker=dict(size=8, opacity=0.3),
+                selector=lambda t: True,
+            )
+            hl_profiles = profiles[profiles["_highlighted"]]
+            if not hl_profiles.empty:
+                fig.add_scatter(
+                    x=hl_profiles["umap_x"], y=hl_profiles["umap_y"],
+                    mode="markers",
+                    marker=dict(size=12, color="red", opacity=1.0),
+                    text=hl_profiles["condition_label"],
+                    hoverinfo="text",
+                    name="Highlighted",
+                )
+
+        harmony_status = ""
+        if has_multi_runs:
+            harmony_status = (
+                " · Harmony" if batch_correct else " · raw (no batch correct)"
+            )
+        fig.update_layout(
+            title=(
+                f"CNN Embedding UMAP — {anchor_label}{harmony_status}"
+                + (f" · model: {emb_path.parent.name}"
+                   if emb_path.parent.name != "embeddings" else "")
+            ),
+            xaxis_title="UMAP 1",
+            yaxis_title="UMAP 2",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=60, b=40),
+        )
+
+        # Match the Feature Profiles renderer: viewport-height default
+        # plus fullheight CSS injection.
+        fig.write_html(
+            str(out_path),
+            include_plotlyjs=True,
+            default_height="100vh",
+        )
+        _make_plot_html_fullheight(out_path)
+        return out_path
+    except ImportError:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CNN Embedding UMAP via Optimal Transport (Sinkhorn divergence)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _sinkhorn_divergence_matrix(
+    point_clouds: list["np.ndarray"],
+    reg: float = 0.1,
+    n_iter_max: int = 2000,
+    progress_cb=None,
+) -> "np.ndarray":
+    """Pairwise Sinkhorn divergence between point clouds.
+
+    Sinkhorn divergence ([Feydy 2019]) is the entropic-regularised OT cost
+    debiased to be a proper divergence:
+
+        SD(μ, ν) = OT_ε(μ, ν) − ½·OT_ε(μ, μ) − ½·OT_ε(ν, ν)
+
+    Returns a symmetric (n, n) matrix of divergences. Each cloud is
+    treated as uniformly-weighted.
+
+    ``reg`` is interpreted as a **fraction of the typical (median) cost
+    matrix value**, not an absolute number. Sinkhorn's regularisation
+    has to be calibrated to the cost-matrix scale or it under- or
+    over-regularises silently — the original ``ε=0.1`` worked for unit-
+    scale embeddings but was ~5000× too small for raw 512-d sqEuclidean
+    distances (typical ~500), giving meaningless distances. With this
+    rescaling, ``reg=0.05`` means "5% of typical cost" regardless of
+    embedding magnitude.
+    """
+    import numpy as np
+    import ot
+
+    n = len(point_clouds)
+    if n == 0:
+        return np.zeros((0, 0))
+
+    # Estimate the typical cost scale once, from a sample of inter-cloud
+    # cost matrices, so the same effective regularisation is used for
+    # every pair.
+    rng = np.random.default_rng(0)
+    sample_pairs = min(20, n * (n - 1) // 2 if n > 1 else 1)
+    sample_costs = []
+    if n > 1:
+        for _ in range(sample_pairs):
+            i, j = rng.choice(n, 2, replace=False)
+            M = ot.dist(point_clouds[i], point_clouds[j], metric="sqeuclidean")
+            sample_costs.append(float(np.median(M)))
+    cost_scale = float(np.median(sample_costs)) if sample_costs else 1.0
+    if cost_scale <= 0:
+        cost_scale = 1.0
+    abs_reg = reg * cost_scale
+
+    def _sinkhorn(M: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+        # Log-stabilised Sinkhorn — same as ot.sinkhorn2 but in log-space
+        # so it stays numerically well-behaved at small reg / large M.
+        return float(
+            ot.sinkhorn2(
+                a, b, M, reg=abs_reg,
+                numItermax=n_iter_max,
+                method="sinkhorn_log",
+            )
+        )
+
+    self_terms = []
+    for pc in point_clouds:
+        a = np.full(len(pc), 1.0 / max(len(pc), 1))
+        M = ot.dist(pc, pc, metric="sqeuclidean")
+        self_terms.append(_sinkhorn(M, a, a))
+
+    D = np.zeros((n, n), dtype=np.float64)
+    total_pairs = n * (n - 1) // 2
+    done = 0
+    for i in range(n):
+        ai = np.full(len(point_clouds[i]), 1.0 / max(len(point_clouds[i]), 1))
+        for j in range(i + 1, n):
+            bj = np.full(len(point_clouds[j]), 1.0 / max(len(point_clouds[j]), 1))
+            M = ot.dist(point_clouds[i], point_clouds[j], metric="sqeuclidean")
+            cost = _sinkhorn(M, ai, bj)
+            div = cost - 0.5 * (self_terms[i] + self_terms[j])
+            D[i, j] = D[j, i] = max(div, 0.0)
+            done += 1
+            if progress_cb is not None and total_pairs > 0:
+                progress_cb(done / total_pairs)
+    return D
+
+
+def render_embeddings_ot_html(
+    out_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    color_by: str = "cluster",
+    feature_col: str | None = None,
+    highlight_genes: list[str] | None = None,
+    batch_correct: bool = True,
+    model_type: str = "",
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    progress_cb=None,
+) -> "Path | None":
+    """Render UMAP of CNN embeddings with **Optimal Transport** distance.
+
+    Instead of collapsing each (run, condition) to its mean and comparing
+    means, this computes pairwise Sinkhorn divergences between full cell
+    point clouds, then UMAP-projects the resulting distance matrix. Two
+    failure modes the mean-based view hides:
+
+    - **Heterogeneous knockdowns** — a gene producing 50% normal + 50%
+      elongated cells has the same mean as one producing 100% medium-
+      elongated; OT separates them.
+    - **Variance differences** — a partially-penetrant knockdown vs.
+      a tight off-control cluster.
+
+    Embeddings are loaded from the same per-architecture subdirectory as
+    :func:`render_embeddings_html`, so this works on autoencoder,
+    SupCon, or any future trained model.
+
+    Computational cost: ``n_cells_per_condition`` cells per group, then
+    O((n_groups² / 2) × n²) Sinkhorn iterations. With 84 groups × 400
+    cells ≈ a few seconds on CPU.
+    """
+    import pandas as pd
+
+    from .feature_library import FeatureLibrary
+
+    out_path = Path(out_path)
+    if progress_cb is None:
+        progress_cb = lambda f: None
+
+    try:
+        lib = FeatureLibrary(library_dir)
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Same model-discovery logic as render_embeddings_html.
+    emb_dir = lib.models_dir / "embeddings"
+    emb_path: "Path | None" = None
+    if model_type:
+        cand = emb_dir / model_type / "cnn_embeddings.parquet"
+        if cand.exists():
+            emb_path = cand
+        elif model_type == "(flat layout)":
+            cand = emb_dir / "cnn_embeddings.parquet"
+            if cand.exists():
+                emb_path = cand
+    else:
+        candidates: list["Path"] = []
+        if emb_dir.exists():
+            flat = emb_dir / "cnn_embeddings.parquet"
+            if flat.exists():
+                candidates.append(flat)
+            for sub in emb_dir.iterdir():
+                if sub.is_dir():
+                    p = sub / "cnn_embeddings.parquet"
+                    if p.exists():
+                        candidates.append(p)
+        if candidates:
+            emb_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    if emb_path is None or not emb_path.exists():
+        return None
+
+    df = pd.read_parquet(emb_path)
+    if df.empty:
+        return None
+
+    emb_cols = [c for c in df.columns if c.startswith("emb_")]
+    if len(emb_cols) < 10:
+        return None
+
+    has_multi_runs = (
+        "run_id" in df.columns and df["run_id"].nunique() > 1
+    )
+
+    # Detect controls (same as the mean-based renderer).
+    control_genes: set[str] = set()
+    try:
+        ctrl_idx = lib.list_runs(species=species or None)
+        # ``ctrl_idx`` is a DataFrame; `.get(col, [])` on a DataFrame
+        # returns the column Series (or default). Don't combine that with
+        # `or` — booling a Series raises "truth value is ambiguous".
+        ctrl_col = (
+            ctrl_idx["control_labels"]
+            if "control_labels" in ctrl_idx.columns
+            else []
+        )
+        for raw in ctrl_col:
+            for tok in str(raw).split(","):
+                tok = tok.strip()
+                if tok:
+                    control_genes.add(tok)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Per-cell preprocessing: optional Harmony, optional per-run NT
+    # subtraction. Done at cell level here (not profile) since OT
+    # operates on the full cloud.
+    import numpy as np
+
+    if batch_correct and has_multi_runs:
+        try:
+            import harmonypy
+            from sklearn.decomposition import PCA
+            # Reduce to ~50-d before Harmony (same logic as S-score path).
+            n_pca = min(50, len(emb_cols), max(2, len(df) // 10))
+            pca = PCA(n_components=n_pca)
+            X_pca = pca.fit_transform(df[emb_cols].values.astype(np.float32))
+            ho = harmonypy.run_harmony(
+                X_pca,
+                pd.DataFrame({"run_id": df["run_id"].values}),
+                vars_use="run_id",
+                max_iter_harmony=20,
+                nclust=min(20, max(2, len(df) // 200)),
+            )
+            # Replace embeddings columns with corrected (and PCA-reduced)
+            # representation. OT works in any dim — the reduced form is
+            # actually faster.
+            emb_cols = [f"hpc_{i}" for i in range(ho.Z_corr.shape[1])]
+            df = df.drop(columns=[c for c in df.columns if c.startswith("emb_")])
+            for i, c in enumerate(emb_cols):
+                df[c] = ho.Z_corr[:, i]
+        except ImportError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    df["gene"] = df["condition_label"].str.split().str[0]
+
+    # Per-run NT centering at the cell level. Done before OT, so the
+    # point clouds are already control-normalised.
+    if "run_id" in df.columns and control_genes:
+        is_ctrl_cell = df["gene"].isin(control_genes)
+        if is_ctrl_cell.any():
+            X = df[emb_cols].values.astype(np.float32)
+            for rid, idx in df.groupby("run_id").indices.items():
+                rid_ctrl_mask = is_ctrl_cell.values[idx]
+                if rid_ctrl_mask.any():
+                    a = X[idx][rid_ctrl_mask].mean(axis=0)
+                    X[idx] = X[idx] - a
+            df[emb_cols] = X
+
+    # Group by (run_id, condition_label), sample n cells per group.
+    group_cols = (
+        ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+    )
+    groups = df.groupby(group_cols)
+    rng = np.random.default_rng(42)
+    point_clouds: list[np.ndarray] = []
+    group_meta: list[dict] = []
+    for key, gdf in groups:
+        n = min(n_cells_per_condition, len(gdf))
+        if n < 5:
+            continue  # too few cells; skip
+        idx = rng.choice(len(gdf), size=n, replace=False)
+        pc = gdf[emb_cols].values[idx].astype(np.float32)
+        point_clouds.append(pc)
+        if isinstance(key, tuple):
+            run_id, cond = key
+        else:
+            run_id, cond = "unknown", key
+        group_meta.append({
+            "run_id": str(run_id),
+            "condition_label": str(cond),
+            "gene": str(cond).split()[0],
+            "n_cells_used": n,
+        })
+    if len(point_clouds) < 3:
+        return None
+
+    progress_cb(0.1)
+
+    # Sinkhorn divergence matrix (the expensive bit).
+    try:
+        D = _sinkhorn_divergence_matrix(
+            point_clouds,
+            reg=sinkhorn_reg,
+            n_iter_max=200,
+            progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
+        )
+    except ImportError:
+        # POT not installed → render an explanatory placeholder.
+        msg = (
+            "<html><body style='font-family: sans-serif; padding: 40px;'>"
+            "<h2>Optimal-Transport view requires <code>POT</code></h2>"
+            "<p>Install with: <code>pip install pot</code></p>"
+            "</body></html>"
+        )
+        out_path.write_text(msg, encoding="utf-8")
+        return out_path
+
+    progress_cb(0.85)
+
+    # Symmetrise (already symmetric within numerical noise) and convert
+    # to a non-negative distance for UMAP. Sinkhorn divergence is squared-
+    # distance-like; take sqrt for a proper-distance feel before UMAP.
+    np.fill_diagonal(D, 0.0)
+    D = np.sqrt(np.maximum(D, 0.0))
+
+    # UMAP from precomputed distance.
+    try:
+        import umap
+        n_neighbors = min(15, len(point_clouds) - 1)
+        n_neighbors = max(2, n_neighbors)
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=n_neighbors,
+            min_dist=0.1,
+            metric="precomputed",
+            random_state=42,
+            n_jobs=1,
+        )
+        coords = reducer.fit_transform(D)
+    except Exception:  # noqa: BLE001
+        # Fallback: classical MDS.
+        from sklearn.manifold import MDS
+        coords = MDS(
+            n_components=2, dissimilarity="precomputed", random_state=42,
+        ).fit_transform(D)
+
+    progress_cb(0.95)
+
+    # Build Plotly DataFrame.
+    plot_df = pd.DataFrame(group_meta)
+    plot_df["x"] = coords[:, 0]
+    plot_df["y"] = coords[:, 1]
+
+    try:
+        import plotly.express as px
+
+        if color_by == "run_id":
+            fig = px.scatter(
+                plot_df, x="x", y="y", color="run_id",
+                hover_data=["condition_label", "gene", "n_cells_used"],
+            )
+        else:
+            fig = px.scatter(
+                plot_df, x="x", y="y", color="gene",
+                hover_data=["condition_label", "run_id", "n_cells_used"],
+            )
+
+        if highlight_genes:
+            hl_set = {g.lower() for g in highlight_genes}
+            mask = plot_df["gene"].str.lower().isin(hl_set)
+            fig.update_traces(marker=dict(size=8, opacity=0.3))
+            hl = plot_df[mask]
+            if not hl.empty:
+                fig.add_scatter(
+                    x=hl["x"], y=hl["y"], mode="markers",
+                    marker=dict(size=12, color="red", opacity=1.0),
+                    text=hl["condition_label"], hoverinfo="text",
+                    name="Highlighted",
+                )
+
+        harmony_status = ""
+        if has_multi_runs:
+            harmony_status = (
+                " · Harmony" if batch_correct else " · raw"
+            )
+        title = (
+            f"CNN Embeddings — Optimal Transport "
+            f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
+            f"{harmony_status}"
+            f" · {len(point_clouds)} groups × {n_cells_per_condition} cells"
+        )
+        if emb_path.parent.name != "embeddings":
+            title += f" · model: {emb_path.parent.name}"
+        fig.update_layout(
+            title=title,
+            xaxis_title="UMAP 1 (from OT distance)",
+            yaxis_title="UMAP 2 (from OT distance)",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=60, b=40),
+        )
+        fig.write_html(
+            str(out_path),
+            include_plotlyjs=True,
+            default_height="100vh",
+        )
+        _make_plot_html_fullheight(out_path)
+        progress_cb(1.0)
+        return out_path
+    except ImportError:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature-profile UMAP via Optimal Transport
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def render_features_ot_html(
+    out_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    color_by: str = "cluster",
+    feature_col: str | None = None,
+    highlight_genes: list[str] | None = None,
+    batch_correct: bool = True,
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    progress_cb=None,
+) -> "Path | None":
+    """OT-based UMAP of S-score morphological profiles.
+
+    Same idea as :func:`render_embeddings_ot_html` but operating on the
+    cell-level morphology features (length, width, intensity stats, etc.)
+    in ``all_features.parquet`` instead of the CNN embedding parquet.
+
+    For each (run, condition) cell cloud, computes the pairwise Sinkhorn
+    divergence and UMAPs the resulting distance matrix. Captures
+    distribution shape (heterogeneity, variance) on top of the per-
+    feature mean comparison the standard Feature Profiles view does.
+
+    Features are z-scored across all cells before OT so distance isn't
+    dominated by whichever feature has the largest scale.
+    """
+    import pandas as pd
+
+    from .feature_library import FeatureLibrary
+
+    out_path = Path(out_path)
+    if progress_cb is None:
+        progress_cb = lambda f: None
+
+    try:
+        lib = FeatureLibrary(library_dir)
+        df_lib = lib.load_species(species)
+    except Exception:  # noqa: BLE001
+        return None
+    if df_lib.empty:
+        return None
+
+    morph_cols = _select_morphology_cols(df_lib)
+    if len(morph_cols) < 3:
+        return None
+
+    # Run / condition / gene metadata. ``feature_library.load_species``
+    # adds ``_library_run_id`` per cell which we treat as the canonical
+    # batch label. We deliberately don't rename to ``run_id`` because the
+    # underlying per-cell features may already have a ``run_id`` column
+    # from extract_features (collision → 2D Series → groupby crashes).
+    df = df_lib.copy()
+    if "_library_run_id" not in df.columns:
+        df["_library_run_id"] = "unknown"
+    # Drop any conflicting per-cell run_id so groupby has a single source
+    # of truth, then alias the library one to ``run_id`` for readability.
+    if "run_id" in df.columns:
+        df = df.drop(columns=["run_id"])
+    df = df.rename(columns={"_library_run_id": "run_id"})
+
+    if "well" not in df.columns:
+        return None
+    parts = df["well"].astype(str).str.split("__", expand=True)
+    atc = parts[0].str.replace("_focused", "", regex=False)
+    mutant = parts[2] if 2 in parts.columns else df["well"].astype(str)
+    df["condition_label"] = (mutant.astype(str) + " " + atc.astype(str)).str.strip()
+    df["gene"] = mutant.astype(str)
+
+    has_multi_runs = df["run_id"].nunique() > 1
+
+    # Detect controls.
+    control_genes: set[str] = set()
+    try:
+        ctrl_idx = lib.list_runs(species=species or None)
+        # ``ctrl_idx`` is a DataFrame; `.get(col, [])` on a DataFrame
+        # returns the column Series (or default). Don't combine that with
+        # `or` — booling a Series raises "truth value is ambiguous".
+        ctrl_col = (
+            ctrl_idx["control_labels"]
+            if "control_labels" in ctrl_idx.columns
+            else []
+        )
+        for raw in ctrl_col:
+            for tok in str(raw).split(","):
+                tok = tok.strip()
+                if tok:
+                    control_genes.add(tok)
+    except Exception:  # noqa: BLE001
+        pass
+
+    import numpy as np
+
+    # Standardise features to unit variance so OT distances aren't
+    # dominated by whichever feature happens to have the largest scale
+    # (length in µm vs. intensity in raw counts, etc.). Z-scoring puts
+    # everything on the same scale, but heavy-tailed distributions (cell
+    # area, intensity outliers) leave a few cells at ±20–80 σ which then
+    # dominate the OT cost matrix and break Sinkhorn convergence. Clip to
+    # ±5 σ after z-scoring — keeps almost all the signal, kills outliers.
+    X = df[morph_cols].values.astype(np.float32)
+    mu = np.nanmean(X, axis=0)
+    sigma = np.nanstd(X, axis=0)
+    sigma[sigma < 1e-8] = 1.0
+    X = (X - mu) / sigma
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -5.0, 5.0)
+    df[morph_cols] = X
+
+    # Optional Harmony at cell level (keeps things consistent with the
+    # CNN-OT path; the feature space is small enough that a PCA reduction
+    # isn't necessary first).
+    if batch_correct and has_multi_runs:
+        try:
+            import harmonypy
+            ho = harmonypy.run_harmony(
+                df[morph_cols].values.astype(np.float32),
+                pd.DataFrame({"run_id": df["run_id"].values}),
+                vars_use="run_id",
+                max_iter_harmony=20,
+                nclust=min(20, max(2, len(df) // 200)),
+            )
+            df[morph_cols] = ho.Z_corr
+        except ImportError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Per-run NT centring at the cell level.
+    if control_genes:
+        is_ctrl = df["gene"].isin(control_genes)
+        if is_ctrl.any():
+            X = df[morph_cols].values.astype(np.float32)
+            for rid, idx in df.groupby("run_id").indices.items():
+                rid_ctrl = is_ctrl.values[idx]
+                if rid_ctrl.any():
+                    a = X[idx][rid_ctrl].mean(axis=0)
+                    X[idx] = X[idx] - a
+            df[morph_cols] = X
+
+    # Group + sample.
+    group_cols = ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+    rng = np.random.default_rng(42)
+    point_clouds: list[np.ndarray] = []
+    group_meta: list[dict] = []
+    for key, gdf in df.groupby(group_cols):
+        n = min(n_cells_per_condition, len(gdf))
+        if n < 5:
+            continue
+        idx = rng.choice(len(gdf), size=n, replace=False)
+        point_clouds.append(gdf[morph_cols].values[idx].astype(np.float32))
+        if isinstance(key, tuple):
+            run_id, cond = key
+        else:
+            run_id, cond = "unknown", key
+        group_meta.append({
+            "run_id": str(run_id),
+            "condition_label": str(cond),
+            "gene": str(cond).split()[0],
+            "n_cells_used": n,
+        })
+    if len(point_clouds) < 3:
+        return None
+
+    progress_cb(0.1)
+
+    try:
+        D = _sinkhorn_divergence_matrix(
+            point_clouds,
+            reg=sinkhorn_reg,
+            n_iter_max=200,
+            progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
+        )
+    except ImportError:
+        msg = (
+            "<html><body style='font-family: sans-serif; padding: 40px;'>"
+            "<h2>Optimal-Transport view requires <code>POT</code></h2>"
+            "<p>Install with: <code>pip install pot</code></p>"
+            "</body></html>"
+        )
+        out_path.write_text(msg, encoding="utf-8")
+        return out_path
+
+    np.fill_diagonal(D, 0.0)
+    D = np.sqrt(np.maximum(D, 0.0))
+
+    progress_cb(0.85)
+
+    try:
+        import umap
+        n_neighbors = max(2, min(15, len(point_clouds) - 1))
+        coords = umap.UMAP(
+            n_components=2, n_neighbors=n_neighbors, min_dist=0.1,
+            metric="precomputed", random_state=42, n_jobs=1,
+        ).fit_transform(D)
+    except Exception:  # noqa: BLE001
+        from sklearn.manifold import MDS
+        coords = MDS(
+            n_components=2, dissimilarity="precomputed", random_state=42,
+        ).fit_transform(D)
+
+    plot_df = pd.DataFrame(group_meta)
+    plot_df["x"] = coords[:, 0]
+    plot_df["y"] = coords[:, 1]
+
+    try:
+        import plotly.express as px
+        if color_by == "run_id":
+            fig = px.scatter(
+                plot_df, x="x", y="y", color="run_id",
+                hover_data=["condition_label", "gene", "n_cells_used"],
+            )
+        else:
+            fig = px.scatter(
+                plot_df, x="x", y="y", color="gene",
+                hover_data=["condition_label", "run_id", "n_cells_used"],
+            )
+
+        if highlight_genes:
+            hl_set = {g.lower() for g in highlight_genes}
+            fig.update_traces(marker=dict(size=8, opacity=0.3))
+            hl = plot_df[plot_df["gene"].str.lower().isin(hl_set)]
+            if not hl.empty:
+                fig.add_scatter(
+                    x=hl["x"], y=hl["y"], mode="markers",
+                    marker=dict(size=12, color="red", opacity=1.0),
+                    text=hl["condition_label"], hoverinfo="text",
+                    name="Highlighted",
+                )
+
+        harmony_status = ""
+        if has_multi_runs:
+            harmony_status = " · Harmony" if batch_correct else " · raw"
+        fig.update_layout(
+            title=(
+                f"Feature Profiles — Optimal Transport "
+                f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
+                f"{harmony_status} · {len(point_clouds)} groups × "
+                f"{n_cells_per_condition} cells · {len(morph_cols)} features"
+            ),
+            xaxis_title="UMAP 1 (from OT distance)",
+            yaxis_title="UMAP 2 (from OT distance)",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=60, b=40),
+        )
+        fig.write_html(
+            str(out_path), include_plotlyjs=True, default_height="100vh",
+        )
+        _make_plot_html_fullheight(out_path)
+        progress_cb(1.0)
+        return out_path
+    except ImportError:
+        return None

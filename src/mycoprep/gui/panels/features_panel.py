@@ -222,13 +222,13 @@ class FeaturesPanel(QWidget):
         root.addWidget(crops_box)
 
         # ── Feature library ───────────────────────────────────────
-        lib_box = QGroupBox("Feature library (cross-experiment clustering)")
+        lib_box = QGroupBox("Morphology library (cross-experiment clustering)")
         lib_form = QFormLayout(lib_box)
         lib_form.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
         lib_form.setHorizontalSpacing(tokens.S4)
         lib_form.setVerticalSpacing(tokens.S3)
 
-        self.add_to_library = QCheckBox("Register this run in the feature library")
+        self.add_to_library = QCheckBox("Register this run in the morphology library")
         self.add_to_library.setChecked(False)
         lib_form.addRow("", _with_helper(
             self.add_to_library,
@@ -254,7 +254,7 @@ class FeaturesPanel(QWidget):
 
         lib_dir_row = QHBoxLayout()
         self.library_dir = QLineEdit()
-        self.library_dir.setPlaceholderText("~/.mycoprep/feature_library/")
+        self.library_dir.setPlaceholderText("~/.mycoprep/morphology_library/")
         lib_dir_row.addWidget(self.library_dir)
         self._lib_browse_btn = QPushButton("Browse\u2026")
         self._lib_browse_btn.setFixedWidth(80)

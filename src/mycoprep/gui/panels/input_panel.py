@@ -70,6 +70,7 @@ class InputMode(Enum):
     SINGLE_FILE = "single_file"
     SINGLE_PLATE = "single_plate"
     BULK = "bulk"
+    TRAIN_EMBEDDINGS = "train_embeddings"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,11 +197,20 @@ class InputPanel(QWidget):
         self._radio_bulk = QPushButton("Multiple files")
         self._radio_bulk.setObjectName("segMid")
         self._radio_single_plate = QPushButton("Single plate")
-        self._radio_single_plate.setObjectName("segRight")
+        self._radio_single_plate.setObjectName("segMid")
+        self._radio_train_embeddings = QPushButton("Train embeddings")
+        self._radio_train_embeddings.setObjectName("segRight")
+        self._radio_train_embeddings.setToolTip(
+            "Train an autoencoder on crops already in the morphology library. "
+            "No new CZIs are processed — only Embeddings + Run are needed."
+        )
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
-        for b in (self._radio_single_file, self._radio_bulk, self._radio_single_plate):
+        for b in (
+            self._radio_single_file, self._radio_bulk,
+            self._radio_single_plate, self._radio_train_embeddings,
+        ):
             b.setCheckable(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             self._mode_group.addButton(b)
@@ -227,6 +237,9 @@ class InputPanel(QWidget):
         self._radio_bulk.toggled.connect(
             lambda on: self._on_mode_changed(InputMode.BULK) if on else None
         )
+        self._radio_train_embeddings.toggled.connect(
+            lambda on: self._on_mode_changed(InputMode.TRAIN_EMBEDDINGS) if on else None
+        )
 
         # ── Stacked source pages ────────────────────────────────────────
         # Custom QStackedWidget that reports the size of the *current* page
@@ -246,6 +259,7 @@ class InputPanel(QWidget):
         self._stack.addWidget(self._build_single_plate_page())  # idx 0
         self._stack.addWidget(self._build_single_file_page())   # idx 1
         self._stack.addWidget(self._build_bulk_page())          # idx 2
+        self._stack.addWidget(self._build_train_embeddings_page())  # idx 3
         self._stack.setSizePolicy(_QSP.Policy.Preferred, _QSP.Policy.Maximum)
         # Re-layout the panel when the page changes so the new (taller or
         # shorter) page is reflected.
@@ -438,6 +452,54 @@ class InputPanel(QWidget):
         v.addWidget(box)
         return page
 
+    # ───────────────────────────────────────────────────── train-embeddings
+
+    def _build_train_embeddings_page(self) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        box = QGroupBox("Train autoencoder from library")
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(16, 20, 16, 16)
+        bv.setSpacing(8)
+
+        info = QLabel(
+            "This mode trains a CNN autoencoder using crops already registered "
+            "in the morphology library — no new CZIs are processed.\n\n"
+            "Configure training settings on the <b>Embeddings</b> tab, then "
+            "click Run."
+        )
+        info.setWordWrap(True)
+        bv.addWidget(info)
+
+        self._train_lib_status = QLabel("")
+        self._train_lib_status.setObjectName("muted")
+        self._train_lib_status.setWordWrap(True)
+        bv.addWidget(self._train_lib_status)
+
+        v.addWidget(box)
+        v.addStretch(1)
+        return page
+
+    def _refresh_train_lib_status(self) -> None:
+        """Show how many library runs/crops are available for training."""
+        try:
+            from mycoprep.core.extract.feature_library import FeatureLibrary
+            lib = FeatureLibrary()
+            runs = lib.list_runs()
+            h5_paths = lib.crop_h5_paths()
+            n_runs = len(runs)
+            n_h5 = len(h5_paths)
+            n_cells = int(runs["n_cells"].sum()) if not runs.empty else 0
+            self._train_lib_status.setText(
+                f"Library: {n_runs} run(s), {n_cells:,} cells, "
+                f"{n_h5} HDF5 crop file(s) available."
+            )
+        except Exception as e:  # noqa: BLE001
+            self._train_lib_status.setText(f"(library status unavailable: {e})")
+
     # ─────────────────────────────────────────────────────────── mode events
 
     def _on_mode_changed(self, mode: InputMode) -> None:
@@ -447,12 +509,15 @@ class InputPanel(QWidget):
         self._sync_stack_to_mode()
         # Refresh the channels/info display for the active source.
         self._refresh_info_and_channels()
+        if mode is InputMode.TRAIN_EMBEDDINGS:
+            self._refresh_train_lib_status()
         self.modeChanged.emit(mode)
 
     def _sync_stack_to_mode(self) -> None:
-        idx = {InputMode.SINGLE_PLATE: 0,
-               InputMode.SINGLE_FILE:  1,
-               InputMode.BULK:         2}[self._mode]
+        idx = {InputMode.SINGLE_PLATE:     0,
+               InputMode.SINGLE_FILE:      1,
+               InputMode.BULK:             2,
+               InputMode.TRAIN_EMBEDDINGS: 3}[self._mode]
         self._stack.setCurrentIndex(idx)
 
     # ─────────────────────────────────────────── single-plate / single-file
@@ -600,6 +665,8 @@ class InputPanel(QWidget):
         n = self._bulk_layout.add_files([Path(p) for p in paths])
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Added {n} file(s).")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of CZIs")
@@ -608,6 +675,8 @@ class InputPanel(QWidget):
         n = self._bulk_layout.add_folder(Path(folder))
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Added {n} file(s) from {folder}.")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_remove_selected(self) -> None:
         sel = self._bulk_table.selectionModel().selectedRows() if self._bulk_table.selectionModel() else []
@@ -617,6 +686,8 @@ class InputPanel(QWidget):
         self._bulk_layout.remove_rows(rows)
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Removed {len(rows)} row(s).")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _bulk_remap_paths(self) -> None:
         """Re-base CZI paths in the bulk table from a user-picked root.
@@ -743,6 +814,8 @@ class InputPanel(QWidget):
             return
         self._bulk_model.set_layout(self._bulk_layout)
         self._refresh_bulk_status(extra=f"Loaded {len(self._bulk_layout.df)} row(s) from {path}.")
+        self._refresh_info_and_channels()
+        self.channelsChanged.emit()
 
     def _refresh_bulk_status(self, extra: str = "") -> None:
         n_total = len(self._bulk_layout.df)
@@ -992,9 +1065,10 @@ class InputPanel(QWidget):
             except ValueError:
                 target = self._mode
             radio = {
-                InputMode.SINGLE_FILE:  self._radio_single_file,
-                InputMode.SINGLE_PLATE: self._radio_single_plate,
-                InputMode.BULK:         self._radio_bulk,
+                InputMode.SINGLE_FILE:      self._radio_single_file,
+                InputMode.SINGLE_PLATE:     self._radio_single_plate,
+                InputMode.BULK:             self._radio_bulk,
+                InputMode.TRAIN_EMBEDDINGS: self._radio_train_embeddings,
             }[target]
             radio.setChecked(True)
 

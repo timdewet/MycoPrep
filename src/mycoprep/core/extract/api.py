@@ -58,7 +58,7 @@ class ExtractOpts:
 
     # Feature library — accumulates features across runs for clustering
     add_to_library: bool = False
-    library_dir: Optional[Path] = None   # default: ~/.mycoprep/feature_library/
+    library_dir: Optional[Path] = None   # default: ~/.mycoprep/morphology_library/
     species: str = ""                    # e.g. "M. tuberculosis"
     experiment_type: str = "knockdown"   # "knockdown" or "drug"
     # Comma-separated list of mutant/condition tokens to treat as controls
@@ -68,7 +68,7 @@ class ExtractOpts:
 
     # Single-cell crops
     save_crops: bool = True
-    crop_size: int = 96
+    crop_size: int = 128
     crop_pad: int = 10
     crop_channels: Optional[list[int]] = None  # None = all non-mask channels
     include_mask_channel: bool = True

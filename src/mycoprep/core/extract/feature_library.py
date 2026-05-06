@@ -1,8 +1,9 @@
-"""Persistent feature library for cross-experiment morphological profiling.
+"""Persistent morphology library for cross-experiment morphological profiling.
 
 Accumulates ``all_features.parquet`` files across pipeline runs so that
 clustering and downstream analyses (drug-gene comparisons, etc.) can draw
-on an ever-growing reference set.
+on an ever-growing reference set.  Also manages trained autoencoder models
+and their provenance (which runs contributed to each model).
 
 Storage layout::
 
@@ -12,10 +13,14 @@ Storage layout::
             <run_id_1>.parquet   # cell-level features copied from each run
             <run_id_2>.parquet
             ...
+        models/
+            model_manifest.json  # provenance: which runs trained each model
+            <model_name>.pth     # trained autoencoder weights
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +28,21 @@ from typing import Optional
 
 import pandas as pd
 
-_DEFAULT_LIBRARY_DIR = Path.home() / ".mycoprep" / "feature_library"
+_NEW_DEFAULT_DIR = Path.home() / ".mycoprep" / "morphology_library"
+_OLD_DEFAULT_DIR = Path.home() / ".mycoprep" / "feature_library"
+
+
+def _resolve_default_library_dir() -> Path:
+    """Use the new default path, migrating from the old one if needed."""
+    if _NEW_DEFAULT_DIR.exists():
+        return _NEW_DEFAULT_DIR
+    if _OLD_DEFAULT_DIR.exists():
+        _OLD_DEFAULT_DIR.rename(_NEW_DEFAULT_DIR)
+        return _NEW_DEFAULT_DIR
+    return _NEW_DEFAULT_DIR
+
+
+_DEFAULT_LIBRARY_DIR = _resolve_default_library_dir()
 _INDEX_FILE = "library.parquet"
 _RUNS_SUBDIR = "runs"
 
@@ -39,16 +58,18 @@ _INDEX_COLUMNS = [
     "plate_acquisition_datetime",
     "date_added",
     "features_file",
+    "crops_h5_path",
 ]
 
 
-class FeatureLibrary:
-    """Manage a persistent library of per-run morphological features."""
+class MorphologyLibrary:
+    """Manage a persistent library of per-run morphological features and models."""
 
     def __init__(self, library_dir: Optional[Path] = None) -> None:
         self._dir = Path(library_dir) if library_dir else _DEFAULT_LIBRARY_DIR
         self._runs_dir = self._dir / _RUNS_SUBDIR
         self._index_path = self._dir / _INDEX_FILE
+        self._models_dir = self._dir / "models"
 
     @property
     def library_dir(self) -> Path:
@@ -80,6 +101,7 @@ class FeatureLibrary:
         source_czi: str = "",
         acquisition_datetime: str = "",
         control_labels: str = "",
+        crops_h5_path: str = "",
     ) -> None:
         """Copy run features into the library and update the index."""
         features_parquet = Path(features_parquet)
@@ -92,6 +114,12 @@ class FeatureLibrary:
 
         df = pd.read_parquet(features_parquet)
         conditions = _condition_labels(df)
+
+        # Auto-detect crops path if not provided
+        if not crops_h5_path:
+            candidate = features_parquet.parent / "all_crops.h5"
+            if candidate.exists():
+                crops_h5_path = str(candidate)
 
         idx = self._read_index()
         idx = idx[idx["run_id"] != run_id]
@@ -112,6 +140,7 @@ class FeatureLibrary:
                         timespec="seconds"
                     ),
                     "features_file": f"{_RUNS_SUBDIR}/{run_id}.parquet",
+                    "crops_h5_path": crops_h5_path,
                 }
             ]
         )
@@ -208,6 +237,128 @@ class FeatureLibrary:
             .reset_index()
         )
 
+    # ------------------------------------------------------------------
+    # Model provenance
+    # ------------------------------------------------------------------
+
+    @property
+    def models_dir(self) -> Path:
+        return self._models_dir
+
+    def _manifest_path(self) -> Path:
+        return self._models_dir / "model_manifest.json"
+
+    def _read_manifest(self) -> list[dict]:
+        path = self._manifest_path()
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+        return []
+
+    def _write_manifest(self, entries: list[dict]) -> None:
+        self._models_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._manifest_path(), "w") as f:
+            json.dump(entries, f, indent=2)
+
+    def register_model(
+        self,
+        model_name: str,
+        model_path: Path,
+        model_type: str,
+        run_ids: list[str],
+        epochs: int,
+        val_loss: float,
+        config: Optional[dict] = None,
+    ) -> Path:
+        """Copy a trained model into the library and update the manifest."""
+        self._models_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._models_dir / f"{model_name}.pth"
+        shutil.copy2(model_path, dest)
+
+        entries = self._read_manifest()
+        entries = [e for e in entries if e.get("model_name") != model_name]
+        entries.append({
+            "model_name": model_name,
+            "model_path": str(dest.relative_to(self._dir)),
+            "model_type": model_type,
+            "training_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "run_ids": run_ids,
+            "epochs": epochs,
+            "final_val_loss": val_loss,
+            "config": config or {},
+        })
+        self._write_manifest(entries)
+        return dest
+
+    def update_model_runs(self, model_name: str, new_run_ids: list[str]) -> bool:
+        """Append run_ids to an existing model's provenance."""
+        entries = self._read_manifest()
+        for entry in entries:
+            if entry.get("model_name") == model_name:
+                existing = set(entry.get("run_ids", []))
+                entry["run_ids"] = sorted(existing | set(new_run_ids))
+                entry["training_date"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+                self._write_manifest(entries)
+                return True
+        return False
+
+    def list_models(self) -> list[dict]:
+        """Return all registered model entries."""
+        return self._read_manifest()
+
+    def get_model_path(self, model_name: str) -> Optional[Path]:
+        """Resolve the .pth path for a named model."""
+        for entry in self._read_manifest():
+            if entry.get("model_name") == model_name:
+                return self._dir / entry["model_path"]
+        return None
+
+    def latest_model(self, model_type: Optional[str] = None) -> Optional[dict]:
+        """Return the most recently trained model entry."""
+        entries = self._read_manifest()
+        if model_type:
+            entries = [e for e in entries if e.get("model_type") == model_type]
+        return entries[-1] if entries else None
+
+    def crop_h5_paths(self, species: Optional[str] = None) -> list[Path]:
+        """Return paths to all_crops.h5 files for registered runs."""
+        return [p for _, p in self.crop_h5_paths_with_run_ids(species=species)]
+
+    def crop_h5_paths_with_run_ids(
+        self, species: Optional[str] = None,
+    ) -> list[tuple[str, Path]]:
+        """Return ``(run_id, path)`` tuples for each registered run's crops.
+
+        Use this instead of :meth:`crop_h5_paths` when you need to know which
+        library run each h5 file belongs to — e.g. when computing per-cell
+        ``run_id`` for batch correction. Filename stems aren't reliable as
+        run identifiers because every run's consolidated h5 is conventionally
+        named ``all_crops.h5``.
+        """
+        idx = self._read_index()
+        if species:
+            idx = idx[idx["species"].str.lower() == species.lower()]
+        out: list[tuple[str, Path]] = []
+        for _, row in idx.iterrows():
+            run_id = str(row["run_id"])
+            stored = row.get("crops_h5_path", "")
+            if stored and Path(stored).exists():
+                out.append((run_id, Path(stored)))
+                continue
+            features_path = self._dir / row["features_file"]
+            crops_path = features_path.parent / "all_crops.h5"
+            if not crops_path.exists():
+                run_dir = features_path.parent.parent
+                crops_path = run_dir / "04_features" / "all_crops.h5"
+            if crops_path.exists():
+                out.append((run_id, crops_path))
+        return out
+
+
+# Backward-compat alias
+FeatureLibrary = MorphologyLibrary
 
 _FEATURE_DIR_NAMES = {"04_features", "features"}
 

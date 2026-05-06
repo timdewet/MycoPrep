@@ -292,6 +292,31 @@ QFrame#sidebarDivider {{
 QFrame#header {{ background: {p.surface}; border: none; }}
 QFrame#headerDivider {{ background: {p.border}; min-height: 1px; max-height: 1px; }}
 
+QFrame#updateBanner {{
+    background: {p.surface_alt};
+    border: none;
+    border-bottom: 1px solid {p.border};
+}}
+QLabel#updateBannerMsg {{ color: {p.text}; font-weight: {tokens.FW_MEDIUM}; }}
+QPushButton#updateBannerView {{
+    background: {p.primary};
+    border: 1px solid {p.primary};
+    color: {p.on_primary};
+    font-weight: {tokens.FW_SEMIBOLD};
+    padding: 5px 14px;
+}}
+QPushButton#updateBannerView:hover {{
+    background: {p.primary_hover};
+    border-color: {p.primary_hover};
+}}
+QPushButton#updateBannerDismiss {{
+    background: transparent;
+    border: 1px solid transparent;
+    color: {p.text_muted};
+    padding: 5px 10px;
+}}
+QPushButton#updateBannerDismiss:hover {{ color: {p.text}; }}
+
 QLabel#brand {{
     font-size: {tokens.FS_H2}px;
     font-weight: {tokens.FW_SEMIBOLD};
