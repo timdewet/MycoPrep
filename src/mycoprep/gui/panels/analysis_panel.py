@@ -740,94 +740,18 @@ class AnalysisPanel(QWidget):
             if color_by == "feature" else None
         )
         baseline_mode = self._baseline_mode.currentData() or "pooled"
-
-        view_mode = self._view_mode.currentData() or "features"
-
-        if view_mode == "embeddings":
-            self._refresh_model_select()
-            worker = _EmbeddingsWorker(
-                self._library_html_path, self._library_dir, species,
-                color_by=color_by, feature_col=feature_col,
-                highlight_genes=self._highlight_genes.selected(),
-                batch_correct=self._batch_correct.isChecked(),
-                model_type=self._model_select.currentData() or "",
-            )
-            self._start_worker(
-                worker,
-                on_finished=self._on_library_render_finished,
-                status="Rendering embedding UMAP\u2026",
-            )
-        elif view_mode == "embeddings_ot":
-            self._refresh_model_select()
-            worker = _EmbeddingsOTWorker(
-                self._library_html_path, self._library_dir, species,
-                color_by=color_by, feature_col=feature_col,
-                highlight_genes=self._highlight_genes.selected(),
-                batch_correct=self._batch_correct.isChecked(),
-                model_type=self._model_select.currentData() or "",
-            )
-            self._start_worker(
-                worker,
-                on_finished=self._on_library_render_finished,
-                status="Computing OT distance matrix\u2026 (this can take a minute)",
-            )
-        elif view_mode == "features_ot":
-            worker = _FeaturesOTWorker(
-                self._library_html_path, self._library_dir, species,
-                color_by=color_by, feature_col=feature_col,
-                highlight_genes=self._highlight_genes.selected(),
-                batch_correct=self._batch_correct.isChecked(),
-            )
-            self._start_worker(
-                worker,
-                on_finished=self._on_library_render_finished,
-                status="Computing feature OT distance matrix\u2026",
-            )
-        else:
-            worker = _LibraryWorker(
-                self._library_html_path, self._library_dir, species,
-                color_by=color_by, feature_col=feature_col,
-                highlight_genes=self._highlight_genes.selected(),
-                baseline_mode=baseline_mode,
-                batch_correct=self._batch_correct.isChecked(),
-            )
-            self._start_worker(
-                worker,
-                on_finished=self._on_library_render_finished,
-                status="Rendering library plot\u2026",
-            )
-
-    def _on_view_mode_changed(self) -> None:
-        """Show/hide the Model selector and re-render."""
-        mode = self._view_mode.currentData() or ""
-        is_cnn = mode in ("embeddings", "embeddings_ot")
-        self._model_label.setVisible(is_cnn)
-        self._model_select.setVisible(is_cnn)
-        if is_cnn:
-            self._refresh_model_select()
-        self._refresh_library_view(force=True)
-
-    def _refresh_model_select(self) -> None:
-        """Populate the Model dropdown with available trained architectures."""
-        from mycoprep.core.extract.qc_plots import available_embedding_models
-        try:
-            models = available_embedding_models(self._library_dir)
-        except Exception:  # noqa: BLE001
-            models = []
-        prev = self._model_select.currentData() or ""
-        self._model_select.blockSignals(True)
-        self._model_select.clear()
-        self._model_select.addItem("Latest", userData="")
-        for m in models:
-            label = m["model_type"]
-            self._model_select.addItem(label, userData=label)
-        # Restore prior selection when still available.
-        if prev:
-            for i in range(self._model_select.count()):
-                if self._model_select.itemData(i) == prev:
-                    self._model_select.setCurrentIndex(i)
-                    break
-        self._model_select.blockSignals(False)
+        worker = _LibraryWorker(
+            self._library_html_path, self._library_dir, species,
+            color_by=color_by, feature_col=feature_col,
+            highlight_genes=self._highlight_genes.selected(),
+            baseline_mode=baseline_mode,
+            batch_correct=self._batch_correct.isChecked(),
+        )
+        self._start_worker(
+            worker,
+            on_finished=self._on_library_render_finished,
+            status="Rendering library plot\u2026",
+        )
 
     def _on_color_by_changed(self, _idx: int) -> None:
         mode = self._color_by.currentData() or "cluster"
