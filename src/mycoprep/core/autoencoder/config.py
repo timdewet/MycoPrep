@@ -36,18 +36,35 @@ class AutoencoderConfig:
     include_mask: bool = True
 
     # Training
-    epochs: int = 50
+    epochs: int = 100
     batch_size: int = 256
     lr: float = 1e-4
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4
     scheduler: str = "cosine"  # "cosine" | "step"
     freeze_epochs: int = 10
     perceptual_loss_weight: float = 0.0
-    val_fraction: float = 0.1
+    val_fraction: float = 0.15
 
     # SupCon-specific (ignored when model_type is an autoencoder)
-    temperature: float = 0.07           # SupCon contrastive temperature
+    temperature: float = 0.05           # SupCon contrastive temperature
     projection_dim: int = 128           # SupCon projection head output dim
+    # Where to take the SupCon class label per cell from. ``"auto"``
+    # prefers the H5 ``genes`` dataset when populated, falls back to
+    # ``drugs`` (drug+concentration), then to the full condition_label.
+    # ``"gene"`` / ``"drug"`` force the choice.
+    supcon_label_source: str = "auto"
+    # Drop classes with fewer than this many cells before training.
+    # Mirrors the Mtb reference's ``min_cells_per_condition: 50``.
+    min_cells_per_class: int = 50
+    # Cap each class's contribution to the WeightedRandomSampler so a
+    # rare class can't drown out the whole batch and a common class can't
+    # dominate. 5000 matches the Mtb reference.
+    max_samples_per_class: int = 5000
+    # Linear warmup epochs before cosine decay kicks in.
+    warmup_epochs: int = 5
+    # Stop training if val loss hasn't improved for this many consecutive
+    # epochs. ``0`` disables early stopping.
+    early_stop_patience: int = 15
 
     # Augmentation
     augment: bool = True

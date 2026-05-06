@@ -188,6 +188,19 @@ class HDF5CropDataset(Dataset):
                     )
                 if "fov_ids" in f:
                     meta_dict["fov_ids"] = f["fov_ids"][:].astype(np.int64)
+                # Per-cell gene / drug labels populated by the labelling
+                # stage (crops.py write path). Used by SupCon to take a
+                # clean class label per cell instead of guessing from
+                # condition_label.
+                for key in ("genes", "drugs", "concentrations"):
+                    if key in f:
+                        meta_dict[key] = np.array(
+                            [s.decode() if isinstance(s, bytes) else str(s)
+                             for s in f[key][:]]
+                        )
+                for key in ("is_drug", "is_control"):
+                    if key in f:
+                        meta_dict[key] = f[key][:].astype(bool)
             _CROP_CACHE[meta_key] = meta_dict  # type: ignore[assignment]
             self._cached_meta.append(meta_dict)
 
@@ -296,6 +309,16 @@ class HDF5CropDataset(Dataset):
                 meta["cell_uid"] = str(mdict["cell_uids"][local_idx])
             if "fov_ids" in mdict:
                 meta["fov_id"] = int(mdict["fov_ids"][local_idx])
+            for key, mkey in [
+                ("genes", "gene"),
+                ("drugs", "drug"),
+                ("concentrations", "concentration"),
+            ]:
+                if key in mdict:
+                    meta[mkey] = str(mdict[key][local_idx])
+            for key in ("is_drug", "is_control"):
+                if key in mdict:
+                    meta[key] = bool(mdict[key][local_idx])
             return crop, meta
 
         f = self._get_h5(file_idx)
@@ -328,6 +351,17 @@ class HDF5CropDataset(Dataset):
             meta["cell_uid"] = f["cell_uids"][local_idx].decode()
         if "fov_ids" in f:
             meta["fov_id"] = int(f["fov_ids"][local_idx])
+        for key, mkey in [
+            ("genes", "gene"),
+            ("drugs", "drug"),
+            ("concentrations", "concentration"),
+        ]:
+            if key in f:
+                v = f[key][local_idx]
+                meta[mkey] = v.decode() if isinstance(v, bytes) else str(v)
+        for key in ("is_drug", "is_control"):
+            if key in f:
+                meta[key] = bool(f[key][local_idx])
 
         return crop, meta
 
