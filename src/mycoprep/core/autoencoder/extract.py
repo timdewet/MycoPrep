@@ -79,6 +79,11 @@ def extract_embeddings(
     all_conditions: list[str] = []
     all_fov_ids: list[int] = []
     all_file_indices: list[int] = []
+    all_genes: list[str] = []
+    all_drugs: list[str] = []
+    all_concentrations: list[str] = []
+    all_is_drug: list[bool] = []
+    all_is_control: list[bool] = []
 
     n_batches = len(loader)
     progress_cb(0.10, f"Extracting embeddings from {len(dataset)} cells...")
@@ -94,6 +99,11 @@ def extract_embeddings(
                 all_conditions.append(m.get("condition_label", ""))
                 all_fov_ids.append(m.get("fov_id", -1))
                 all_file_indices.append(m.get("file_idx", 0))
+                all_genes.append(m.get("gene", ""))
+                all_drugs.append(m.get("drug", ""))
+                all_concentrations.append(m.get("concentration", ""))
+                all_is_drug.append(bool(m.get("is_drug", False)))
+                all_is_control.append(bool(m.get("is_control", False)))
 
             if (batch_idx + 1) % max(1, n_batches // 20) == 0:
                 frac = 0.10 + 0.70 * (batch_idx + 1) / n_batches
@@ -119,6 +129,15 @@ def extract_embeddings(
     else:
         run_ids = [str(h5_paths[fi].stem) for fi in all_file_indices]
     df.insert(3, "run_id", run_ids)
+
+    # Per-cell gene / drug / control labels straight from the H5 metadata
+    # (populated by the labelling stage). Lets downstream OT analysis
+    # rank conditions cleanly without re-deriving from condition_label.
+    df.insert(4, "gene", all_genes)
+    df.insert(5, "drug", all_drugs)
+    df.insert(6, "concentration", all_concentrations)
+    df.insert(7, "is_drug", all_is_drug)
+    df.insert(8, "is_control", all_is_control)
 
     # NB: Harmony batch correction is no longer applied here. We save raw
     # encoder output and let the visualisation layer apply Harmony on demand

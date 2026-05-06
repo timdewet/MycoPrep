@@ -2096,10 +2096,65 @@ def render_embeddings_html(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _ot_sidecar_path(html_path: "Path") -> "Path":
+    """Sidecar location for the cached OT distance matrix + group metadata."""
+    return Path(html_path).with_suffix(".ot_distance.parquet")
+
+
+def _save_ot_sidecar(
+    html_path: "Path",
+    D: "np.ndarray",
+    group_meta: list[dict],
+) -> None:
+    """Persist the OT distance matrix as a parquet so downstream analyses
+    (ranked matches, permutation tests, recolouring) don't recompute it.
+
+    Schema: one row per group, columns = group_meta keys + ``d_<idx>``
+    columns holding the distance to every other group. Indexed by row
+    position. Best-effort — silently swallows write failures so the HTML
+    renderer's success isn't tied to disk availability for the cache.
+    """
+    import pandas as pd
+
+    try:
+        meta_df = pd.DataFrame(group_meta)
+        n = D.shape[0]
+        for j in range(n):
+            meta_df[f"d_{j}"] = D[:, j]
+        meta_df.to_parquet(_ot_sidecar_path(html_path), index=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_pathway_map(pathway_csv: "Path | None") -> dict[str, str]:
+    """Load a gene → pathway mapping from a CSV.
+
+    Accepts any CSV with at least a ``gene`` column and a ``pathway``
+    column (case-insensitive). Genes are matched case-insensitively
+    downstream. Returns ``{}`` on missing file / read failure.
+    """
+    if pathway_csv is None:
+        return {}
+    try:
+        import pandas as pd
+        df = pd.read_csv(pathway_csv)
+        cols = {c.lower(): c for c in df.columns}
+        if "gene" not in cols or "pathway" not in cols:
+            return {}
+        gcol, pcol = cols["gene"], cols["pathway"]
+        return {
+            str(g).lower(): str(p)
+            for g, p in zip(df[gcol], df[pcol])
+            if str(g).strip()
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _sinkhorn_divergence_matrix(
     point_clouds: list["np.ndarray"],
     reg: float = 0.1,
-    n_iter_max: int = 2000,
+    n_iter_max: int = 1000,
     progress_cb=None,
 ) -> "np.ndarray":
     """Pairwise Sinkhorn divergence between point clouds.
@@ -2190,6 +2245,9 @@ def render_embeddings_ot_html(
     model_type: str = "",
     n_cells_per_condition: int = 400,
     sinkhorn_reg: float = 0.05,
+    n_neighbors: int = 5,
+    pca_dims_before_ot: int = 50,
+    pathway_csv: "Path | None" = None,
     progress_cb=None,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings with **Optimal Transport** distance.
@@ -2317,7 +2375,16 @@ def render_embeddings_ot_html(
         except Exception:  # noqa: BLE001
             pass
 
-    df["gene"] = df["condition_label"].str.split().str[0]
+    # Prefer the per-cell ``gene`` column written by extract.py; fall
+    # back to splitting condition_label on whitespace for older parquets.
+    if "gene" in df.columns and df["gene"].astype(str).str.len().gt(0).any():
+        df["gene"] = df["gene"].astype(str)
+        df["gene"] = df["gene"].where(
+            df["gene"].str.len() > 0,
+            df["condition_label"].str.split().str[0],
+        )
+    else:
+        df["gene"] = df["condition_label"].str.split().str[0]
 
     # Per-run NT centering at the cell level. Done before OT, so the
     # point clouds are already control-normalised.
@@ -2331,6 +2398,30 @@ def render_embeddings_ot_html(
                     a = X[idx][rid_ctrl_mask].mean(axis=0)
                     X[idx] = X[idx] - a
             df[emb_cols] = X
+
+    # Standalone PCA-before-OT (independent of Harmony). When Harmony is
+    # off we'd otherwise be running Sinkhorn on a 512-D embedding, which
+    # is both slower and noisier than working in a denoised 50-D subspace.
+    if (
+        pca_dims_before_ot
+        and pca_dims_before_ot > 0
+        and len(emb_cols) > pca_dims_before_ot
+    ):
+        try:
+            from sklearn.decomposition import PCA as _PCA
+            n_pca = min(
+                int(pca_dims_before_ot), len(emb_cols), max(2, len(df) // 10),
+            )
+            X_pca = _PCA(n_components=n_pca).fit_transform(
+                df[emb_cols].values.astype(np.float32),
+            )
+            new_cols = [f"pcot_{i}" for i in range(X_pca.shape[1])]
+            df = df.drop(columns=emb_cols)
+            for i, c in enumerate(new_cols):
+                df[c] = X_pca[:, i]
+            emb_cols = new_cols
+        except Exception:  # noqa: BLE001
+            pass
 
     # Group by (run_id, condition_label), sample n cells per group.
     group_cols = (
@@ -2367,7 +2458,7 @@ def render_embeddings_ot_html(
         D = _sinkhorn_divergence_matrix(
             point_clouds,
             reg=sinkhorn_reg,
-            n_iter_max=200,
+            n_iter_max=1000,
             progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
         )
     except ImportError:
@@ -2389,14 +2480,19 @@ def render_embeddings_ot_html(
     np.fill_diagonal(D, 0.0)
     D = np.sqrt(np.maximum(D, 0.0))
 
+    # Cache the distance matrix + group metadata as a sidecar parquet
+    # next to the HTML. Downstream analyses (ranked matches, permutation
+    # test, alternative colourings) read from cache instead of recomputing
+    # the expensive Sinkhorn loop.
+    _save_ot_sidecar(out_path, D, group_meta)
+
     # UMAP from precomputed distance.
     try:
         import umap
-        n_neighbors = min(15, len(point_clouds) - 1)
-        n_neighbors = max(2, n_neighbors)
+        eff_neighbors = max(2, min(int(n_neighbors), len(point_clouds) - 1))
         reducer = umap.UMAP(
             n_components=2,
-            n_neighbors=n_neighbors,
+            n_neighbors=eff_neighbors,
             min_dist=0.1,
             metric="precomputed",
             random_state=42,
@@ -2417,19 +2513,32 @@ def render_embeddings_ot_html(
     plot_df["x"] = coords[:, 0]
     plot_df["y"] = coords[:, 1]
 
+    # Pathway annotation (optional). When ``color_by == "pathway"`` and a
+    # mapping is available, points are coloured by gene → pathway lookup;
+    # genes without a mapping go to "Unannotated".
+    pathway_map = _load_pathway_map(pathway_csv)
+    if pathway_map:
+        plot_df["pathway"] = (
+            plot_df["gene"].astype(str).str.lower().map(pathway_map)
+            .fillna("Unannotated")
+        )
+    elif color_by == "pathway":
+        plot_df["pathway"] = "Unannotated"
+
     try:
         import plotly.express as px
 
+        color_col = "gene"
         if color_by == "run_id":
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="run_id",
-                hover_data=["condition_label", "gene", "n_cells_used"],
-            )
-        else:
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="gene",
-                hover_data=["condition_label", "run_id", "n_cells_used"],
-            )
+            color_col = "run_id"
+        elif color_by == "pathway" and "pathway" in plot_df.columns:
+            color_col = "pathway"
+        hover = [c for c in ["condition_label", "gene", "run_id", "pathway",
+                              "n_cells_used"]
+                 if c in plot_df.columns and c != color_col]
+        fig = px.scatter(
+            plot_df, x="x", y="y", color=color_col, hover_data=hover,
+        )
 
         if highlight_genes:
             hl_set = {g.lower() for g in highlight_genes}
@@ -2454,6 +2563,7 @@ def render_embeddings_ot_html(
             f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
             f"{harmony_status}"
             f" · {len(point_clouds)} groups × {n_cells_per_condition} cells"
+            f" · n_neighbors={max(2, min(int(n_neighbors), len(point_clouds) - 1))}"
         )
         if emb_path.parent.name != "embeddings":
             title += f" · model: {emb_path.parent.name}"
@@ -2492,6 +2602,9 @@ def render_features_ot_html(
     batch_correct: bool = True,
     n_cells_per_condition: int = 400,
     sinkhorn_reg: float = 0.05,
+    n_neighbors: int = 5,
+    pca_dims_before_ot: int = 0,
+    pathway_csv: "Path | None" = None,
     progress_cb=None,
 ) -> "Path | None":
     """OT-based UMAP of S-score morphological profiles.
@@ -2647,11 +2760,31 @@ def render_features_ot_html(
 
     progress_cb(0.1)
 
+    # Optional PCA-before-OT (off by default for the feature path —
+    # 30-D shape input is already small enough that OT handles it
+    # directly; included for parity with the embeddings path).
+    if (
+        pca_dims_before_ot
+        and pca_dims_before_ot > 0
+        and len(morph_cols) > pca_dims_before_ot
+    ):
+        try:
+            from sklearn.decomposition import PCA as _PCA
+            n_pca = min(int(pca_dims_before_ot), len(morph_cols))
+            X_red = _PCA(n_components=n_pca).fit_transform(
+                np.vstack(point_clouds).astype(np.float32),
+            )
+            sizes = [len(pc) for pc in point_clouds]
+            cum = np.cumsum([0] + sizes)
+            point_clouds = [X_red[cum[i]:cum[i + 1]] for i in range(len(sizes))]
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         D = _sinkhorn_divergence_matrix(
             point_clouds,
             reg=sinkhorn_reg,
-            n_iter_max=200,
+            n_iter_max=1000,
             progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
         )
     except ImportError:
@@ -2667,13 +2800,15 @@ def render_features_ot_html(
     np.fill_diagonal(D, 0.0)
     D = np.sqrt(np.maximum(D, 0.0))
 
+    _save_ot_sidecar(out_path, D, group_meta)
+
     progress_cb(0.85)
 
     try:
         import umap
-        n_neighbors = max(2, min(15, len(point_clouds) - 1))
+        eff_neighbors = max(2, min(int(n_neighbors), len(point_clouds) - 1))
         coords = umap.UMAP(
-            n_components=2, n_neighbors=n_neighbors, min_dist=0.1,
+            n_components=2, n_neighbors=eff_neighbors, min_dist=0.1,
             metric="precomputed", random_state=42, n_jobs=1,
         ).fit_transform(D)
     except Exception:  # noqa: BLE001
@@ -2686,18 +2821,28 @@ def render_features_ot_html(
     plot_df["x"] = coords[:, 0]
     plot_df["y"] = coords[:, 1]
 
+    pathway_map = _load_pathway_map(pathway_csv)
+    if pathway_map:
+        plot_df["pathway"] = (
+            plot_df["gene"].astype(str).str.lower().map(pathway_map)
+            .fillna("Unannotated")
+        )
+    elif color_by == "pathway":
+        plot_df["pathway"] = "Unannotated"
+
     try:
         import plotly.express as px
+        color_col = "gene"
         if color_by == "run_id":
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="run_id",
-                hover_data=["condition_label", "gene", "n_cells_used"],
-            )
-        else:
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="gene",
-                hover_data=["condition_label", "run_id", "n_cells_used"],
-            )
+            color_col = "run_id"
+        elif color_by == "pathway" and "pathway" in plot_df.columns:
+            color_col = "pathway"
+        hover = [c for c in ["condition_label", "gene", "run_id", "pathway",
+                              "n_cells_used"]
+                 if c in plot_df.columns and c != color_col]
+        fig = px.scatter(
+            plot_df, x="x", y="y", color=color_col, hover_data=hover,
+        )
 
         if highlight_genes:
             hl_set = {g.lower() for g in highlight_genes}
@@ -2720,6 +2865,7 @@ def render_features_ot_html(
                 f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
                 f"{harmony_status} · {len(point_clouds)} groups × "
                 f"{n_cells_per_condition} cells · {len(morph_cols)} features"
+                f" · n_neighbors={max(2, min(int(n_neighbors), len(point_clouds) - 1))}"
             ),
             xaxis_title="UMAP 1 (from OT distance)",
             yaxis_title="UMAP 2 (from OT distance)",

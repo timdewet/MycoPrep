@@ -23,6 +23,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QStackedLayout,
     QToolButton,
     QVBoxLayout,
@@ -315,6 +317,8 @@ class _EmbeddingsOTWorker(QObject):
         highlight_genes: Optional[list[str]] = None,
         batch_correct: bool = True,
         model_type: str = "",
+        n_neighbors: int = 5,
+        pathway_csv: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -325,6 +329,8 @@ class _EmbeddingsOTWorker(QObject):
         self._highlight_genes = list(highlight_genes or [])
         self._batch_correct = batch_correct
         self._model_type = model_type
+        self._n_neighbors = int(n_neighbors)
+        self._pathway_csv = pathway_csv
 
     def run(self) -> None:
         try:
@@ -345,6 +351,8 @@ class _EmbeddingsOTWorker(QObject):
                 highlight_genes=self._highlight_genes,
                 batch_correct=self._batch_correct,
                 model_type=self._model_type,
+                n_neighbors=self._n_neighbors,
+                pathway_csv=self._pathway_csv,
                 progress_cb=_cb,
             )
             self.progress.emit(100, "Done")
@@ -369,6 +377,8 @@ class _FeaturesOTWorker(QObject):
         feature_col: Optional[str] = None,
         highlight_genes: Optional[list[str]] = None,
         batch_correct: bool = True,
+        n_neighbors: int = 5,
+        pathway_csv: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -378,6 +388,8 @@ class _FeaturesOTWorker(QObject):
         self._feature_col = feature_col
         self._highlight_genes = list(highlight_genes or [])
         self._batch_correct = batch_correct
+        self._n_neighbors = int(n_neighbors)
+        self._pathway_csv = pathway_csv
 
     def run(self) -> None:
         try:
@@ -397,6 +409,8 @@ class _FeaturesOTWorker(QObject):
                 feature_col=self._feature_col,
                 highlight_genes=self._highlight_genes,
                 batch_correct=self._batch_correct,
+                n_neighbors=self._n_neighbors,
+                pathway_csv=self._pathway_csv,
                 progress_cb=_cb,
             )
             self.progress.emit(100, "Done")
@@ -590,6 +604,7 @@ class AnalysisPanel(QWidget):
         self._color_by.addItem("Condition", userData="atc")
         self._color_by.addItem("Reporter", userData="reporter")
         self._color_by.addItem("Replica", userData="replica")
+        self._color_by.addItem("Pathway", userData="pathway")
         self._color_by.addItem("Feature gradient\u2026", userData="feature")
         self._color_by.currentIndexChanged.connect(self._on_color_by_changed)
         colour_row.addWidget(self._color_by)
@@ -656,6 +671,52 @@ class AnalysisPanel(QWidget):
         self._compare_btn.clicked.connect(self._open_comparison)
         self._compare_btn.setEnabled(False)
         colour_row.addWidget(self._compare_btn)
+
+        # \u2500\u2500 OT-only controls \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # Visible only when an OT view is selected.
+        colour_row.addSpacing(tokens.S4)
+        self._ot_nn_label = QLabel("OT n_neighbors:")
+        colour_row.addWidget(self._ot_nn_label)
+        self._ot_nn = QSpinBox()
+        self._ot_nn.setRange(2, 50)
+        self._ot_nn.setValue(5)
+        self._ot_nn.setToolTip(
+            "n_neighbors for the precomputed-distance UMAP. Smaller =\n"
+            "tighter local clusters (matches the Mtb reference, default 5).\n"
+            "Larger = more global structure but tends to dissolve real\n"
+            "phenotype groups into one big blob."
+        )
+        self._ot_nn.valueChanged.connect(
+            lambda _v: self._refresh_library_view(force=True),
+        )
+        colour_row.addWidget(self._ot_nn)
+
+        self._pathway_btn = QPushButton("Pathway map\u2026")
+        self._pathway_btn.setToolTip(
+            "Load a CSV with 'gene' and 'pathway' columns to colour points\n"
+            "by pathway membership. Selected when 'Colour by' = Pathway."
+        )
+        self._pathway_btn.clicked.connect(self._pick_pathway_csv)
+        colour_row.addWidget(self._pathway_btn)
+        self._pathway_csv: Path | None = None
+
+        self._ranked_btn = QPushButton("Ranked matches CSV\u2026")
+        self._ranked_btn.setToolTip(
+            "From the cached OT distance matrix, export each condition's\n"
+            "top-K nearest other conditions ordered by Sinkhorn distance.\n"
+            "Run an OT view first to populate the cache."
+        )
+        self._ranked_btn.clicked.connect(self._export_ranked_matches)
+        colour_row.addWidget(self._ranked_btn)
+
+        self._perm_btn = QPushButton("Permutation test CSV\u2026")
+        self._perm_btn.setToolTip(
+            "Run a 1000-permutation test on each query's top-1 nearest\n"
+            "match (CNN embeddings only); export distances + BH-FDR\n"
+            "q-values."
+        )
+        self._perm_btn.clicked.connect(self._export_permutation_test)
+        colour_row.addWidget(self._perm_btn)
 
         colour_row.addStretch(1)
 
@@ -740,18 +801,68 @@ class AnalysisPanel(QWidget):
             if color_by == "feature" else None
         )
         baseline_mode = self._baseline_mode.currentData() or "pooled"
-        worker = _LibraryWorker(
-            self._library_html_path, self._library_dir, species,
-            color_by=color_by, feature_col=feature_col,
-            highlight_genes=self._highlight_genes.selected(),
-            baseline_mode=baseline_mode,
-            batch_correct=self._batch_correct.isChecked(),
-        )
+        view_mode = self._view_mode.currentData() or "features"
+        model_type = self._model_select.currentData() or ""
+        n_neighbors = int(self._ot_nn.value())
+        pathway_csv = self._pathway_csv
+
+        if view_mode == "features_ot":
+            worker = _FeaturesOTWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+                n_neighbors=n_neighbors,
+                pathway_csv=pathway_csv,
+            )
+            status = "Rendering Feature Profiles (OT)\u2026"
+        elif view_mode == "embeddings":
+            worker = _EmbeddingsWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+                model_type=str(model_type),
+            )
+            status = "Rendering CNN Embeddings (mean)\u2026"
+        elif view_mode == "embeddings_ot":
+            worker = _EmbeddingsOTWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                batch_correct=self._batch_correct.isChecked(),
+                model_type=str(model_type),
+                n_neighbors=n_neighbors,
+                pathway_csv=pathway_csv,
+            )
+            status = "Rendering CNN Embeddings (OT)\u2026"
+        else:
+            worker = _LibraryWorker(
+                self._library_html_path, self._library_dir, species,
+                color_by=color_by, feature_col=feature_col,
+                highlight_genes=self._highlight_genes.selected(),
+                baseline_mode=baseline_mode,
+                batch_correct=self._batch_correct.isChecked(),
+            )
+            status = "Rendering library plot\u2026"
+
         self._start_worker(
             worker,
             on_finished=self._on_library_render_finished,
-            status="Rendering library plot\u2026",
+            status=status,
         )
+
+    def _on_view_mode_changed(self) -> None:
+        view_mode = self._view_mode.currentData() or "features"
+        is_embeddings = view_mode in ("embeddings", "embeddings_ot")
+        self._model_label.setVisible(is_embeddings)
+        self._model_select.setVisible(is_embeddings)
+        is_ot = view_mode in ("features_ot", "embeddings_ot")
+        self._ot_nn_label.setVisible(is_ot)
+        self._ot_nn.setVisible(is_ot)
+        self._ranked_btn.setEnabled(is_ot)
+        self._perm_btn.setEnabled(view_mode == "embeddings_ot")
+        self._refresh_library_view(force=True)
 
     def _on_color_by_changed(self, _idx: int) -> None:
         mode = self._color_by.currentData() or "cluster"
@@ -766,6 +877,119 @@ class AnalysisPanel(QWidget):
                 return
         # Re-render with the new colouring.
         self._refresh_library_view(force=True)
+
+    # ------------------------------------------------------------------
+    # OT analysis hooks (PR5 — ranked matches, permutation test, pathway)
+    # ------------------------------------------------------------------
+
+    def _pick_pathway_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select gene→pathway CSV", "",
+            "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        self._pathway_csv = Path(path)
+        self._status.setText(
+            f"Pathway map loaded: {self._pathway_csv.name}"
+        )
+        # Trigger re-render so the pathway colouring picks up the new file.
+        if self._color_by.currentData() == "pathway":
+            self._refresh_library_view(force=True)
+
+    def _ot_sidecar_for_current_view(self) -> Optional[Path]:
+        from mycoprep.core.extract.qc_plots import _ot_sidecar_path
+        candidate = _ot_sidecar_path(self._library_html_path)
+        return candidate if candidate.exists() else None
+
+    def _export_ranked_matches(self) -> None:
+        sidecar = self._ot_sidecar_for_current_view()
+        if sidecar is None:
+            QMessageBox.information(
+                self, "Ranked matches",
+                "No cached OT distance matrix yet. Switch to an OT view "
+                "(Feature profiles (OT) or CNN embeddings (OT)) and let it "
+                "render once, then try again.",
+            )
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Export ranked matches CSV",
+            "ranked_matches.csv", "CSV (*.csv)",
+        )
+        if not out:
+            return
+        try:
+            from mycoprep.core.extract.ot_analysis import rank_condition_matches
+            df = rank_condition_matches(sidecar, top_k=10)
+            df.to_csv(out, index=False)
+            self._status.setText(
+                f"Wrote {len(df)} ranked matches → {Path(out).name}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Ranked matches failed", str(exc),
+            )
+
+    def _export_permutation_test(self) -> None:
+        if self._view_mode.currentData() != "embeddings_ot":
+            QMessageBox.information(
+                self, "Permutation test",
+                "Permutation testing reads per-cell embeddings; it's "
+                "only available in the CNN embeddings (OT) view.",
+            )
+            return
+        sidecar = self._ot_sidecar_for_current_view()
+        if sidecar is None:
+            QMessageBox.information(
+                self, "Permutation test",
+                "No cached OT distance matrix yet. Render the OT view "
+                "first, then try again.",
+            )
+            return
+        # Locate the per-cell embeddings parquet.
+        from mycoprep.core.extract.feature_library import FeatureLibrary
+        try:
+            lib = FeatureLibrary(self._library_dir)
+            model_type = self._model_select.currentData() or ""
+            emb_dir = lib.models_dir / "embeddings"
+            if model_type:
+                emb_path = emb_dir / str(model_type) / "cnn_embeddings.parquet"
+            else:
+                # Pick the most recent.
+                cands = list(emb_dir.glob("**/cnn_embeddings.parquet"))
+                emb_path = (
+                    max(cands, key=lambda p: p.stat().st_mtime)
+                    if cands else None
+                )
+        except Exception:  # noqa: BLE001
+            emb_path = None
+        if emb_path is None or not emb_path.exists():
+            QMessageBox.information(
+                self, "Permutation test",
+                "No CNN embeddings parquet found in the library.",
+            )
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Export permutation test CSV",
+            "permutation_test.csv", "CSV (*.csv)",
+        )
+        if not out:
+            return
+        try:
+            from mycoprep.core.extract.ot_analysis import permutation_test
+            df = permutation_test(
+                emb_path, sidecar,
+                top_k_per_query=1, n_perm=1000, sub_n=200,
+            )
+            df.to_csv(out, index=False)
+            n_sig = int(df["significant"].sum()) if "significant" in df else 0
+            self._status.setText(
+                f"Permutation test: {len(df)} pairs, {n_sig} significant (FDR≤0.05) → {Path(out).name}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Permutation test failed", str(exc),
+            )
 
     def _populate_gene_combo(self) -> None:
         """Refresh the gene multi-select with the current library's genes."""
