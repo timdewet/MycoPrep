@@ -540,10 +540,35 @@ def _subsample_stratified(df, max_n, group_col, rng):
     return __import__("pandas").concat(parts, ignore_index=True)
 
 
-def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
-                       min_cluster_size=15, random_state=42,
-                       batch_labels=None):
-    """PCA → [Harmony] → UMAP → HDBSCAN.  Returns (embedding_2d, cluster_labels)."""
+def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
+                       min_cluster_size=3, random_state=42,
+                       batch_labels=None,
+                       *,
+                       n_consensus_runs: int = 25,
+                       pca_threshold_features: int = 100):
+    """[PCA] → [Harmony] → consensus UMAP+HDBSCAN → (embedding_2d, cluster_labels).
+
+    Mirrors the MorphologicalProfiling_Mtb R pipeline's stability strategy:
+    UMAP+HDBSCAN is rerun with ``n_consensus_runs`` different random seeds,
+    a co-association proportion matrix is built across runs, and a single
+    stable partition is recovered by hierarchical clustering on
+    ``1 − co_assoc`` with ``k`` picked by silhouette in
+    ``[2, min(8, N-1)]``. The 2D embedding for plotting comes from the
+    ``random_state``-seeded run so the picture is reproducible.
+
+    PCA is skipped when ``n_features <= pca_threshold_features`` — UMAP
+    handles ~30–60-D inputs directly and PCA-to-95%-variance silently
+    drops the low-variance shape axes (``width_std``, ``sinuosity`` …)
+    that carry the discriminative phenotype signal.
+
+    Defaults (``n_neighbors=3``, ``min_dist=0``, ``min_cluster_size=3``)
+    match the Mtb R config; they capture local structure rather than
+    dissolving into global geometry.
+
+    Harmony, when batch labels are present, uses ``nclust = min(max(2,
+    n_batches), 5)`` instead of an adaptive ``N // 5``-based heuristic
+    that over-aligned and erased biology on small profile counts.
+    """
     import numpy as np
     from sklearn.cluster import HDBSCAN
     from sklearn.decomposition import PCA
@@ -554,45 +579,136 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
         raise ImportError("umap-learn is required for clustering plots")
 
     n_samples, n_features = X_scaled.shape
-    n_components = min(n_features, n_samples, 50)
-    if n_components >= 2:
-        pca = PCA(n_components=min(n_components, 0.95), random_state=random_state)
-        X_pca = pca.fit_transform(X_scaled)
-    else:
-        X_pca = X_scaled
 
-    # Harmony batch correction: align PCA embeddings across runs.
+    # Skip PCA on low-D inputs (typical: 28–60-D shape S-scores). UMAP
+    # handles them directly and PCA would discard low-variance axes that
+    # carry phenotype signal. Keep PCA only when the input is genuinely
+    # high-D (e.g. 512-D CNN embeddings), in which case it both denoises
+    # and accelerates Harmony.
+    if n_features > pca_threshold_features:
+        n_components = min(n_features, n_samples, 50)
+        if n_components >= 2:
+            pca = PCA(
+                n_components=min(n_components, 0.95),
+                random_state=random_state,
+            )
+            X_proc = pca.fit_transform(X_scaled)
+        else:
+            X_proc = X_scaled
+    else:
+        X_proc = X_scaled
+
     if batch_labels is not None:
         unique_batches = np.unique(batch_labels)
-        if len(unique_batches) >= 2:
+        n_batches = len(unique_batches)
+        if n_batches >= 2:
             try:
                 import harmonypy
                 import pandas as pd
 
                 ho = harmonypy.run_harmony(
-                    X_pca,
+                    X_proc,
                     pd.DataFrame({"run_id": batch_labels}),
                     vars_use="run_id",
                     max_iter_harmony=20,
-                    nclust=min(max(2, n_samples // 5), 20),
+                    # Conservative pinned nclust — anchored on the actual
+                    # batch count, capped at 5. The previous adaptive
+                    # ``min(max(2, N//5), 20)`` over-aligned on small N
+                    # and could erase real biology when run/condition
+                    # confounding was partial.
+                    nclust=min(max(2, n_batches), 5),
                 )
-                X_pca = ho.Z_corr
+                X_proc = ho.Z_corr
             except ImportError:
                 pass
 
-    effective_neighbors = min(n_neighbors, n_samples - 1)
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=max(2, effective_neighbors),
-        min_dist=min_dist,
-        random_state=random_state,
-        n_jobs=1,
-    )
-    embedding = reducer.fit_transform(X_pca)
+    effective_neighbors = max(2, min(n_neighbors, n_samples - 1))
+    effective_min_cluster = max(2, min(min_cluster_size, n_samples // 2))
 
-    effective_min_cluster = min(min_cluster_size, max(2, n_samples // 10))
-    clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
-    labels = clusterer.fit_predict(embedding)
+    def _single_run(seed: int):
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=effective_neighbors,
+            min_dist=min_dist,
+            random_state=seed,
+            n_jobs=1,
+        )
+        emb = reducer.fit_transform(X_proc)
+        clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
+        return emb, clusterer.fit_predict(emb)
+
+    # Single-shot path for tiny datasets where consensus is meaningless.
+    if n_samples < 6 or n_consensus_runs <= 1:
+        return _single_run(random_state)
+
+    # Consensus: gather labels across many seeds, compute pairwise
+    # co-association proportion, hclust, pick k by silhouette.
+    embedding, _ = _single_run(random_state)
+
+    label_runs: list[np.ndarray] = []
+    seeds = [random_state] + list(range(random_state + 1,
+                                        random_state + n_consensus_runs))
+    for seed in seeds:
+        if seed == random_state:
+            _, lbl = _single_run(seed)
+        else:
+            _, lbl = _single_run(seed)
+        # Remap HDBSCAN noise label (-1) to unique negative IDs per
+        # sample so two noise points are NOT counted as co-clustered.
+        lbl = np.asarray(lbl).astype(np.int64).copy()
+        noise = lbl == -1
+        if noise.any():
+            offset = int(lbl.max()) + 1 if (lbl >= 0).any() else 0
+            lbl[noise] = -(offset + 1 + np.arange(int(noise.sum())))
+        label_runs.append(lbl)
+
+    L = np.stack(label_runs, axis=1)  # (n_samples, n_runs)
+    co_assoc = np.zeros((n_samples, n_samples), dtype=np.float64)
+    for r in range(L.shape[1]):
+        col = L[:, r][:, None]
+        co_assoc += (col == col.T).astype(np.float64)
+    co_assoc /= L.shape[1]
+    consensus_dist = 1.0 - co_assoc
+    np.fill_diagonal(consensus_dist, 0.0)
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+        from sklearn.metrics import silhouette_score
+
+        condensed = squareform(consensus_dist, checks=False)
+        Z = linkage(condensed, method="average")
+
+        scores: list[tuple[int, float]] = []
+        k_max = min(8, n_samples - 1)
+        for k in range(2, k_max + 1):
+            cand = fcluster(Z, t=k, criterion="maxclust")
+            if len(np.unique(cand)) < 2:
+                continue
+            try:
+                score = silhouette_score(
+                    consensus_dist, cand, metric="precomputed",
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            scores.append((k, score))
+
+        if scores:
+            best_score = max(s for _, s in scores)
+            # Bias toward parsimony: pick the SMALLEST k whose silhouette
+            # is within ``tol`` of the maximum. Without this, silhouette
+            # routinely splits a single dense biological cluster into
+            # 2–3 noise-driven sub-clusters because the within-cluster
+            # consensus distance is tiny.
+            tol = 0.03
+            eligible = [k for k, s in scores if s >= best_score - tol]
+            best_k = min(eligible) if eligible else scores[0][0]
+            labels = fcluster(Z, t=best_k, criterion="maxclust") - 1
+        else:
+            labels = label_runs[0]
+    except Exception:  # noqa: BLE001
+        # Fallback: just use the labels from the seeded run.
+        labels = label_runs[0]
 
     return embedding, labels
 
@@ -624,8 +740,9 @@ def _embed_profiles(profiles, *, batch_correct: bool = True):
     if n >= 6:
         emb, lbl = _run_umap_hdbscan(
             X,
-            n_neighbors=min(5, n - 1),
-            min_cluster_size=max(2, n // 5),
+            n_neighbors=min(3, n - 1),
+            min_dist=0.0,
+            min_cluster_size=3,
             batch_labels=batch_labels if has_batches else None,
         )
     else:
