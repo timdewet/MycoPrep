@@ -27,7 +27,7 @@ from ..ui import icons, tokens
 from ..ui.stepper import StepState, Stepper
 from ..widgets.log_view import LogView
 
-STAGE_NAMES = ["Split", "Focus", "Segment", "Classify", "Features"]
+STAGE_NAMES = ["Split", "Focus", "Segment", "Classify", "Features", "Embeddings"]
 
 
 class RunPanel(QWidget):
@@ -54,12 +54,11 @@ class RunPanel(QWidget):
         # Split is suppressed when Focus is also enabled (Focus subsumes it).
         self._planned_stages: list[str] | None = None
         self.checks: dict[str, QCheckBox] = {}
+        # Features and Embeddings are opt-in heavy stages; default OFF.
+        _default_off = {"Features", "Embeddings"}
         for name in STAGE_NAMES:
             cb = QCheckBox(name)
-            # Phase A: Features is an opt-in extra step; default it OFF so
-            # existing four-stage runs aren't slowed down by feature
-            # extraction users haven't asked for.
-            cb.setChecked(name != "Features")
+            cb.setChecked(name not in _default_off)
             cb.toggled.connect(self._refresh_run_enable)
             cb.toggled.connect(lambda _checked: self.stageEnablesChanged.emit())
             self.checks[name] = cb
@@ -123,14 +122,14 @@ class RunPanel(QWidget):
         root.setSpacing(0)
 
         # ── Stage toggles card ─────────────────────────────────────────
-        stages_box = QGroupBox("Stages to run")
-        h = QHBoxLayout(stages_box)
+        self._stages_box = QGroupBox("Stages to run")
+        h = QHBoxLayout(self._stages_box)
         h.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
         h.setSpacing(tokens.S5)
         for name in STAGE_NAMES:
             h.addWidget(self.checks[name])
         h.addStretch(1)
-        root.addWidget(stages_box)
+        root.addWidget(self._stages_box)
 
         # ── Progress card: overall bar + per-stage stepper ─────────────
         progress_box = QGroupBox("Progress")
@@ -367,6 +366,44 @@ class RunPanel(QWidget):
                 cb.setChecked(bool(enables[name]))
         if "reuse_existing" in s:
             self.reuse_existing.setChecked(bool(s["reuse_existing"]))
+
+    # ---------------------------------------------------------------- modes
+
+    def set_train_only_mode(self, train_only: bool) -> None:
+        """Constrain the stage toggles to Embeddings only.
+
+        Used when the Input panel is in TRAIN_EMBEDDINGS mode — the other
+        pipeline stages don't apply (no CZIs to process), so we hide their
+        checkboxes and force Embeddings on. Snapshots the prior state so
+        leaving train mode restores the user's previous selections.
+        """
+        already_train = bool(getattr(self, "_train_only_active", False))
+        if train_only and not already_train:
+            self._pre_train_enables = {n: cb.isChecked() for n, cb in self.checks.items()}
+        self._train_only_active = train_only
+        self._stages_box.setTitle("Stage to run" if train_only else "Stages to run")
+
+        if train_only:
+            for name, cb in self.checks.items():
+                if name == "Embeddings":
+                    cb.setChecked(True)
+                    cb.setEnabled(False)
+                    cb.setVisible(True)
+                else:
+                    cb.setChecked(False)
+                    cb.setVisible(False)
+        else:
+            prior = getattr(self, "_pre_train_enables", None)
+            for name, cb in self.checks.items():
+                cb.setVisible(True)
+                cb.setEnabled(True)
+                if prior is not None and name in prior:
+                    cb.setChecked(prior[name])
+        # Stepper steps mirror the checkbox visibility — when only Embeddings
+        # is selectable, only its progress strip is meaningful.
+        for name in self.checks.keys():
+            self.stepper.set_visible(name, name == "Embeddings" if train_only else True)
+        self._refresh_run_enable()
 
     # ---------------------------------------------------------------- getters
 

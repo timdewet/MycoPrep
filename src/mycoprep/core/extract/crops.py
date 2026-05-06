@@ -22,7 +22,7 @@ from skimage.transform import resize
 
 @dataclass
 class CropOpts:
-    crop_size: int = 96
+    crop_size: int = 128
     pad: int = 10
     crop_channels: Optional[list[int]] = None  # None = all non-mask channels
     include_mask_channel: bool = True

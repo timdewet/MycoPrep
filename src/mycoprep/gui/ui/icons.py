@@ -31,6 +31,7 @@ ICONS: dict[str, str] = {
     "focus":         "mdi.target",
     "segment":       "mdi.shape",
     "features":      "mdi.table-large",
+    "embeddings":    "mdi.vector-link",
     "run":           "mdi.play-circle",
     "analysis":      "mdi.chart-scatter-plot",
     "play":          "mdi.play",

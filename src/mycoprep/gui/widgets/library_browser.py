@@ -1,7 +1,7 @@
-"""Feature library browser — table view of registered runs with filter,
-remove, and import actions.
+"""Morphology library browser — table view of registered runs with filter,
+remove, import, and model training actions.
 
-The library is a persistent store under ``~/.mycoprep/feature_library/`` (or
+The library is a persistent store under ``~/.mycoprep/morphology_library/`` (or
 a user-chosen directory). Each registered run contributes a parquet copy
 of its ``all_features.parquet`` plus a row in ``library.parquet`` with run
 metadata (species, experiment type, cell counts, conditions, date).
@@ -44,7 +44,7 @@ from ..ui import tokens
 
 
 class LibraryBrowser(QWidget):
-    """Browse, filter, and manage the persistent feature library."""
+    """Browse, filter, and manage the persistent morphology library."""
 
     libraryChanged = pyqtSignal()
 
