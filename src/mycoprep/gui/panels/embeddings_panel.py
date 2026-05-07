@@ -85,10 +85,16 @@ class EmbeddingsPanel(QWidget):
         ))
 
         self.model_source = QComboBox()
-        self.model_source.addItems(["Auto (train/fine-tune)", "Use existing model"])
+        self.model_source.addItems([
+            "Auto (train/fine-tune)",
+            "Train from scratch",
+            "Use existing model",
+        ])
         self._source_helper = _with_helper(
             self.model_source,
-            "Auto: trains from scratch on the first run, fine-tunes on later runs. "
+            "Auto: trains from scratch on the first run, fine-tunes on later runs.\n"
+            "Train from scratch: ignores any existing library model and starts fresh "
+            "(needed when changing the channel set, since you can't re-shape conv1).\n"
             "Use existing: point to a trained .pth file.",
         )
         self._source_label = QLabel("Source:")
@@ -197,14 +203,16 @@ class EmbeddingsPanel(QWidget):
             self.optionsChanged.emit()
 
     def _refresh_model_path_enable(self, _idx: int = 0) -> None:
-        use_existing = (
-            self.model_source.currentIndex() == 1 and not self._train_only
+        # The dropdown order is now Auto / Train from scratch / Use existing.
+        is_use_existing = (
+            "existing" in self.model_source.currentText().lower()
+            and not self._train_only
         )
-        self.model_path.setEnabled(use_existing)
-        self._browse_btn.setEnabled(use_existing)
-        self.epochs.setEnabled(not use_existing)
-        self.batch_size.setEnabled(not use_existing)
-        self.include_library_crops.setEnabled(not use_existing)
+        self.model_path.setEnabled(is_use_existing)
+        self._browse_btn.setEnabled(is_use_existing)
+        self.epochs.setEnabled(not is_use_existing)
+        self.batch_size.setEnabled(not is_use_existing)
+        self.include_library_crops.setEnabled(not is_use_existing)
 
     def set_train_only_mode(self, train_only: bool) -> None:
         """Hide source/model-path rows when the run is a library-only training job.

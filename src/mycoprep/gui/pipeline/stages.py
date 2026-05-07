@@ -729,6 +729,13 @@ class EmbeddingsStage:
         use_existing = (
             not train_only and "existing" in opts.model_source.lower()
         )
+        # "Train from scratch" forces the auto path to skip the
+        # fine-tune branch even when a library model of the same
+        # model_type exists. Needed when changing the channel set
+        # (conv1 weights can't be reshaped).
+        force_from_scratch = (
+            not train_only and "scratch" in opts.model_source.lower()
+        )
 
         # Pick the right trainer based on model_type. SupCon needs class
         # labels (gene from condition_label); the autoencoder is label-free.
@@ -749,7 +756,10 @@ class EmbeddingsStage:
         else:
             # Auto: fine-tune library model or train from scratch
             lib = FeatureLibrary(opts.library_dir)
-            latest = lib.latest_model(model_type=config.model_type)
+            latest = (
+                None if force_from_scratch
+                else lib.latest_model(model_type=config.model_type)
+            )
             run_id = ctx.output_dir.name
 
             if latest and not train_only:
