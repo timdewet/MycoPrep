@@ -96,6 +96,26 @@ class SupConLoss(nn.Module):
         return -mean_log_prob_pos[valid].mean()
 
 
+def _peek_checkpoint_in_channels(state: dict) -> Optional[int]:
+    """Return the input-channel count of a saved SupCon/AE checkpoint.
+
+    Looks at the conv1 weight (shape ``(out_c, in_c, k, k)``) at any of
+    the keys we use across architectures: ResNet-18 wraps the encoder
+    in ``encoder.0`` (Sequential), the lightweight encoder uses
+    ``encoder.0.0``. Returns None if no recognised key is present.
+    """
+    candidates = (
+        "encoder.0.weight",       # ResNet-18 encoder Sequential[0] = conv1
+        "encoder.0.0.weight",     # Lightweight encoder Sequential[0] = first block conv
+    )
+    for key in candidates:
+        if key in state:
+            shape = tuple(state[key].shape)
+            if len(shape) == 4:
+                return int(shape[1])
+    return None
+
+
 def _build_warmup_cosine(
     optimizer: torch.optim.Optimizer,
     warmup_epochs: int,
@@ -341,14 +361,41 @@ def train_supcon(
     # Build model via the config dispatch — supports both
     # ``supcon_resnet18`` (ImageNet-pretrained ResNet-18 backbone) and
     # ``supcon_lightweight`` (from-scratch 5-block CNN).
-    model = config.build_model()
+    #
+    # When fine-tuning, the checkpoint's conv1 input-channel count is
+    # the source of truth — peek at it and override the config so a
+    # change in include_mask / image_channels between runs doesn't break
+    # the load with a "size mismatch for encoder.0.weight" error.
     if fine_tune and config.model_path and config.model_path.exists():
-        # Existing model is the encoder-only state dict; load into encoder.
-        state = torch.load(str(config.model_path), map_location="cpu", weights_only=True)
-        # If the saved file is a full SupCon model (encoder + head), it'll
-        # match all keys; if it's an autoencoder encoder, partial load is OK.
+        state = torch.load(
+            str(config.model_path), map_location="cpu", weights_only=True,
+        )
+        ckpt_in = _peek_checkpoint_in_channels(state)
+        cfg_in = config.total_in_channels()
+        if ckpt_in is not None and ckpt_in != cfg_in:
+            progress_cb(
+                0.025,
+                f"Fine-tune checkpoint expects {ckpt_in}-channel input "
+                f"({cfg_in} requested) — overriding config to match. "
+                f"Train from scratch (untick 'Use existing model') if you "
+                f"want to change the channel count.",
+            )
+            # Override at the field level the build_model() reads.
+            if config.image_channels is not None:
+                # When user has picked specific channels, drop the mask
+                # to fit (or vice-versa). Cleanest is to fall back to the
+                # legacy in_channels path.
+                config.image_channels = None
+            config.in_channels = max(1, ckpt_in - (1 if config.include_mask else 0))
+            if config.total_in_channels() != ckpt_in:
+                # If include_mask was off, just set in_channels to ckpt_in.
+                config.in_channels = ckpt_in
+                config.include_mask = False
+        model = config.build_model()
         model.load_state_dict(state, strict=False)
         progress_cb(0.03, f"Loaded model from {config.model_path.name}")
+    else:
+        model = config.build_model()
 
     model = model.to(device)
     if not fine_tune and config.freeze_epochs > 0:
