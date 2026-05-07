@@ -832,8 +832,13 @@ class EmbeddingsStage:
             run_ids_per_file=run_ids_per_file,
         )
 
-        # Re-extract all library crops after training to keep feature space consistent
-        if not use_existing and len(h5_paths) > 1:
+        # Re-extract library embeddings after training so the library's
+        # canonical embedding parquet reflects the freshly-trained model.
+        # Previously gated on ``len(h5_paths) > 1`` as an optimisation,
+        # but that left a stale library parquet behind whenever the user
+        # cleared the library down to a single run — the Analysis panel
+        # then read the old combined embeddings instead of the new one.
+        if not use_existing:
             progress_cb(0.95, "Re-extracting library embeddings for consistency...")
             # Per-model-type subdirectory so re-training with a different
             # architecture (e.g. autoencoder → SupCon) doesn't clobber the
