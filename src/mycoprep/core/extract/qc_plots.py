@@ -2105,15 +2105,19 @@ def _save_ot_sidecar(
     html_path: "Path",
     D: "np.ndarray",
     group_meta: list[dict],
+    params: "dict | None" = None,
 ) -> None:
     """Persist the OT distance matrix as a parquet so downstream analyses
     (ranked matches, permutation tests, recolouring) don't recompute it.
 
     Schema: one row per group, columns = group_meta keys + ``d_<idx>``
     columns holding the distance to every other group. Indexed by row
-    position. Best-effort — silently swallows write failures so the HTML
-    renderer's success isn't tied to disk availability for the cache.
+    position. ``params`` is a dict of the parameters that produced the
+    matrix (n_cells, sinkhorn_reg, pca_dims, batch_correct …) — saved
+    as a sibling JSON so cache lookups can validate a hit. Best-effort
+    — silently swallows write failures.
     """
+    import json
     import pandas as pd
 
     try:
@@ -2121,9 +2125,237 @@ def _save_ot_sidecar(
         n = D.shape[0]
         for j in range(n):
             meta_df[f"d_{j}"] = D[:, j]
-        meta_df.to_parquet(_ot_sidecar_path(html_path), index=False)
+        sidecar = _ot_sidecar_path(html_path)
+        meta_df.to_parquet(sidecar, index=False)
+        if params is not None:
+            sidecar.with_suffix(sidecar.suffix + ".params.json").write_text(
+                json.dumps(params, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
     except Exception:  # noqa: BLE001
         pass
+
+
+def _embedding_ot_cache_path(emb_path: "Path") -> "Path":
+    """Stable cache location next to the embeddings parquet for the
+    precomputed OT distance matrix written by ``EmbeddingsStage``.
+    """
+    return Path(emb_path).with_name(
+        Path(emb_path).stem + ".ot_default.ot_distance.parquet",
+    )
+
+
+def _try_load_ot_cache(
+    cache_sidecar: "Path",
+    requested_params: dict,
+) -> "tuple[np.ndarray, list[dict]] | None":
+    """Return ``(D, group_meta)`` if the cache exists and its stored
+    params match the requested ones. ``None`` on miss / stale cache.
+    """
+    import json
+
+    import numpy as np
+    import pandas as pd
+
+    if not cache_sidecar.exists():
+        return None
+    params_path = cache_sidecar.with_suffix(
+        cache_sidecar.suffix + ".params.json",
+    )
+    if params_path.exists():
+        try:
+            stored = json.loads(params_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        for k, v in requested_params.items():
+            if str(stored.get(k)) != str(v):
+                return None
+    try:
+        df = pd.read_parquet(cache_sidecar)
+    except Exception:  # noqa: BLE001
+        return None
+    d_cols = sorted(
+        [c for c in df.columns if c.startswith("d_")],
+        key=lambda c: int(c.split("_", 1)[1]),
+    )
+    if not d_cols:
+        return None
+    D = df[d_cols].to_numpy(dtype=np.float64)
+    meta = df.drop(columns=d_cols).to_dict("records")
+    return D, meta
+
+
+def precompute_embedding_ot_cache(
+    emb_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    model_type: str = "",
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    pca_dims_before_ot: int = 50,
+    batch_correct: bool = True,
+    progress_cb=None,
+) -> "Path | None":
+    """Precompute the OT distance matrix for an embeddings parquet.
+
+    Called by ``EmbeddingsStage`` at the end of training so the Analysis
+    panel's first OT view render is instant — the expensive Sinkhorn
+    loop has already happened. Writes the cache to the stable location
+    returned by :func:`_embedding_ot_cache_path`. Renders into a
+    temporary HTML file (which gets discarded) only because the
+    distance computation is currently embedded inside
+    :func:`render_embeddings_ot_html`; the sidecar is the artifact
+    that matters.
+    """
+    import tempfile
+
+    out_path = Path(emb_path).with_name(
+        Path(emb_path).stem + ".ot_default.html",
+    )
+    try:
+        render_embeddings_ot_html(
+            out_path,
+            library_dir=library_dir,
+            species=species,
+            model_type=model_type,
+            n_cells_per_condition=n_cells_per_condition,
+            sinkhorn_reg=sinkhorn_reg,
+            pca_dims_before_ot=pca_dims_before_ot,
+            batch_correct=batch_correct,
+            progress_cb=progress_cb,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    cache = _embedding_ot_cache_path(emb_path)
+    return cache if cache.exists() else None
+
+
+def _ot_render_from_distance(
+    out_path: "Path",
+    *,
+    D: "np.ndarray",
+    group_meta: list[dict],
+    color_by: str,
+    highlight_genes: "list[str] | None",
+    n_neighbors: int,
+    sinkhorn_reg: float,
+    pathway_csv: "Path | None",
+    has_multi_runs: bool,
+    batch_correct: bool,
+    n_cells_per_condition: int,
+    label: str,
+    extra_title: str = "",
+    progress_cb=None,
+) -> "Path | None":
+    """UMAP + Plotly render given a precomputed ``D`` and ``group_meta``.
+
+    Shared by :func:`render_embeddings_ot_html` and
+    :func:`render_features_ot_html` so both benefit from caching, and
+    so a cache hit doesn't need to recompute the expensive Sinkhorn
+    matrix.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if progress_cb is None:
+        progress_cb = lambda f: None
+
+    n_groups = D.shape[0]
+    if n_groups < 3:
+        return None
+
+    try:
+        import umap
+        eff_neighbors = max(2, min(int(n_neighbors), n_groups - 1))
+        coords = umap.UMAP(
+            n_components=2,
+            n_neighbors=eff_neighbors,
+            min_dist=0.1,
+            metric="precomputed",
+            random_state=42,
+            n_jobs=1,
+        ).fit_transform(D)
+    except Exception:  # noqa: BLE001
+        from sklearn.manifold import MDS
+        coords = MDS(
+            n_components=2, dissimilarity="precomputed", random_state=42,
+        ).fit_transform(D)
+
+    progress_cb(0.95)
+
+    plot_df = pd.DataFrame(group_meta)
+    plot_df["x"] = coords[:, 0]
+    plot_df["y"] = coords[:, 1]
+
+    pathway_map = _load_pathway_map(pathway_csv)
+    if pathway_map:
+        plot_df["pathway"] = (
+            plot_df["gene"].astype(str).str.lower().map(pathway_map)
+            .fillna("Unannotated")
+        )
+    elif color_by == "pathway":
+        plot_df["pathway"] = "Unannotated"
+
+    try:
+        import plotly.express as px
+
+        color_col = "gene"
+        if color_by == "run_id":
+            color_col = "run_id"
+        elif color_by == "pathway" and "pathway" in plot_df.columns:
+            color_col = "pathway"
+        hover = [
+            c for c in [
+                "condition_label", "gene", "run_id", "pathway", "n_cells_used",
+            ]
+            if c in plot_df.columns and c != color_col
+        ]
+        fig = px.scatter(
+            plot_df, x="x", y="y", color=color_col, hover_data=hover,
+        )
+
+        if highlight_genes:
+            hl_set = {g.lower() for g in highlight_genes}
+            mask = plot_df["gene"].str.lower().isin(hl_set)
+            fig.update_traces(marker=dict(size=8, opacity=0.3))
+            hl = plot_df[mask]
+            if not hl.empty:
+                fig.add_scatter(
+                    x=hl["x"], y=hl["y"], mode="markers",
+                    marker=dict(size=12, color="red", opacity=1.0),
+                    text=hl["condition_label"], hoverinfo="text",
+                    name="Highlighted",
+                )
+
+        harmony_status = (
+            (" · Harmony" if batch_correct else " · raw")
+            if has_multi_runs else ""
+        )
+        title = (
+            f"{label} — Optimal Transport "
+            f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
+            f"{harmony_status}"
+            f" · {n_groups} groups × {n_cells_per_condition} cells"
+            f" · n_neighbors={max(2, min(int(n_neighbors), n_groups - 1))}"
+        )
+        if extra_title:
+            title += extra_title
+        fig.update_layout(
+            title=title,
+            xaxis_title="UMAP 1 (from OT distance)",
+            yaxis_title="UMAP 2 (from OT distance)",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=60, b=40),
+        )
+        fig.write_html(
+            str(out_path), include_plotlyjs=True, default_height="100vh",
+        )
+        _make_plot_html_fullheight(out_path)
+        progress_cb(1.0)
+        return out_path
+    except ImportError:
+        return None
 
 
 def _load_pathway_map(pathway_csv: "Path | None") -> dict[str, str]:
@@ -2323,6 +2555,42 @@ def render_embeddings_ot_html(
         "run_id" in df.columns and df["run_id"].nunique() > 1
     )
 
+    # Cache key: parameters that affect the OT distance matrix. Anything
+    # downstream of D (n_neighbors, color_by, pathway_csv, highlight)
+    # can vary freely without invalidating. Embedding-parquet mtime
+    # invalidates the cache after a re-extraction.
+    cache_params = {
+        "n_cells_per_condition": int(n_cells_per_condition),
+        "sinkhorn_reg": float(sinkhorn_reg),
+        "pca_dims_before_ot": int(pca_dims_before_ot or 0),
+        "batch_correct": bool(batch_correct),
+        "emb_mtime_ns": emb_path.stat().st_mtime_ns,
+    }
+    cache_sidecar = _embedding_ot_cache_path(emb_path)
+    cached = _try_load_ot_cache(cache_sidecar, cache_params)
+    if cached is not None:
+        D, group_meta = cached
+        # Mirror the cached matrix to the per-render sidecar so the
+        # Analysis panel's "Ranked matches" / "Permutation test"
+        # buttons resolve it the same as a freshly-rendered view.
+        _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        return _ot_render_from_distance(
+            out_path,
+            D=D, group_meta=group_meta,
+            color_by=color_by, highlight_genes=highlight_genes,
+            n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+            pathway_csv=pathway_csv,
+            has_multi_runs=has_multi_runs,
+            batch_correct=batch_correct,
+            n_cells_per_condition=n_cells_per_condition,
+            label="CNN Embeddings",
+            extra_title=(
+                f" · model: {emb_path.parent.name}"
+                if emb_path.parent.name != "embeddings" else ""
+            ),
+            progress_cb=progress_cb,
+        )
+
     # Detect controls (same as the mean-based renderer).
     control_genes: set[str] = set()
     try:
@@ -2486,109 +2754,43 @@ def render_embeddings_ot_html(
     D = np.sqrt(np.maximum(D, 0.0))
 
     # Cache the distance matrix + group metadata as a sidecar parquet
-    # next to the HTML. Downstream analyses (ranked matches, permutation
-    # test, alternative colourings) read from cache instead of recomputing
-    # the expensive Sinkhorn loop.
-    _save_ot_sidecar(out_path, D, group_meta)
-
-    # UMAP from precomputed distance.
+    # next to the HTML, AND at the stable per-embeddings location so a
+    # subsequent render with the same params hits the cache. Downstream
+    # analyses (ranked matches, permutation test, alternative colourings)
+    # also read from these sidecars.
+    _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
     try:
-        import umap
-        eff_neighbors = max(2, min(int(n_neighbors), len(point_clouds) - 1))
-        reducer = umap.UMAP(
-            n_components=2,
-            n_neighbors=eff_neighbors,
-            min_dist=0.1,
-            metric="precomputed",
-            random_state=42,
-            n_jobs=1,
+        import shutil
+        shutil.copyfile(_ot_sidecar_path(out_path), cache_sidecar)
+        params_src = _ot_sidecar_path(out_path).with_suffix(
+            _ot_sidecar_path(out_path).suffix + ".params.json",
         )
-        coords = reducer.fit_transform(D)
-    except Exception:  # noqa: BLE001
-        # Fallback: classical MDS.
-        from sklearn.manifold import MDS
-        coords = MDS(
-            n_components=2, dissimilarity="precomputed", random_state=42,
-        ).fit_transform(D)
-
-    progress_cb(0.95)
-
-    # Build Plotly DataFrame.
-    plot_df = pd.DataFrame(group_meta)
-    plot_df["x"] = coords[:, 0]
-    plot_df["y"] = coords[:, 1]
-
-    # Pathway annotation (optional). When ``color_by == "pathway"`` and a
-    # mapping is available, points are coloured by gene → pathway lookup;
-    # genes without a mapping go to "Unannotated".
-    pathway_map = _load_pathway_map(pathway_csv)
-    if pathway_map:
-        plot_df["pathway"] = (
-            plot_df["gene"].astype(str).str.lower().map(pathway_map)
-            .fillna("Unannotated")
-        )
-    elif color_by == "pathway":
-        plot_df["pathway"] = "Unannotated"
-
-    try:
-        import plotly.express as px
-
-        color_col = "gene"
-        if color_by == "run_id":
-            color_col = "run_id"
-        elif color_by == "pathway" and "pathway" in plot_df.columns:
-            color_col = "pathway"
-        hover = [c for c in ["condition_label", "gene", "run_id", "pathway",
-                              "n_cells_used"]
-                 if c in plot_df.columns and c != color_col]
-        fig = px.scatter(
-            plot_df, x="x", y="y", color=color_col, hover_data=hover,
-        )
-
-        if highlight_genes:
-            hl_set = {g.lower() for g in highlight_genes}
-            mask = plot_df["gene"].str.lower().isin(hl_set)
-            fig.update_traces(marker=dict(size=8, opacity=0.3))
-            hl = plot_df[mask]
-            if not hl.empty:
-                fig.add_scatter(
-                    x=hl["x"], y=hl["y"], mode="markers",
-                    marker=dict(size=12, color="red", opacity=1.0),
-                    text=hl["condition_label"], hoverinfo="text",
-                    name="Highlighted",
-                )
-
-        harmony_status = ""
-        if has_multi_runs:
-            harmony_status = (
-                " · Harmony" if batch_correct else " · raw"
+        if params_src.exists():
+            shutil.copyfile(
+                params_src,
+                cache_sidecar.with_suffix(
+                    cache_sidecar.suffix + ".params.json",
+                ),
             )
-        title = (
-            f"CNN Embeddings — Optimal Transport "
-            f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
-            f"{harmony_status}"
-            f" · {len(point_clouds)} groups × {n_cells_per_condition} cells"
-            f" · n_neighbors={max(2, min(int(n_neighbors), len(point_clouds) - 1))}"
-        )
-        if emb_path.parent.name != "embeddings":
-            title += f" · model: {emb_path.parent.name}"
-        fig.update_layout(
-            title=title,
-            xaxis_title="UMAP 1 (from OT distance)",
-            yaxis_title="UMAP 2 (from OT distance)",
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-        fig.write_html(
-            str(out_path),
-            include_plotlyjs=True,
-            default_height="100vh",
-        )
-        _make_plot_html_fullheight(out_path)
-        progress_cb(1.0)
-        return out_path
-    except ImportError:
-        return None
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _ot_render_from_distance(
+        out_path,
+        D=D, group_meta=group_meta,
+        color_by=color_by, highlight_genes=highlight_genes,
+        n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+        pathway_csv=pathway_csv,
+        has_multi_runs=has_multi_runs,
+        batch_correct=batch_correct,
+        n_cells_per_condition=n_cells_per_condition,
+        label="CNN Embeddings",
+        extra_title=(
+            f" · model: {emb_path.parent.name}"
+            if emb_path.parent.name != "embeddings" else ""
+        ),
+        progress_cb=progress_cb,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

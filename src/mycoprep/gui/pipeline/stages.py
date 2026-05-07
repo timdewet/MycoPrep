@@ -803,6 +803,33 @@ class EmbeddingsStage:
                     config=config.__dict__,
                 )
 
+        def _precompute_ot(emb_p: Path, label: str, lo: float, hi: float) -> None:
+            """Precompute the OT distance matrix for ``emb_p`` so the
+            Analysis panel's first OT view render is instant."""
+            try:
+                from mycoprep.core.extract.qc_plots import (
+                    precompute_embedding_ot_cache,
+                )
+                progress_cb(
+                    lo,
+                    f"Precomputing OT distance matrix for {label} "
+                    f"(this saves time on the first OT view)...",
+                )
+                precompute_embedding_ot_cache(
+                    emb_p,
+                    library_dir=opts.library_dir,
+                    species=opts.species,
+                    model_type=config.model_type,
+                    progress_cb=lambda f, *_a: progress_cb(
+                        lo + (hi - lo) * max(0.0, min(1.0, f)),
+                        f"OT precompute {int(f * 100)}%...",
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                # Non-fatal: the Analysis panel will compute on demand
+                # if the cache is missing.
+                pass
+
         # Train-only runs go straight to library re-extraction; there's no
         # current-run h5 to extract for.
         if train_only:
@@ -819,16 +846,17 @@ class EmbeddingsStage:
             lib_emb_dir.mkdir(parents=True, exist_ok=True)
             emb_path = extract_embeddings(
                 h5_paths, model_path, lib_emb_dir, config,
-                progress_cb=lambda f, m: progress_cb(0.50 + f * 0.45, m),
+                progress_cb=lambda f, m: progress_cb(0.50 + f * 0.40, m),
                 run_ids_per_file=run_ids_per_file,
             )
+            _precompute_ot(emb_path, "library embeddings", 0.92, 0.99)
             progress_cb(1.0, "Library embedding training complete.")
             return [emb_path]
 
         progress_cb(0.50, "Extracting embeddings...")
         emb_path = extract_embeddings(
             h5_paths, model_path, emb_dir, config,
-            progress_cb=lambda f, m: progress_cb(0.50 + f * 0.45, m),
+            progress_cb=lambda f, m: progress_cb(0.50 + f * 0.35, m),
             run_ids_per_file=run_ids_per_file,
         )
 
@@ -838,8 +866,9 @@ class EmbeddingsStage:
         # but that left a stale library parquet behind whenever the user
         # cleared the library down to a single run — the Analysis panel
         # then read the old combined embeddings instead of the new one.
+        lib_emb_path: Optional[Path] = None
         if not use_existing:
-            progress_cb(0.95, "Re-extracting library embeddings for consistency...")
+            progress_cb(0.85, "Re-extracting library embeddings for consistency...")
             # Per-model-type subdirectory so re-training with a different
             # architecture (e.g. autoencoder → SupCon) doesn't clobber the
             # earlier embeddings. Keeps both available for side-by-side
@@ -850,12 +879,18 @@ class EmbeddingsStage:
                 / config.model_type
             )
             lib_emb_dir.mkdir(parents=True, exist_ok=True)
-            extract_embeddings(
+            lib_emb_path = extract_embeddings(
                 h5_paths, model_path, lib_emb_dir, config,
-                progress_cb=lambda f, m: progress_cb(0.95 + f * 0.04, m),
+                progress_cb=lambda f, m: progress_cb(0.85 + f * 0.05, m),
                 run_ids_per_file=run_ids_per_file,
             )
 
+        # Precompute OT for whichever parquet the Analysis panel will
+        # actually read (the library copy when present — that's what
+        # ``render_embeddings_ot_html`` resolves via FeatureLibrary).
+        _precompute_ot(
+            lib_emb_path or emb_path, "library embeddings", 0.90, 0.99,
+        )
         progress_cb(1.0, "CNN embeddings complete.")
         return [emb_path]
 
