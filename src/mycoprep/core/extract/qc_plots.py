@@ -2438,8 +2438,13 @@ def render_embeddings_ot_html(
         idx = rng.choice(len(gdf), size=n, replace=False)
         pc = gdf[emb_cols].values[idx].astype(np.float32)
         point_clouds.append(pc)
-        if isinstance(key, tuple):
+        # pandas 3.x returns groupby keys as tuples even for single-col
+        # groupbys (("cond",)), so check the actual tuple length rather
+        # than relying on has_multi_runs to align with the tuple shape.
+        if isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
+        elif isinstance(key, tuple) and len(key) == 1:
+            run_id, cond = "unknown", key[0]
         else:
             run_id, cond = "unknown", key
         group_meta.append({
@@ -2745,8 +2750,13 @@ def render_features_ot_html(
             continue
         idx = rng.choice(len(gdf), size=n, replace=False)
         point_clouds.append(gdf[morph_cols].values[idx].astype(np.float32))
-        if isinstance(key, tuple):
+        # pandas 3.x returns groupby keys as tuples even for single-col
+        # groupbys (("cond",)), so check the actual tuple length rather
+        # than relying on has_multi_runs to align with the tuple shape.
+        if isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
+        elif isinstance(key, tuple) and len(key) == 1:
+            run_id, cond = "unknown", key[0]
         else:
             run_id, cond = "unknown", key
         group_meta.append({
