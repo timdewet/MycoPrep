@@ -200,6 +200,11 @@ def train_autoencoder(
     epochs = config.fine_tune_epochs if fine_tune else config.epochs
     lr = config.fine_tune_lr if fine_tune else config.lr
 
+    # Align config to fine-tune checkpoint BEFORE building the dataset,
+    # so the dataset's channel selection matches the model's conv1.
+    from .supcon import _maybe_align_config_to_checkpoint
+    _maybe_align_config_to_checkpoint(config, fine_tune, progress_cb)
+
     progress_cb(0.0, "Splitting data by FOV...")
     train_idx, val_idx = split_by_fov(h5_paths, config.val_fraction)
 
@@ -267,35 +272,14 @@ def train_autoencoder(
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
-    # Build or load model. When fine-tuning, use the checkpoint's input
-    # channel count (overriding config) so a change in include_mask /
-    # image_channels between runs doesn't break the load.
+    # Config already aligned to checkpoint's conv1 input shape above.
+    model = config.build_model()
     if fine_tune and config.model_path and config.model_path.exists():
-        from .supcon import _peek_checkpoint_in_channels
         state = torch.load(
             str(config.model_path), map_location="cpu", weights_only=True,
         )
-        ckpt_in = _peek_checkpoint_in_channels(state)
-        cfg_in = config.total_in_channels()
-        if ckpt_in is not None and ckpt_in != cfg_in:
-            progress_cb(
-                0.025,
-                f"Fine-tune checkpoint expects {ckpt_in}-channel input "
-                f"({cfg_in} requested) — overriding config to match.",
-            )
-            if config.image_channels is not None:
-                config.image_channels = None
-            config.in_channels = max(
-                1, ckpt_in - (1 if config.include_mask else 0),
-            )
-            if config.total_in_channels() != ckpt_in:
-                config.in_channels = ckpt_in
-                config.include_mask = False
-        model = config.build_model()
         model.load_state_dict(state, strict=False)
         progress_cb(0.03, f"Loaded model from {config.model_path.name}")
-    else:
-        model = config.build_model()
 
     model = model.to(device)
 

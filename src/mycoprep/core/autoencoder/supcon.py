@@ -96,6 +96,48 @@ class SupConLoss(nn.Module):
         return -mean_log_prob_pos[valid].mean()
 
 
+def _maybe_align_config_to_checkpoint(
+    config, fine_tune: bool, progress_cb,
+) -> None:
+    """When fine-tuning, override config in_channels / include_mask to
+    match the saved checkpoint's conv1 input shape.
+
+    The saved checkpoint's input dimensionality is unchangeable — you
+    can't load 1-channel weights into a 2-channel conv. So if the user
+    has changed include_mask / image_channels between runs, we silently
+    align the config to the checkpoint and log it. The dataset (built
+    after this call) will then read the right number of channels.
+    """
+    if not (fine_tune and config.model_path and config.model_path.exists()):
+        return
+    try:
+        state = torch.load(
+            str(config.model_path), map_location="cpu", weights_only=True,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    ckpt_in = _peek_checkpoint_in_channels(state)
+    if ckpt_in is None:
+        return
+    cfg_in = config.total_in_channels()
+    if ckpt_in == cfg_in:
+        return
+    progress_cb(
+        0.005,
+        f"Fine-tune checkpoint expects {ckpt_in}-channel input "
+        f"({cfg_in} requested) — overriding config to match. Train from "
+        f"scratch (untick 'Use existing model') to change channel count.",
+    )
+    if config.image_channels is not None:
+        config.image_channels = None
+    desired_imgs = ckpt_in - (1 if config.include_mask else 0)
+    if desired_imgs >= 1:
+        config.in_channels = desired_imgs
+    else:
+        config.in_channels = ckpt_in
+        config.include_mask = False
+
+
 def _peek_checkpoint_in_channels(state: dict) -> Optional[int]:
     """Return the input-channel count of a saved SupCon/AE checkpoint.
 
@@ -257,6 +299,12 @@ def train_supcon(
     temperature = float(getattr(config, "temperature", 0.07))
     projection_dim = int(getattr(config, "projection_dim", 128))
 
+    # Resolve fine-tune channel mismatch BEFORE building the dataset
+    # so the dataset's channel selection matches what the model will
+    # accept. (Otherwise dataset returns N+1 channels and the model
+    # built later only takes N → "expected N channels, got N+1".)
+    _maybe_align_config_to_checkpoint(config, fine_tune, progress_cb)
+
     progress_cb(0.0, "Splitting data by FOV...")
     train_idx, val_idx = split_by_fov(h5_paths, config.val_fraction)
 
@@ -358,44 +406,15 @@ def train_supcon(
     train_loader = DataLoader(train_ds, sampler=sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
-    # Build model via the config dispatch — supports both
-    # ``supcon_resnet18`` (ImageNet-pretrained ResNet-18 backbone) and
-    # ``supcon_lightweight`` (from-scratch 5-block CNN).
-    #
-    # When fine-tuning, the checkpoint's conv1 input-channel count is
-    # the source of truth — peek at it and override the config so a
-    # change in include_mask / image_channels between runs doesn't break
-    # the load with a "size mismatch for encoder.0.weight" error.
+    # Config has already been aligned to the checkpoint's conv1 input
+    # shape (see _maybe_align_config_to_checkpoint earlier in this fn).
+    model = config.build_model()
     if fine_tune and config.model_path and config.model_path.exists():
         state = torch.load(
             str(config.model_path), map_location="cpu", weights_only=True,
         )
-        ckpt_in = _peek_checkpoint_in_channels(state)
-        cfg_in = config.total_in_channels()
-        if ckpt_in is not None and ckpt_in != cfg_in:
-            progress_cb(
-                0.025,
-                f"Fine-tune checkpoint expects {ckpt_in}-channel input "
-                f"({cfg_in} requested) — overriding config to match. "
-                f"Train from scratch (untick 'Use existing model') if you "
-                f"want to change the channel count.",
-            )
-            # Override at the field level the build_model() reads.
-            if config.image_channels is not None:
-                # When user has picked specific channels, drop the mask
-                # to fit (or vice-versa). Cleanest is to fall back to the
-                # legacy in_channels path.
-                config.image_channels = None
-            config.in_channels = max(1, ckpt_in - (1 if config.include_mask else 0))
-            if config.total_in_channels() != ckpt_in:
-                # If include_mask was off, just set in_channels to ckpt_in.
-                config.in_channels = ckpt_in
-                config.include_mask = False
-        model = config.build_model()
         model.load_state_dict(state, strict=False)
         progress_cb(0.03, f"Loaded model from {config.model_path.name}")
-    else:
-        model = config.build_model()
 
     model = model.to(device)
     if not fine_tune and config.freeze_epochs > 0:
