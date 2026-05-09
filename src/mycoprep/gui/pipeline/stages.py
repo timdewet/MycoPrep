@@ -601,6 +601,31 @@ class ExtractStage:
                     control_labels=getattr(opts, "control_labels", ""),
                 )
                 progress_cb(1.0, f"Registered run '{run_id}' in feature library")
+                # Precompute features-OT for this species so the
+                # Feature Profiles (OT) view in the Analysis panel
+                # renders instantly. The library mtime just changed,
+                # so any old cache is now stale anyway.
+                try:
+                    from mycoprep.core.extract.qc_plots import (
+                        precompute_features_ot_cache,
+                    )
+                    species = getattr(opts, "species", "")
+                    progress_cb(
+                        1.0,
+                        f"Precomputing features-OT cache for "
+                        f"{species or 'library'}...",
+                    )
+                    precompute_features_ot_cache(
+                        library_dir, species,
+                        progress_cb=lambda f, *_a: progress_cb(
+                            1.0,
+                            f"Features-OT precompute {int(max(0, min(1, f)) * 100)}%...",
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    # Non-fatal: Analysis panel will compute lazily on
+                    # demand if the cache is missing.
+                    pass
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"Library registration failed: {e}")
 

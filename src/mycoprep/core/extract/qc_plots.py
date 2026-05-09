@@ -2145,6 +2145,22 @@ def _embedding_ot_cache_path(emb_path: "Path") -> "Path":
     )
 
 
+def _features_ot_cache_path(library_dir: "Path | None", species: str) -> "Path":
+    """Stable cache location for the features-OT distance matrix.
+
+    Lives under the library's ``features_ot_cache/`` subdir, keyed by
+    species (since each species' library is queried separately and has
+    its own condition / control set).
+    """
+    from .feature_library import FeatureLibrary
+
+    lib = FeatureLibrary(library_dir)
+    cache_dir = lib.library_dir / "features_ot_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() else "_" for c in (species or "all"))
+    return cache_dir / f"{safe}.ot_distance.parquet"
+
+
 def _try_load_ot_cache(
     cache_sidecar: "Path",
     requested_params: dict,
@@ -2183,6 +2199,45 @@ def _try_load_ot_cache(
     D = df[d_cols].to_numpy(dtype=np.float64)
     meta = df.drop(columns=d_cols).to_dict("records")
     return D, meta
+
+
+def precompute_features_ot_cache(
+    library_dir: "Path | None",
+    species: str,
+    *,
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    pca_dims_before_ot: int = 0,
+    batch_correct: bool = True,
+    progress_cb=None,
+) -> "Path | None":
+    """Precompute the features-OT distance matrix for one species.
+
+    Called by ``ExtractStage`` after a successful feature library
+    registration so the Feature Profiles (OT) view in the Analysis
+    panel renders instantly. Cached at
+    ``<library>/features_ot_cache/<species>.ot_distance.parquet`` and
+    keyed by (params, library mtime). Best-effort — silently skips
+    when there are < 3 groups (typical for a single-condition library).
+    """
+    out_path = Path(_features_ot_cache_path(library_dir, species)).with_name(
+        _features_ot_cache_path(library_dir, species).stem + ".html",
+    )
+    try:
+        render_features_ot_html(
+            out_path,
+            library_dir=library_dir,
+            species=species,
+            n_cells_per_condition=n_cells_per_condition,
+            sinkhorn_reg=sinkhorn_reg,
+            pca_dims_before_ot=pca_dims_before_ot,
+            batch_correct=batch_correct,
+            progress_cb=progress_cb,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    cache = _features_ot_cache_path(library_dir, species)
+    return cache if cache.exists() else None
 
 
 def precompute_embedding_ot_cache(
@@ -2848,6 +2903,49 @@ def render_features_ot_html(
     if len(morph_cols) < 3:
         return None
 
+    # Cache key: parameters that affect D plus the library's mtime
+    # (invalidates when runs are registered or removed).
+    library_index = lib.library_dir / "library.parquet"
+    cache_params = {
+        "n_cells_per_condition": int(n_cells_per_condition),
+        "sinkhorn_reg": float(sinkhorn_reg),
+        "pca_dims_before_ot": int(pca_dims_before_ot or 0),
+        "batch_correct": bool(batch_correct),
+        "library_mtime_ns": (
+            library_index.stat().st_mtime_ns
+            if library_index.exists() else 0
+        ),
+        "species": str(species or ""),
+        "n_features": len(morph_cols),
+    }
+    cache_sidecar = _features_ot_cache_path(library_dir, species)
+    cached = _try_load_ot_cache(
+        cache_sidecar,
+        # Only validate D-affecting params + library state. n_features
+        # is metadata and shouldn't gate cache hits.
+        {k: v for k, v in cache_params.items() if k != "n_features"},
+    )
+    has_multi_runs_cached = (
+        df_lib["_library_run_id"].nunique() > 1
+        if "_library_run_id" in df_lib.columns else False
+    )
+    if cached is not None:
+        D, group_meta = cached
+        _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        return _ot_render_from_distance(
+            out_path,
+            D=D, group_meta=group_meta,
+            color_by=color_by, highlight_genes=highlight_genes,
+            n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+            pathway_csv=pathway_csv,
+            has_multi_runs=has_multi_runs_cached,
+            batch_correct=batch_correct,
+            n_cells_per_condition=n_cells_per_condition,
+            label="Feature Profiles",
+            extra_title=f" · {len(morph_cols)} features",
+            progress_cb=progress_cb,
+        )
+
     # Run / condition / gene metadata. ``feature_library.load_species``
     # adds ``_library_run_id`` per cell which we treat as the canonical
     # batch label. We deliberately don't rename to ``run_id`` because the
@@ -3012,83 +3110,38 @@ def render_features_ot_html(
     np.fill_diagonal(D, 0.0)
     D = np.sqrt(np.maximum(D, 0.0))
 
-    _save_ot_sidecar(out_path, D, group_meta)
+    # Save both to the per-render sidecar and to the stable library
+    # cache so subsequent renders (with the same params + library state)
+    # hit the cache.
+    _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+    try:
+        import shutil
+        shutil.copyfile(_ot_sidecar_path(out_path), cache_sidecar)
+        params_src = _ot_sidecar_path(out_path).with_suffix(
+            _ot_sidecar_path(out_path).suffix + ".params.json",
+        )
+        if params_src.exists():
+            shutil.copyfile(
+                params_src,
+                cache_sidecar.with_suffix(
+                    cache_sidecar.suffix + ".params.json",
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
     progress_cb(0.85)
 
-    try:
-        import umap
-        eff_neighbors = max(2, min(int(n_neighbors), len(point_clouds) - 1))
-        coords = umap.UMAP(
-            n_components=2, n_neighbors=eff_neighbors, min_dist=0.1,
-            metric="precomputed", random_state=42, n_jobs=1,
-        ).fit_transform(D)
-    except Exception:  # noqa: BLE001
-        from sklearn.manifold import MDS
-        coords = MDS(
-            n_components=2, dissimilarity="precomputed", random_state=42,
-        ).fit_transform(D)
-
-    plot_df = pd.DataFrame(group_meta)
-    plot_df["x"] = coords[:, 0]
-    plot_df["y"] = coords[:, 1]
-
-    pathway_map = _load_pathway_map(pathway_csv)
-    if pathway_map:
-        plot_df["pathway"] = (
-            plot_df["gene"].astype(str).str.lower().map(pathway_map)
-            .fillna("Unannotated")
-        )
-    elif color_by == "pathway":
-        plot_df["pathway"] = "Unannotated"
-
-    try:
-        import plotly.express as px
-        color_col = "gene"
-        if color_by == "run_id":
-            color_col = "run_id"
-        elif color_by == "pathway" and "pathway" in plot_df.columns:
-            color_col = "pathway"
-        hover = [c for c in ["condition_label", "gene", "run_id", "pathway",
-                              "n_cells_used"]
-                 if c in plot_df.columns and c != color_col]
-        fig = px.scatter(
-            plot_df, x="x", y="y", color=color_col, hover_data=hover,
-        )
-
-        if highlight_genes:
-            hl_set = {g.lower() for g in highlight_genes}
-            fig.update_traces(marker=dict(size=8, opacity=0.3))
-            hl = plot_df[plot_df["gene"].str.lower().isin(hl_set)]
-            if not hl.empty:
-                fig.add_scatter(
-                    x=hl["x"], y=hl["y"], mode="markers",
-                    marker=dict(size=12, color="red", opacity=1.0),
-                    text=hl["condition_label"], hoverinfo="text",
-                    name="Highlighted",
-                )
-
-        harmony_status = ""
-        if has_multi_runs:
-            harmony_status = " · Harmony" if batch_correct else " · raw"
-        fig.update_layout(
-            title=(
-                f"Feature Profiles — Optimal Transport "
-                f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
-                f"{harmony_status} · {len(point_clouds)} groups × "
-                f"{n_cells_per_condition} cells · {len(morph_cols)} features"
-                f" · n_neighbors={max(2, min(int(n_neighbors), len(point_clouds) - 1))}"
-            ),
-            xaxis_title="UMAP 1 (from OT distance)",
-            yaxis_title="UMAP 2 (from OT distance)",
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-        fig.write_html(
-            str(out_path), include_plotlyjs=True, default_height="100vh",
-        )
-        _make_plot_html_fullheight(out_path)
-        progress_cb(1.0)
-        return out_path
-    except ImportError:
-        return None
+    return _ot_render_from_distance(
+        out_path,
+        D=D, group_meta=group_meta,
+        color_by=color_by, highlight_genes=highlight_genes,
+        n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+        pathway_csv=pathway_csv,
+        has_multi_runs=has_multi_runs,
+        batch_correct=batch_correct,
+        n_cells_per_condition=n_cells_per_condition,
+        label="Feature Profiles",
+        extra_title=f" · {len(morph_cols)} features",
+        progress_cb=progress_cb,
+    )
