@@ -556,6 +556,52 @@ def _subsample_stratified(df, max_n, group_col, rng):
     return __import__("pandas").concat(parts, ignore_index=True)
 
 
+_REPLICATE_RX_CACHE = None
+
+
+def _replicate_strip_regex():
+    """Lazy-compile a regex that matches a replicate suffix in a label.
+
+    Common patterns observed in MycoPrep labelling (current and likely-
+    future variants):
+    - ``"rpoB R1"`` → strip `` R1``
+    - ``"rpoB_R1"`` → strip ``_R1``
+    - ``"ATc+__iniB-mScarlet__rpoB__R1"`` → strip ``__R1``
+    - ``"rpoB R2 ATc+"`` → strip `` R2`` (middle of the string)
+
+    The regex consumes the separator + ``R<digits>`` together; downstream
+    callers clean orphan whitespace / trailing connectors.
+    """
+    global _REPLICATE_RX_CACHE
+    if _REPLICATE_RX_CACHE is None:
+        import re
+
+        _REPLICATE_RX_CACHE = re.compile(r"[\s_]+R\d+\b", re.IGNORECASE)
+    return _REPLICATE_RX_CACHE
+
+
+def _strip_replicate_suffix(label: str) -> str:
+    """Return ``label`` with ``_R<digits>`` / `` R<digits>`` patterns stripped.
+
+    Used by the OT views' and mean-views' ``merge_replicates`` mode to
+    collapse same-condition cells across replicate runs even when the
+    labeller embedded a per-run replicate index in ``condition_label``.
+
+    The user's current dataset uses ``R1`` for every condition (no
+    suffix variation between runs), so this is a no-op for them — kept
+    for future-proofing in case the labelling convention starts using
+    distinct ``R<n>`` suffixes per run.
+    """
+    import re
+
+    rx = _replicate_strip_regex()
+    s = rx.sub("", str(label))
+    # Collapse leftover whitespace + strip trailing connectors.
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[_\s]+$", "", s).strip()
+    return s
+
+
 def _harmony_oriented(ho, n_samples: int):
     """Return Harmony's corrected matrix as ``(n_samples, d)``.
 
@@ -1471,6 +1517,7 @@ def render_library_html(
     highlight_genes: list[str] | None = None,
     baseline_mode: str = "pooled",
     batch_correct: bool = True,
+    merge_replicates: bool = False,
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
@@ -1518,9 +1565,6 @@ def render_library_html(
         "_library_experiment_type", "knockdown",
     ).astype(str).fillna("knockdown")
     df_lib["_is_current_run"] = False
-    df_lib["_combined_label"] = (
-        df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str)
-    )
 
     # Union all controls registered with library runs.
     controls: list[str] = []
@@ -1530,6 +1574,34 @@ def render_library_html(
                 tok = tok.strip()
                 if tok and tok not in controls:
                     controls.append(tok)
+
+    # ``_combined_label`` is the per-condition key the S-score pipeline
+    # uses. Default convention: ``"<condition> @ <run_id>"`` (each
+    # (run, condition) gets its own profile point). When
+    # ``merge_replicates`` is on, non-control rows drop the ``@ run_id``
+    # suffix and additionally strip any embedded replicate identifier
+    # (R1, R2 …) — so the same condition across replicate runs collapses
+    # into one profile point. Controls keep the run_id suffix so their
+    # per-run variation remains visible as a noise floor.
+    if merge_replicates and controls:
+        import numpy as np
+
+        gene_for_merge = (
+            df_lib["condition"].astype(str).str.split().str[0]
+        )
+        is_ctrl_row = gene_for_merge.isin(controls)
+        cond_stripped = (
+            df_lib["condition"].astype(str).map(_strip_replicate_suffix)
+        )
+        df_lib["_combined_label"] = np.where(
+            is_ctrl_row.values,
+            df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str),
+            cond_stripped.astype(str),
+        )
+    else:
+        df_lib["_combined_label"] = (
+            df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str)
+        )
 
     profiles = _compute_condition_sscores(
         df_lib, morph_cols, "_combined_label",
@@ -1828,6 +1900,7 @@ def render_embeddings_html(
     highlight_genes: list[str] | None = None,
     batch_correct: bool = True,
     model_type: str = "",
+    merge_replicates: bool = False,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings as interactive Plotly HTML.
 
@@ -1933,7 +2006,56 @@ def render_embeddings_html(
     # already do for the S-score pipeline. Profile-level Harmony is more
     # stable with few batches: the algorithm doesn't have to invent a
     # cell-level subcluster structure that the data may not support.
-    if has_multi_runs and "condition_label" in df.columns:
+    #
+    # When ``merge_replicates`` is on, non-control cells are pooled across
+    # runs into one row (same condition across runs = one profile point);
+    # controls keep their per-run identity so between-control variation
+    # stays visible.
+    if merge_replicates and has_multi_runs and "condition_label" in df.columns:
+        # Build a row-level group key that collapses non-control rows
+        # by condition_label and keeps controls per-run.
+        _gene_for_merge = (
+            df["gene"].astype(str)
+            if "gene" in df.columns
+            else df["condition_label"].astype(str).str.split().str[0]
+        )
+        ctrl_mask = _gene_for_merge.isin(control_genes) if control_genes else None
+        cond_stripped = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
+        if ctrl_mask is not None and ctrl_mask.any():
+            run_key = np.where(
+                ctrl_mask.values,
+                df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+                cond_stripped.astype(str),
+            )
+        else:
+            run_key = cond_stripped.astype(str).values
+        df = df.copy()
+        df["_merge_key"] = run_key
+        profiles = df.groupby("_merge_key")[emb_cols].mean().reset_index()
+        # Split the synthetic key back into (run_id, condition_label) for
+        # downstream colouring / hover.
+        def _split_key(k):
+            k = str(k)
+            if "::" in k:
+                rid, cond = k.split("::", 1)
+                return rid, cond
+            # Merged non-control row — surface the contributing runs.
+            cond_rows = df[df["_merge_key"] == k]
+            runs = sorted(cond_rows["run_id"].astype(str).unique())
+            rid_label = ",".join(runs) if len(runs) <= 3 else f"{len(runs)} runs"
+            return rid_label, k
+        rids: list[str] = []
+        conds: list[str] = []
+        for k in profiles["_merge_key"]:
+            rid, cond = _split_key(k)
+            rids.append(rid)
+            conds.append(cond)
+        profiles["run_id"] = rids
+        profiles["condition_label"] = conds
+        profiles = profiles.drop(columns=["_merge_key"])
+    elif has_multi_runs and "condition_label" in df.columns:
         profiles = (
             df.groupby(["run_id", "condition_label"])[emb_cols]
             .mean()
@@ -2018,9 +2140,18 @@ def render_embeddings_html(
         from sklearn.decomposition import PCA
         import umap
 
+        # Strip NaN / ±inf BEFORE PCA → Harmony. Harmony's internal
+        # KMeans rejects NaN explicitly. Profile means can carry NaN
+        # when a condition has all-NaN cells for some embedding dim
+        # (rare for CNN embeddings but possible for upstream features-
+        # derived profiles).
+        emb_matrix = np.nan_to_num(
+            emb_matrix, nan=0.0, posinf=0.0, neginf=0.0,
+        )
         n_components_pca = min(50, emb_matrix.shape[1], emb_matrix.shape[0] - 1)
         pca = PCA(n_components=n_components_pca)
         reduced = pca.fit_transform(emb_matrix)
+        reduced = np.nan_to_num(reduced, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 3. Harmony in PCA space (more stable than raw 512-d).
         if batch_correct and has_multi_runs:
@@ -2864,8 +2995,13 @@ def render_embeddings_ot_html(
             from sklearn.decomposition import PCA
             # Reduce to ~50-d before Harmony (same logic as S-score path).
             n_pca = min(50, len(emb_cols), max(2, len(df) // 10))
+            # Strip NaN / ±inf BEFORE Harmony — its internal KMeans
+            # rejects them with the same error as the consensus path.
+            X_in = df[emb_cols].values.astype(np.float32)
+            X_in = np.nan_to_num(X_in, nan=0.0, posinf=0.0, neginf=0.0)
             pca = PCA(n_components=n_pca)
-            X_pca = pca.fit_transform(df[emb_cols].values.astype(np.float32))
+            X_pca = pca.fit_transform(X_in)
+            X_pca = np.nan_to_num(X_pca, nan=0.0, posinf=0.0, neginf=0.0)
             ho = harmonypy.run_harmony(
                 X_pca,
                 pd.DataFrame({"run_id": df["run_id"].values}),
@@ -2944,10 +3080,16 @@ def render_embeddings_ot_html(
     # explicitly asked for this carve-out).
     if merge_replicates:
         is_ctrl = df["gene"].astype(str).isin(control_genes)
+        # Non-control merge key: condition_label with any replicate
+        # suffix (R1, R2 …) stripped, so labels that embed a run index
+        # collapse correctly. Controls keep their per-run identity.
+        merge_key_noctrl = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
         df["_merge_key"] = np.where(
             is_ctrl.values,
             df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
-            df["condition_label"].astype(str),
+            merge_key_noctrl,
         )
         group_cols = ["_merge_key"]
     else:
@@ -3282,10 +3424,16 @@ def render_features_ot_html(
     # so between-control variation remains visible.
     if merge_replicates:
         is_ctrl = df["gene"].astype(str).isin(control_genes)
+        # Non-control merge key: condition_label with any replicate
+        # suffix (R1, R2 …) stripped, so labels that embed a run index
+        # collapse correctly. Controls keep their per-run identity.
+        merge_key_noctrl = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
         df["_merge_key"] = np.where(
             is_ctrl.values,
             df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
-            df["condition_label"].astype(str),
+            merge_key_noctrl,
         )
         group_cols = ["_merge_key"]
     else:
