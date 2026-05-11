@@ -24,13 +24,26 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("MycoPrep")
     app.setApplicationDisplayName("MycoPrep")
+    # Ensure closing the last window actually exits the process. Qt's
+    # default is to keep the event loop alive while any QObject is
+    # still attached — QWebEngineView (used by the Analysis panel)
+    # spawns helper processes that occasionally outlive ``win.close()``
+    # and leave the terminal hanging on Windows.
+    app.setQuitOnLastWindowClosed(True)
     logo = resource_root() / "logo" / "logo.svg"
     if logo.exists():
         app.setWindowIcon(QIcon(str(logo)))
     apply_theme(app)
     win = MainWindow()
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # Force-quit any lingering Qt resources. ``os._exit`` bypasses
+    # Python's atexit cleanup — safe here because the GUI is the
+    # only thing this entry-point manages, and it's the documented
+    # escape hatch for Qt apps that won't release the terminal when
+    # WebEngine helper processes outlive the main loop.
+    import os
+    os._exit(rc)
 
 
 if __name__ == "__main__":
