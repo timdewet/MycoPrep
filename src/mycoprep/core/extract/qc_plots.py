@@ -2528,6 +2528,22 @@ def _sinkhorn_divergence_matrix(
         else:
             n_jobs = -2
 
+    # Resolve the actual effective worker count for diagnostics. joblib
+    # interprets negative numbers relative to cpu_count() (-1 = all,
+    # -2 = all-but-one), so surface the absolute number to the log so
+    # we can tell whether parallelism is actually engaging.
+    cpu_count = os.cpu_count() or 1
+    if n_jobs < 0:
+        effective_jobs = max(1, cpu_count + 1 + n_jobs)
+    else:
+        effective_jobs = max(1, n_jobs)
+    n_pairs_total = n * (n - 1) // 2
+    import logging
+    logging.getLogger("mycoprep").info(
+        "OT compute: %d groups, %d pairs, %d/%d cores, stop_thr=%g",
+        n, n_pairs_total, effective_jobs, cpu_count, stop_thr,
+    )
+
     def _sinkhorn(M: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
         # Log-stabilised Sinkhorn — same as ot.sinkhorn2 but in log-space
         # so it stays numerically well-behaved at small reg / large M.
@@ -2575,13 +2591,25 @@ def _sinkhorn_divergence_matrix(
         n_jobs=n_jobs, prefer="threads", return_as="generator_unordered",
     )(delayed(_pair)(i, j) for i, j in pairs)
 
+    import time
+    t0 = time.monotonic()
     done = 0
+    last_pct = -1
     for i, j, cost in gen:
         div = cost - 0.5 * (self_terms[i] + self_terms[j])
         D[i, j] = D[j, i] = max(div, 0.0)
         done += 1
         if progress_cb is not None:
-            progress_cb(done / total_pairs)
+            pct = int(done / total_pairs * 100)
+            if pct != last_pct:
+                last_pct = pct
+                progress_cb(done / total_pairs)
+    logging.getLogger("mycoprep").info(
+        "OT compute: done in %.1fs (%.2f s/pair on %d pairs)",
+        time.monotonic() - t0,
+        (time.monotonic() - t0) / max(total_pairs, 1),
+        total_pairs,
+    )
     return D
 
 

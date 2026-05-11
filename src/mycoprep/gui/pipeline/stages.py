@@ -616,12 +616,23 @@ class ExtractStage:
                         f"Precomputing features-OT cache for "
                         f"{species or 'library'}...",
                     )
+                    # Rate-limit the logger: many small ticks from the
+                    # inner pair loop scale to overlapping integer
+                    # percents and spam the log otherwise.
+                    _last_pct = [-1]
+
+                    def _features_ot_cb(f, *_a):
+                        pct = int(max(0, min(1, f)) * 100)
+                        if pct != _last_pct[0]:
+                            _last_pct[0] = pct
+                            progress_cb(
+                                1.0,
+                                f"Features-OT precompute {pct}%...",
+                            )
+
                     precompute_features_ot_cache(
                         library_dir, species,
-                        progress_cb=lambda f, *_a: progress_cb(
-                            1.0,
-                            f"Features-OT precompute {int(max(0, min(1, f)) * 100)}%...",
-                        ),
+                        progress_cb=_features_ot_cb,
                     )
                     cache_path = _features_ot_cache_path(library_dir, species)
                     if cache_path.exists():
@@ -858,15 +869,23 @@ class EmbeddingsStage:
                     f"Precomputing OT distance matrix for {label} "
                     f"(this saves time on the first OT view)...",
                 )
+                _last_pct = [-1]
+
+                def _emb_ot_cb(f, *_a):
+                    pct = int(max(0.0, min(1.0, f)) * 100)
+                    if pct != _last_pct[0]:
+                        _last_pct[0] = pct
+                        progress_cb(
+                            lo + (hi - lo) * max(0.0, min(1.0, f)),
+                            f"OT precompute {pct}%...",
+                        )
+
                 precompute_embedding_ot_cache(
                     emb_p,
                     library_dir=opts.library_dir,
                     species=opts.species,
                     model_type=config.model_type,
-                    progress_cb=lambda f, *_a: progress_cb(
-                        lo + (hi - lo) * max(0.0, min(1.0, f)),
-                        f"OT precompute {int(f * 100)}%...",
-                    ),
+                    progress_cb=_emb_ot_cb,
                 )
                 cache_path = _embedding_ot_cache_path(emb_p)
                 if cache_path.exists():
