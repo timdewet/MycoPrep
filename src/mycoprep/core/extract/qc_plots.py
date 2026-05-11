@@ -627,6 +627,36 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
 
     n_samples, n_features = X_scaled.shape
 
+    # NaN / inf cleanup. Some shape features (angularity, curvature,
+    # pole_taper) produce NaN per cell when the contour spline fails on
+    # too-small or pathological cells; means and CVs of those features
+    # then carry NaN into per-condition profiles, and per-run S-score
+    # baselines compute NaN-bearing (μ, σ). Harmony's internal KMeans
+    # rejects NaN explicitly. Drop columns that are entirely NaN
+    # (no signal anywhere — keeping them just propagates problems),
+    # then impute remaining NaN/inf with 0 (post-z-score that's
+    # equivalent to "no deviation from baseline").
+    X_scaled = np.asarray(X_scaled, dtype=np.float64)
+    if X_scaled.size:
+        # NaN-only columns get dropped entirely. We do this in-place on
+        # a local copy and warn via the mycoprep logger so it's visible
+        # when troubleshooting; the column count is also stable across
+        # consensus runs (no random drops).
+        col_all_nan = np.all(~np.isfinite(X_scaled), axis=0)
+        if col_all_nan.any():
+            import logging
+            logging.getLogger("mycoprep").info(
+                "Clustering: dropping %d all-NaN columns out of %d",
+                int(col_all_nan.sum()), n_features,
+            )
+            X_scaled = X_scaled[:, ~col_all_nan]
+            n_features = X_scaled.shape[1]
+        # Replace remaining NaN / ±inf with 0. After S-score scaling the
+        # output is centred so 0 corresponds to "control baseline".
+        X_scaled = np.nan_to_num(
+            X_scaled, nan=0.0, posinf=0.0, neginf=0.0,
+        )
+
     # Skip PCA on low-D inputs (typical: 28–60-D shape S-scores). UMAP
     # handles them directly and PCA would discard low-variance axes that
     # carry phenotype signal. Keep PCA only when the input is genuinely
