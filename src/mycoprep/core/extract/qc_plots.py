@@ -2164,16 +2164,27 @@ def _features_ot_cache_path(library_dir: "Path | None", species: str) -> "Path":
 def _try_load_ot_cache(
     cache_sidecar: "Path",
     requested_params: dict,
+    *,
+    miss_reason: "list[str] | None" = None,
 ) -> "tuple[np.ndarray, list[dict]] | None":
     """Return ``(D, group_meta)`` if the cache exists and its stored
     params match the requested ones. ``None`` on miss / stale cache.
+
+    When ``miss_reason`` is provided (mutable list), the first reason
+    for a miss is appended to it — useful for diagnostics when the
+    Analysis panel can't figure out why a fresh precompute didn't take.
     """
     import json
 
     import numpy as np
     import pandas as pd
 
+    def _report(reason: str) -> None:
+        if miss_reason is not None:
+            miss_reason.append(reason)
+
     if not cache_sidecar.exists():
+        _report(f"cache file not found at {cache_sidecar.name}")
         return None
     params_path = cache_sidecar.with_suffix(
         cache_sidecar.suffix + ".params.json",
@@ -2181,20 +2192,29 @@ def _try_load_ot_cache(
     if params_path.exists():
         try:
             stored = json.loads(params_path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _report(f"params.json unreadable: {exc}")
             return None
         for k, v in requested_params.items():
             if str(stored.get(k)) != str(v):
+                _report(
+                    f"param mismatch on {k!r}: "
+                    f"requested={v!r} cached={stored.get(k)!r}"
+                )
                 return None
+    else:
+        _report("params.json missing — old cache layout, will recompute")
     try:
         df = pd.read_parquet(cache_sidecar)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _report(f"parquet unreadable: {exc}")
         return None
     d_cols = sorted(
         [c for c in df.columns if c.startswith("d_")],
         key=lambda c: int(c.split("_", 1)[1]),
     )
     if not d_cols:
+        _report("cache parquet has no d_* columns")
         return None
     D = df[d_cols].to_numpy(dtype=np.float64)
     meta = df.drop(columns=d_cols).to_dict("records")
@@ -2622,7 +2642,20 @@ def render_embeddings_ot_html(
         "emb_mtime_ns": emb_path.stat().st_mtime_ns,
     }
     cache_sidecar = _embedding_ot_cache_path(emb_path)
-    cached = _try_load_ot_cache(cache_sidecar, cache_params)
+    cache_miss: list[str] = []
+    cached = _try_load_ot_cache(
+        cache_sidecar, cache_params, miss_reason=cache_miss,
+    )
+    if cached is None and cache_miss:
+        # Surface why a precomputed cache didn't take so the user can
+        # see "param mismatch on emb_mtime_ns: ..." in the status bar
+        # instead of silently watching Sinkhorn run from scratch.
+        progress_cb(0.05, f"OT cache miss: {cache_miss[0]}")
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache miss (embeddings @ %s): %s",
+            cache_sidecar, cache_miss[0],
+        )
     if cached is not None:
         D, group_meta = cached
         # Mirror the cached matrix to the per-render sidecar so the
@@ -2919,12 +2952,21 @@ def render_features_ot_html(
         "n_features": len(morph_cols),
     }
     cache_sidecar = _features_ot_cache_path(library_dir, species)
+    cache_miss: list[str] = []
     cached = _try_load_ot_cache(
         cache_sidecar,
         # Only validate D-affecting params + library state. n_features
         # is metadata and shouldn't gate cache hits.
         {k: v for k, v in cache_params.items() if k != "n_features"},
+        miss_reason=cache_miss,
     )
+    if cached is None and cache_miss:
+        progress_cb(0.05, f"OT cache miss: {cache_miss[0]}")
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache miss (features @ %s): %s",
+            cache_sidecar, cache_miss[0],
+        )
     has_multi_runs_cached = (
         df_lib["_library_run_id"].nunique() > 1
         if "_library_run_id" in df_lib.columns else False

@@ -338,9 +338,12 @@ class _EmbeddingsOTWorker(QObject):
 
             self.progress.emit(5, "Loading embeddings…")
 
-            def _cb(f: float) -> None:
+            def _cb(f: float, msg: str = "") -> None:
                 pct = int(5 + 90 * max(0.0, min(1.0, f)))
-                self.progress.emit(pct, f"Computing OT distance matrix… {pct}%")
+                self.progress.emit(
+                    pct,
+                    msg if msg else f"Computing OT distance matrix… {pct}%",
+                )
 
             written = render_embeddings_ot_html(
                 self._out_path,
@@ -397,9 +400,12 @@ class _FeaturesOTWorker(QObject):
 
             self.progress.emit(5, "Loading features…")
 
-            def _cb(f: float) -> None:
+            def _cb(f: float, msg: str = "") -> None:
                 pct = int(5 + 90 * max(0.0, min(1.0, f)))
-                self.progress.emit(pct, f"Computing OT distance matrix… {pct}%")
+                self.progress.emit(
+                    pct,
+                    msg if msg else f"Computing OT distance matrix… {pct}%",
+                )
 
             written = render_features_ot_html(
                 self._out_path,
