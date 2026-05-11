@@ -607,6 +607,7 @@ class ExtractStage:
                 # so any old cache is now stale anyway.
                 try:
                     from mycoprep.core.extract.qc_plots import (
+                        _features_ot_cache_path,
                         precompute_features_ot_cache,
                     )
                     species = getattr(opts, "species", "")
@@ -622,10 +623,26 @@ class ExtractStage:
                             f"Features-OT precompute {int(max(0, min(1, f)) * 100)}%...",
                         ),
                     )
-                except Exception:  # noqa: BLE001
+                    cache_path = _features_ot_cache_path(library_dir, species)
+                    if cache_path.exists():
+                        progress_cb(
+                            1.0,
+                            f"Features-OT cache written: {cache_path}",
+                        )
+                    else:
+                        progress_cb(
+                            1.0,
+                            f"Features-OT precompute reported done but "
+                            f"cache file is missing at {cache_path} — "
+                            f"the Analysis panel will recompute on demand.",
+                        )
+                except Exception as exc:  # noqa: BLE001
                     # Non-fatal: Analysis panel will compute lazily on
-                    # demand if the cache is missing.
-                    pass
+                    # demand if the cache is missing — but make it
+                    # visible so the user can see why it's not landing.
+                    progress_cb(
+                        1.0, f"Features-OT precompute failed: {exc}",
+                    )
             except Exception as e:  # noqa: BLE001
                 progress_cb(1.0, f"Library registration failed: {e}")
 
@@ -833,6 +850,7 @@ class EmbeddingsStage:
             Analysis panel's first OT view render is instant."""
             try:
                 from mycoprep.core.extract.qc_plots import (
+                    _embedding_ot_cache_path,
                     precompute_embedding_ot_cache,
                 )
                 progress_cb(
@@ -850,10 +868,22 @@ class EmbeddingsStage:
                         f"OT precompute {int(f * 100)}%...",
                     ),
                 )
-            except Exception:  # noqa: BLE001
-                # Non-fatal: the Analysis panel will compute on demand
-                # if the cache is missing.
-                pass
+                cache_path = _embedding_ot_cache_path(emb_p)
+                if cache_path.exists():
+                    progress_cb(
+                        hi, f"OT cache written: {cache_path}",
+                    )
+                else:
+                    progress_cb(
+                        hi,
+                        f"OT precompute reported done but cache file is "
+                        f"missing at {cache_path} — the Analysis panel will "
+                        f"recompute on demand.",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                progress_cb(
+                    hi, f"OT precompute failed for {label}: {exc}",
+                )
 
         # Train-only runs go straight to library re-extraction; there's no
         # current-run h5 to extract for.
