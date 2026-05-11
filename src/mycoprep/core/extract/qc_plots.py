@@ -556,6 +556,37 @@ def _subsample_stratified(df, max_n, group_col, rng):
     return __import__("pandas").concat(parts, ignore_index=True)
 
 
+def _harmony_oriented(ho, n_samples: int):
+    """Return Harmony's corrected matrix as ``(n_samples, d)``.
+
+    ``harmonypy.run_harmony`` returns ``Z_corr`` as a ``(d, N)`` matrix
+    (features × cells / samples), not the ``(N, d)`` orientation that
+    downstream sklearn / UMAP / DataFrame code expects. Older callers
+    in this module assigned ``ho.Z_corr`` directly and silently produced
+    UMAP embeddings of length ``d`` instead of ``n_samples`` — broken,
+    but it didn't error out under single-shot clustering. The consensus
+    UMAP+HDBSCAN in :func:`_run_umap_hdbscan` accumulates a
+    ``(n_samples, n_samples)`` co-association matrix and rejects the
+    mismatch loudly (``"operands could not be broadcast together with
+    shapes (95,95) (60,60) ..."``).
+
+    Detect orientation against ``n_samples`` and transpose if needed.
+    Robust to any future harmonypy version that flips the convention.
+    """
+    import numpy as np
+
+    Z = np.asarray(ho.Z_corr)
+    if Z.ndim != 2:
+        raise ValueError(f"harmony Z_corr has unexpected ndim={Z.ndim}")
+    if Z.shape[0] == n_samples:
+        return Z
+    if Z.shape[1] == n_samples:
+        return Z.T
+    raise ValueError(
+        f"harmony Z_corr shape {Z.shape} doesn't match n_samples={n_samples}",
+    )
+
+
 def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
                        min_cluster_size=3, random_state=42,
                        batch_labels=None,
@@ -634,7 +665,7 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
                     # confounding was partial.
                     nclust=min(max(2, n_batches), 5),
                 )
-                X_proc = ho.Z_corr
+                X_proc = _harmony_oriented(ho, n_samples)
             except ImportError:
                 pass
 
@@ -1973,7 +2004,7 @@ def render_embeddings_html(
                     max_iter_harmony=20,
                     nclust=nclust,
                 )
-                reduced = ho.Z_corr
+                reduced = _harmony_oriented(ho, reduced.shape[0])
             except ImportError:
                 pass
             except Exception:  # noqa: BLE001
@@ -2808,11 +2839,14 @@ def render_embeddings_ot_html(
             )
             # Replace embeddings columns with corrected (and PCA-reduced)
             # representation. OT works in any dim — the reduced form is
-            # actually faster.
-            emb_cols = [f"hpc_{i}" for i in range(ho.Z_corr.shape[1])]
+            # actually faster. ``_harmony_oriented`` normalises Z_corr
+            # to (n_cells, d) regardless of harmonypy's internal axis
+            # convention.
+            Z = _harmony_oriented(ho, len(df))
+            emb_cols = [f"hpc_{i}" for i in range(Z.shape[1])]
             df = df.drop(columns=[c for c in df.columns if c.startswith("emb_")])
             for i, c in enumerate(emb_cols):
-                df[c] = ho.Z_corr[:, i]
+                df[c] = Z[:, i]
         except ImportError:
             pass
         except Exception:  # noqa: BLE001
@@ -3160,7 +3194,7 @@ def render_features_ot_html(
                 max_iter_harmony=20,
                 nclust=min(20, max(2, len(df) // 200)),
             )
-            df[morph_cols] = ho.Z_corr
+            df[morph_cols] = _harmony_oriented(ho, len(df))
         except ImportError:
             pass
         except Exception:  # noqa: BLE001
