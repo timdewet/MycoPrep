@@ -56,6 +56,13 @@ class HDF5CropDataset(Dataset):
         *,
         target_size: int = 128,
         in_channels: int = 1,
+        # Per-channel selection. ``image_channels=None`` uses the first
+        # ``in_channels`` non-mask channels; otherwise pick by name.
+        # ``include_mask=True`` appends the mask channel binarised at 0.5
+        # — matches the Mtb reference's 3-channel input (phase + ParB +
+        # mask).
+        image_channels: Optional[list[str]] = None,
+        include_mask: bool = True,
         # Kept for API compatibility — ignored. Augmentation is done on the
         # GPU per batch in train.py for efficiency.
         augment: bool = False,
@@ -71,6 +78,12 @@ class HDF5CropDataset(Dataset):
 
         self.target_size = target_size
         self.in_channels = in_channels
+        self._image_channels = image_channels
+        self._include_mask = bool(include_mask)
+        # Track per-file the local index of the mask channel in the
+        # selected slice (or -1 if no mask was appended) so __getitem__
+        # can binarise it after read.
+        self._mask_local_idx: list[int] = []
 
         # Build an index mapping global_idx → (file_idx, local_idx)
         self._h5_paths = [Path(p) for p in h5_paths]
@@ -87,13 +100,18 @@ class HDF5CropDataset(Dataset):
                 crop_sz = int(f.attrs.get("crop_size", f["crops"].shape[-1]))
                 channel_names = list(f.attrs.get("channel_names", []))
 
-                # Select imaging channels (drop mask)
-                ch_idx = self._select_channels(channel_names, in_channels)
+                ch_idx, mask_local = self._select_channels(
+                    channel_names,
+                    in_channels=in_channels,
+                    image_channels=image_channels,
+                    include_mask=self._include_mask,
+                )
 
                 self._file_offsets.append(total)
                 self._file_lengths.append(n)
                 self._channel_indices.append(ch_idx)
                 self._crop_sizes.append(crop_sz)
+                self._mask_local_idx.append(mask_local)
                 total += n
                 total_bytes += n * len(ch_idx) * target_size * target_size * 4
 
@@ -140,6 +158,13 @@ class HDF5CropDataset(Dataset):
                 arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
                 if arr.shape[-1] != self.target_size:
                     arr = self._batched_resize(arr, self.target_size)
+                # Binarise the mask channel post-resize so bilinear
+                # interpolation can't leave it on intermediate values.
+                mask_local = self._mask_local_idx[fi]
+                if mask_local >= 0 and mask_local < arr.shape[1]:
+                    arr[:, mask_local] = (arr[:, mask_local] >= 0.5).astype(
+                        np.float32
+                    )
                 _CROP_CACHE[cache_key] = arr
                 self._cached[fi] = arr
 
@@ -163,6 +188,19 @@ class HDF5CropDataset(Dataset):
                     )
                 if "fov_ids" in f:
                     meta_dict["fov_ids"] = f["fov_ids"][:].astype(np.int64)
+                # Per-cell gene / drug labels populated by the labelling
+                # stage (crops.py write path). Used by SupCon to take a
+                # clean class label per cell instead of guessing from
+                # condition_label.
+                for key in ("genes", "drugs", "concentrations"):
+                    if key in f:
+                        meta_dict[key] = np.array(
+                            [s.decode() if isinstance(s, bytes) else str(s)
+                             for s in f[key][:]]
+                        )
+                for key in ("is_drug", "is_control"):
+                    if key in f:
+                        meta_dict[key] = f[key][:].astype(bool)
             _CROP_CACHE[meta_key] = meta_dict  # type: ignore[assignment]
             self._cached_meta.append(meta_dict)
 
@@ -181,16 +219,61 @@ class HDF5CropDataset(Dataset):
         return np.concatenate(out_chunks, axis=0)
 
     @staticmethod
-    def _select_channels(channel_names: list[str], in_channels: int) -> list[int]:
-        """Pick the first ``in_channels`` imaging channels (skip mask)."""
-        imaging = []
-        for i, name in enumerate(channel_names):
-            if "mask" in name.lower():
-                continue
-            imaging.append(i)
-        if not imaging:
-            imaging = list(range(in_channels))
-        return imaging[:in_channels]
+    def _select_channels(
+        channel_names: list[str],
+        *,
+        in_channels: int,
+        image_channels: Optional[list[str]] = None,
+        include_mask: bool = True,
+    ) -> tuple[list[int], int]:
+        """Resolve the selected channel indices for one H5 file.
+
+        - If ``image_channels`` is provided, match each name case-
+          insensitively against ``channel_names`` and use those (in the
+          requested order) as the imaging channels.
+        - Otherwise take the first ``in_channels`` non-mask channels in
+          file order.
+        - When ``include_mask`` is True, append the mask channel (the
+          first channel whose name contains "mask") if found.
+
+        Returns ``(selected_indices, mask_local_idx)`` where
+        ``mask_local_idx`` is the position of the mask in
+        ``selected_indices`` (or -1 if no mask was appended).
+        """
+        lower_names = [str(n).lower() for n in channel_names]
+        mask_global_idx = next(
+            (i for i, n in enumerate(lower_names) if "mask" in n),
+            -1,
+        )
+
+        if image_channels is not None:
+            wanted = [str(c).lower() for c in image_channels]
+            imaging: list[int] = []
+            for w in wanted:
+                # Exact match preferred, fall back to substring containment.
+                hit = next(
+                    (i for i, n in enumerate(lower_names) if n == w),
+                    None,
+                )
+                if hit is None:
+                    hit = next(
+                        (i for i, n in enumerate(lower_names) if w in n),
+                        None,
+                    )
+                if hit is not None and hit != mask_global_idx:
+                    imaging.append(hit)
+        else:
+            imaging = [
+                i for i, n in enumerate(lower_names) if "mask" not in n
+            ]
+            if not imaging:
+                imaging = list(range(in_channels))
+            imaging = imaging[: max(0, int(in_channels))]
+
+        if include_mask and mask_global_idx >= 0:
+            selected = imaging + [mask_global_idx]
+            return selected, len(imaging)  # mask is the appended channel
+        return imaging, -1
 
     def _get_h5(self, file_idx: int):
         import h5py
@@ -226,6 +309,16 @@ class HDF5CropDataset(Dataset):
                 meta["cell_uid"] = str(mdict["cell_uids"][local_idx])
             if "fov_ids" in mdict:
                 meta["fov_id"] = int(mdict["fov_ids"][local_idx])
+            for key, mkey in [
+                ("genes", "gene"),
+                ("drugs", "drug"),
+                ("concentrations", "concentration"),
+            ]:
+                if key in mdict:
+                    meta[mkey] = str(mdict[key][local_idx])
+            for key in ("is_drug", "is_control"):
+                if key in mdict:
+                    meta[key] = bool(mdict[key][local_idx])
             return crop, meta
 
         f = self._get_h5(file_idx)
@@ -244,6 +337,12 @@ class HDF5CropDataset(Dataset):
                 align_corners=False,
             ).squeeze(0)
 
+        # Re-binarise the mask channel after the bilinear resize so
+        # downstream code sees crisp {0, 1}.
+        mask_local = self._mask_local_idx[file_idx]
+        if mask_local >= 0 and mask_local < crop.shape[0]:
+            crop[mask_local] = (crop[mask_local] >= 0.5).to(crop.dtype)
+
         # Metadata
         meta = {"global_idx": global_idx, "file_idx": file_idx}
         if "condition_labels" in f:
@@ -252,6 +351,17 @@ class HDF5CropDataset(Dataset):
             meta["cell_uid"] = f["cell_uids"][local_idx].decode()
         if "fov_ids" in f:
             meta["fov_id"] = int(f["fov_ids"][local_idx])
+        for key, mkey in [
+            ("genes", "gene"),
+            ("drugs", "drug"),
+            ("concentrations", "concentration"),
+        ]:
+            if key in f:
+                v = f[key][local_idx]
+                meta[mkey] = v.decode() if isinstance(v, bytes) else str(v)
+        for key in ("is_drug", "is_control"):
+            if key in f:
+                meta[key] = bool(f[key][local_idx])
 
         return crop, meta
 

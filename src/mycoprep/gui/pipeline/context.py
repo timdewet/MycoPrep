@@ -18,7 +18,10 @@ class EmbeddingOpts:
     model_type: str = "ResNet-18"           # "ResNet-18" | "Lightweight"
     model_source: str = "Auto (train/fine-tune)"
     model_path: str = ""                    # only used when model_source = "Use existing model"
-    in_channels: int = 1                    # 1 = brightfield only, 2 = + fluorescence
+    in_channels: int = 1                    # number of non-mask image channels
+    # Append the segmentation mask as an additional input channel. Default
+    # ON to match the Mtb reference (phase + ParB + mask).
+    include_mask: bool = True
     epochs: int = 50
     batch_size: int = 256
     include_library_crops: bool = True

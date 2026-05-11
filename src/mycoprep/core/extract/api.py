@@ -318,19 +318,37 @@ def extract_features_tiff(
             meta_npz = partial_dir / f"fov_{i:03d}__meta.json"
 
             if ckpt.exists() and df_npz.exists():
-                df = pd.read_parquet(df_npz)
-                if df_npz.exists():
-                    all_dfs.append(df)
+                # Validate that the cached crops match the H5 we're
+                # writing into. A mismatch usually means the user changed
+                # crop_size / channel count between runs without clearing
+                # the .partial dir; previously this fell over inside the
+                # broadcast assignment with an opaque numpy error.
+                stale_ckpt = False
                 if h5_file is not None and ckpt.exists():
                     with np.load(ckpt) as npz:
                         if "crops" in npz and npz["crops"].size:
                             arr = npz["crops"]
-                            crops_ds.resize(n_crops_written + arr.shape[0], axis=0)
-                            crops_ds[n_crops_written: n_crops_written + arr.shape[0]] = arr
-                            n_crops_written += arr.shape[0]
-                if meta_npz.exists():
-                    all_crop_meta.extend(json.loads(meta_npz.read_text()))
-                continue
+                            if arr.shape[1:] != crops_ds.shape[1:]:
+                                progress_cb(
+                                    0.05 + 0.9 * (i / max(n_fov, 1)),
+                                    f"FOV {i+1}/{n_fov}: stale checkpoint "
+                                    f"{arr.shape[1:]} vs h5 {crops_ds.shape[1:]} — "
+                                    f"re-extracting",
+                                )
+                                stale_ckpt = True
+                            else:
+                                crops_ds.resize(
+                                    n_crops_written + arr.shape[0], axis=0,
+                                )
+                                crops_ds[n_crops_written: n_crops_written + arr.shape[0]] = arr
+                                n_crops_written += arr.shape[0]
+                if not stale_ckpt:
+                    df = pd.read_parquet(df_npz)
+                    all_dfs.append(df)
+                    if meta_npz.exists():
+                        all_crop_meta.extend(json.loads(meta_npz.read_text()))
+                    continue
+                # Fall through to re-extract this FOV from scratch.
 
             fov_acq_time = fov_acq_times[i] if i < len(fov_acq_times) else None
 

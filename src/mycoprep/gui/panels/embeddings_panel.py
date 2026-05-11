@@ -85,10 +85,16 @@ class EmbeddingsPanel(QWidget):
         ))
 
         self.model_source = QComboBox()
-        self.model_source.addItems(["Auto (train/fine-tune)", "Use existing model"])
+        self.model_source.addItems([
+            "Auto (train/fine-tune)",
+            "Train from scratch",
+            "Use existing model",
+        ])
         self._source_helper = _with_helper(
             self.model_source,
-            "Auto: trains from scratch on the first run, fine-tunes on later runs. "
+            "Auto: trains from scratch on the first run, fine-tunes on later runs.\n"
+            "Train from scratch: ignores any existing library model and starts fresh "
+            "(needed when changing the channel set, since you can't re-shape conv1).\n"
             "Use existing: point to a trained .pth file.",
         )
         self._source_label = QLabel("Source:")
@@ -112,13 +118,26 @@ class EmbeddingsPanel(QWidget):
 
         self.in_channels = QComboBox()
         self.in_channels.addItems([
-            "Brightfield only (1ch)",
-            "Brightfield + fluorescence (2ch)",
+            "1 image channel (brightfield only)",
+            "2 image channels (BF + 1 fluor)",
+            "3 image channels (BF + 2 fluors)",
         ])
-        model_form.addRow("Channels:", _with_helper(
+        model_form.addRow("Image channels:", _with_helper(
             self.in_channels,
-            "Imaging channels fed to the encoder. Mask channel is always dropped. "
-            "Fluorescence is optional.",
+            "Number of non-mask image channels fed to the encoder, taken in "
+            "their H5 order. Set this to match how many imaging channels "
+            "your acquisition has.",
+        ))
+
+        self.include_mask = QCheckBox("Include segmentation mask channel")
+        self.include_mask.setChecked(True)
+        model_form.addRow("", _with_helper(
+            self.include_mask,
+            "Append the binarised mask as an extra input channel. The "
+            "MorphologicalProfiling_Mtb SupCon training used phase + ParB + "
+            "mask — the mask gives the encoder the segmentation prior for "
+            "free instead of forcing it to re-derive cell boundaries from "
+            "intensity. Default ON.",
         ))
 
         root.addWidget(model_box)
@@ -171,7 +190,7 @@ class EmbeddingsPanel(QWidget):
         self.model_source.currentIndexChanged.connect(self._refresh_model_path_enable)
 
         # Fan in option signals
-        for cb in (self.include_library_crops,):
+        for cb in (self.include_library_crops, self.include_mask):
             cb.toggled.connect(self._emit_options_changed)
         for sb in (self.epochs, self.batch_size):
             sb.valueChanged.connect(self._emit_options_changed)
@@ -184,14 +203,16 @@ class EmbeddingsPanel(QWidget):
             self.optionsChanged.emit()
 
     def _refresh_model_path_enable(self, _idx: int = 0) -> None:
-        use_existing = (
-            self.model_source.currentIndex() == 1 and not self._train_only
+        # The dropdown order is now Auto / Train from scratch / Use existing.
+        is_use_existing = (
+            "existing" in self.model_source.currentText().lower()
+            and not self._train_only
         )
-        self.model_path.setEnabled(use_existing)
-        self._browse_btn.setEnabled(use_existing)
-        self.epochs.setEnabled(not use_existing)
-        self.batch_size.setEnabled(not use_existing)
-        self.include_library_crops.setEnabled(not use_existing)
+        self.model_path.setEnabled(is_use_existing)
+        self._browse_btn.setEnabled(is_use_existing)
+        self.epochs.setEnabled(not is_use_existing)
+        self.batch_size.setEnabled(not is_use_existing)
+        self.include_library_crops.setEnabled(not is_use_existing)
 
     def set_train_only_mode(self, train_only: bool) -> None:
         """Hide source/model-path rows when the run is a library-only training job.
@@ -226,7 +247,8 @@ class EmbeddingsPanel(QWidget):
             model_type=self.model_type.currentText(),
             model_source=self.model_source.currentText(),
             model_path=self.model_path.text().strip(),
-            in_channels=2 if self.in_channels.currentIndex() == 1 else 1,
+            in_channels=int(self.in_channels.currentIndex()) + 1,
+            include_mask=self.include_mask.isChecked(),
             epochs=int(self.epochs.value()),
             batch_size=int(self.batch_size.value()),
             include_library_crops=self.include_library_crops.isChecked(),
@@ -239,6 +261,7 @@ class EmbeddingsPanel(QWidget):
             "model_source": self.model_source.currentText(),
             "model_path": self.model_path.text(),
             "in_channels": self.in_channels.currentIndex(),
+            "include_mask": self.include_mask.isChecked(),
             "epochs": int(self.epochs.value()),
             "batch_size": int(self.batch_size.value()),
             "include_library_crops": self.include_library_crops.isChecked(),
@@ -260,7 +283,11 @@ class EmbeddingsPanel(QWidget):
             if "model_path" in s:
                 self.model_path.setText(str(s["model_path"]))
             if "in_channels" in s:
-                self.in_channels.setCurrentIndex(int(s["in_channels"]))
+                idx = int(s["in_channels"])
+                idx = max(0, min(idx, self.in_channels.count() - 1))
+                self.in_channels.setCurrentIndex(idx)
+            if "include_mask" in s:
+                self.include_mask.setChecked(bool(s["include_mask"]))
             if "epochs" in s:
                 self.epochs.setValue(int(s["epochs"]))
             if "batch_size" in s:

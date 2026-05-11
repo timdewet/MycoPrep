@@ -29,8 +29,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .config import AutoencoderConfig
 from .dataset import HDF5CropDataset, split_by_fov
@@ -96,30 +96,175 @@ class SupConLoss(nn.Module):
         return -mean_log_prob_pos[valid].mean()
 
 
-def _gene_from_label(label: str) -> str:
-    """Extract the gene token from a condition label (first whitespace-split token)."""
-    label = str(label)
-    return label.split(maxsplit=1)[0] if label else ""
+def _maybe_align_config_to_checkpoint(
+    config, fine_tune: bool, progress_cb,
+) -> None:
+    """When fine-tuning, override config in_channels / include_mask to
+    match the saved checkpoint's conv1 input shape.
 
-
-def _build_label_map(dataset: HDF5CropDataset) -> dict[str, int]:
-    """Walk the dataset's cached metadata to enumerate unique gene labels.
-
-    Returns a {gene: int_label} mapping. Falls back to integer hash if
-    metadata is missing.
+    The saved checkpoint's input dimensionality is unchangeable — you
+    can't load 1-channel weights into a 2-channel conv. So if the user
+    has changed include_mask / image_channels between runs, we silently
+    align the config to the checkpoint and log it. The dataset (built
+    after this call) will then read the right number of channels.
     """
-    genes: set[str] = set()
+    if not (fine_tune and config.model_path and config.model_path.exists()):
+        return
+    try:
+        state = torch.load(
+            str(config.model_path), map_location="cpu", weights_only=True,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    ckpt_in = _peek_checkpoint_in_channels(state)
+    if ckpt_in is None:
+        return
+    cfg_in = config.total_in_channels()
+    if ckpt_in == cfg_in:
+        return
+    progress_cb(
+        0.005,
+        f"Fine-tune checkpoint expects {ckpt_in}-channel input "
+        f"({cfg_in} requested) — overriding config to match. Train from "
+        f"scratch (untick 'Use existing model') to change channel count.",
+    )
+    if config.image_channels is not None:
+        config.image_channels = None
+    desired_imgs = ckpt_in - (1 if config.include_mask else 0)
+    if desired_imgs >= 1:
+        config.in_channels = desired_imgs
+    else:
+        config.in_channels = ckpt_in
+        config.include_mask = False
+
+
+def _peek_checkpoint_in_channels(state: dict) -> Optional[int]:
+    """Return the input-channel count of a saved SupCon/AE checkpoint.
+
+    Looks at the conv1 weight (shape ``(out_c, in_c, k, k)``) at any of
+    the keys we use across architectures: ResNet-18 wraps the encoder
+    in ``encoder.0`` (Sequential), the lightweight encoder uses
+    ``encoder.0.0``. Returns None if no recognised key is present.
+    """
+    candidates = (
+        "encoder.0.weight",       # ResNet-18 encoder Sequential[0] = conv1
+        "encoder.0.0.weight",     # Lightweight encoder Sequential[0] = first block conv
+    )
+    for key in candidates:
+        if key in state:
+            shape = tuple(state[key].shape)
+            if len(shape) == 4:
+                return int(shape[1])
+    return None
+
+
+def _build_warmup_cosine(
+    optimizer: torch.optim.Optimizer,
+    warmup_epochs: int,
+    total_epochs: int,
+):
+    """Linear warmup → cosine decay learning-rate schedule.
+
+    ``warmup_epochs == 0`` collapses to pure cosine. Mirrors the Mtb
+    reference's ``warmup_epochs=5`` then cosine.
+    """
+    if warmup_epochs <= 0:
+        return CosineAnnealingLR(optimizer, T_max=max(1, total_epochs))
+    cosine_epochs = max(1, total_epochs - warmup_epochs)
+    warmup = LambdaLR(
+        optimizer,
+        lr_lambda=lambda e: (e + 1) / float(warmup_epochs),
+    )
+    cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    return SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+    )
+
+
+def _resolve_class_label(meta: dict, source: str = "auto") -> str:
+    """Pick the SupCon class label for a single cell.
+
+    ``source = "auto"`` (default) prefers the H5 ``genes`` field when
+    populated, falls back to ``drugs`` (combined with concentration so
+    each drug-dose is its own class), then to the full ``condition_label``.
+    ``source = "gene"`` / ``"drug"`` forces the choice.
+    """
+    if source in ("auto", "gene"):
+        g = str(meta.get("gene", "") or "").strip()
+        if g:
+            return g
+        if source == "gene":
+            return ""
+    if source in ("auto", "drug"):
+        d = str(meta.get("drug", "") or "").strip()
+        if d:
+            conc = str(meta.get("concentration", "") or "").strip()
+            return f"{d}_{conc}" if conc else d
+        if source == "drug":
+            return ""
+    # Last resort: the full condition label, NOT just the first token,
+    # so labels like "ATc+ rpoB" don't collapse all "ATc+" cells into
+    # one class.
+    return str(meta.get("condition_label", "") or "").strip()
+
+
+def _per_cell_class_labels(
+    dataset: HDF5CropDataset, source: str = "auto",
+) -> list[str]:
+    """Return one class label per cell in the dataset's index order."""
+    n = len(dataset)
+    out: list[str] = [""] * n
     if hasattr(dataset, "_cached_meta"):
-        for meta_dict in dataset._cached_meta:
-            if "condition_labels" in meta_dict:
-                for s in meta_dict["condition_labels"]:
-                    genes.add(_gene_from_label(s))
-    if not genes:
-        # Streaming-mode fallback: scan a sample.
-        for i in range(min(len(dataset), 5000)):
-            _, m = dataset[i]
-            genes.add(_gene_from_label(m.get("condition_label", "")))
-    return {g: i for i, g in enumerate(sorted(genes))}
+        for i in range(n):
+            global_idx = int(dataset._indices[i])
+            file_idx, local_idx = dataset._global_to_file(global_idx)
+            mdict = dataset._cached_meta[file_idx]
+            stub = {
+                "condition_label": (
+                    str(mdict["condition_labels"][local_idx])
+                    if "condition_labels" in mdict else ""
+                ),
+                "gene": (
+                    str(mdict["genes"][local_idx])
+                    if "genes" in mdict else ""
+                ),
+                "drug": (
+                    str(mdict["drugs"][local_idx])
+                    if "drugs" in mdict else ""
+                ),
+                "concentration": (
+                    str(mdict["concentrations"][local_idx])
+                    if "concentrations" in mdict else ""
+                ),
+            }
+            out[i] = _resolve_class_label(stub, source)
+        return out
+    for i in range(n):
+        _, m = dataset[i]
+        out[i] = _resolve_class_label(m, source)
+    return out
+
+
+def _build_label_map(
+    dataset: HDF5CropDataset,
+    source: str = "auto",
+    min_cells_per_class: int = 1,
+) -> tuple[dict[str, int], list[str]]:
+    """Enumerate unique class labels and return ``(label_map, per_cell_labels)``.
+
+    Classes with fewer than ``min_cells_per_class`` cells are dropped
+    from the map; their cells get an empty-string label and the SupCon
+    training loop will filter them out via ``class_kept_mask``.
+    """
+    per_cell = _per_cell_class_labels(dataset, source=source)
+    counts: dict[str, int] = {}
+    for c in per_cell:
+        if not c:
+            continue
+        counts[c] = counts.get(c, 0) + 1
+    keep = sorted(c for c, n in counts.items() if n >= min_cells_per_class)
+    label_map = {c: i for i, c in enumerate(keep)}
+    return label_map, per_cell
 
 
 def train_supcon(
@@ -154,6 +299,12 @@ def train_supcon(
     temperature = float(getattr(config, "temperature", 0.07))
     projection_dim = int(getattr(config, "projection_dim", 128))
 
+    # Resolve fine-tune channel mismatch BEFORE building the dataset
+    # so the dataset's channel selection matches what the model will
+    # accept. (Otherwise dataset returns N+1 channels and the model
+    # built later only takes N → "expected N channels, got N+1".)
+    _maybe_align_config_to_checkpoint(config, fine_tune, progress_cb)
+
     progress_cb(0.0, "Splitting data by FOV...")
     train_idx, val_idx = split_by_fov(h5_paths, config.val_fraction)
 
@@ -161,6 +312,8 @@ def train_supcon(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,  # GPU-batched augmentation in the loop produces 2 views
         indices=train_idx,
     )
@@ -168,23 +321,68 @@ def train_supcon(
         h5_paths,
         target_size=config.crop_size,
         in_channels=config.in_channels,
+        image_channels=config.image_channels,
+        include_mask=config.include_mask,
         augment=False,
         indices=val_idx,
     )
 
-    label_map = _build_label_map(train_ds)
+    label_source = str(getattr(config, "supcon_label_source", "auto"))
+    min_cells = max(1, int(getattr(config, "min_cells_per_class", 50)))
+    label_map, train_per_cell = _build_label_map(
+        train_ds, source=label_source, min_cells_per_class=min_cells,
+    )
     n_classes = len(label_map)
     if n_classes < 2:
         raise RuntimeError(
-            f"SupCon needs ≥ 2 distinct gene labels in the training data, "
-            f"found {n_classes}. Check that condition_labels are populated."
+            f"SupCon needs ≥ 2 distinct class labels in the training data "
+            f"(after dropping classes with < {min_cells} cells), found "
+            f"{n_classes}. Check that the H5 'genes' / 'drugs' datasets are "
+            f"populated, or lower min_cells_per_class."
         )
+
+    # Per-cell integer labels for the kept classes; -1 marks cells
+    # whose class was dropped, so they're excluded from sampling.
+    train_int_labels = np.array(
+        [label_map.get(c, -1) for c in train_per_cell], dtype=np.int64,
+    )
+    kept_mask = train_int_labels >= 0
+    n_dropped = int((~kept_mask).sum())
+
+    # Class-frequency stats — surfaced upfront so weird splits are visible.
+    class_counts: dict[int, int] = {}
+    for k in train_int_labels[kept_mask]:
+        class_counts[int(k)] = class_counts.get(int(k), 0) + 1
+    counts_arr = np.array(list(class_counts.values()), dtype=np.int64)
     progress_cb(
         0.02,
-        f"Train: {len(train_ds)} cells, Val: {len(val_ds)} cells, "
-        f"{n_classes} gene classes "
-        + ("(crops cached in RAM)" if getattr(train_ds, "_use_cache", False)
-           else "(streaming)"),
+        f"Train: {len(train_ds)} cells ({n_dropped} dropped, "
+        f"{kept_mask.sum()} kept), Val: {len(val_ds)} cells, "
+        f"{n_classes} classes "
+        f"(min={int(counts_arr.min())}, median={int(np.median(counts_arr))}, "
+        f"max={int(counts_arr.max())}) "
+        + ("[crops cached in RAM]" if getattr(train_ds, "_use_cache", False)
+           else "[streaming]"),
+    )
+
+    # WeightedRandomSampler with inverse-frequency weights, capped at
+    # ``max_samples_per_class`` so a rare class can't dominate via huge
+    # weights and a common class can't drown out the batch. Mirrors the
+    # Mtb reference's class-balancing strategy.
+    max_per_class = max(1, int(getattr(config, "max_samples_per_class", 5000)))
+    inv_freq = np.zeros(len(train_int_labels), dtype=np.float64)
+    for k, cnt in class_counts.items():
+        # Per-cell weight = 1/count, capped so the per-class total
+        # doesn't exceed max_per_class units.
+        w = 1.0 / cnt
+        cap = max_per_class / max(1, cnt)
+        per_cell_w = min(w, cap)
+        inv_freq[(train_int_labels == k)] = per_cell_w
+    inv_freq[~kept_mask] = 0.0
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(inv_freq, dtype=torch.double),
+        num_samples=int(kept_mask.sum()),
+        replacement=True,
     )
 
     # Worker count + loader settings: same logic as train_autoencoder.
@@ -205,18 +403,16 @@ def train_supcon(
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(train_ds, sampler=sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
-    # Build model via the config dispatch — supports both
-    # ``supcon_resnet18`` (ImageNet-pretrained ResNet-18 backbone) and
-    # ``supcon_lightweight`` (from-scratch 5-block CNN).
+    # Config has already been aligned to the checkpoint's conv1 input
+    # shape (see _maybe_align_config_to_checkpoint earlier in this fn).
     model = config.build_model()
     if fine_tune and config.model_path and config.model_path.exists():
-        # Existing model is the encoder-only state dict; load into encoder.
-        state = torch.load(str(config.model_path), map_location="cpu", weights_only=True)
-        # If the saved file is a full SupCon model (encoder + head), it'll
-        # match all keys; if it's an autoencoder encoder, partial load is OK.
+        state = torch.load(
+            str(config.model_path), map_location="cpu", weights_only=True,
+        )
         model.load_state_dict(state, strict=False)
         progress_cb(0.03, f"Loaded model from {config.model_path.name}")
 
@@ -228,8 +424,10 @@ def train_supcon(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr, weight_decay=config.weight_decay,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    warmup_epochs = max(0, int(getattr(config, "warmup_epochs", 5)))
+    scheduler = _build_warmup_cosine(optimizer, warmup_epochs, epochs)
     criterion = SupConLoss(temperature=temperature)
+    early_stop_patience = max(0, int(getattr(config, "early_stop_patience", 15)))
 
     best_val_loss = float("inf")
     train_losses: list[float] = []
@@ -250,10 +448,12 @@ def train_supcon(
     def _labels_for_batch(metas) -> torch.Tensor:
         ys = []
         for m in metas:
-            g = _gene_from_label(m.get("condition_label", ""))
-            ys.append(label_map.get(g, -1))
+            cls = _resolve_class_label(m, source=label_source)
+            ys.append(label_map.get(cls, -1))
         return torch.as_tensor(ys, dtype=torch.long, device=device)
 
+    epochs_no_improve = 0
+    stopped_early_at: Optional[int] = None
     for epoch in range(epochs):
         if (
             not fine_tune
@@ -263,7 +463,14 @@ def train_supcon(
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=lr, weight_decay=config.weight_decay,
             )
-            scheduler = CosineAnnealingLR(optimizer, T_max=epochs - epoch)
+            # Re-arm warmup on the freshly-unfrozen network so the bigger
+            # parameter set doesn't get hit with a full-magnitude lr step
+            # immediately.
+            scheduler = _build_warmup_cosine(
+                optimizer,
+                min(warmup_epochs, max(0, epochs - epoch - 1)),
+                epochs - epoch,
+            )
             progress_cb(epoch / epochs, f"Epoch {epoch}: unfreezing all layers")
 
         model.train()
@@ -340,9 +547,12 @@ def train_supcon(
 
         if v_loss < best_val_loss:
             best_val_loss = v_loss
+            epochs_no_improve = 0
             # Save the full model (encoder + head) so fine-tuning can resume;
             # extract.py loads only the encoder portion via .encode().
             torch.save(model.state_dict(), output_dir / "best_model.pth")
+        else:
+            epochs_no_improve += 1
 
         elapsed = time.time() - t0
         progress_cb(
@@ -351,6 +561,19 @@ def train_supcon(
             f"train: {train_loss:.5f}, val: {v_loss:.5f} "
             f"(epoch {time.time() - epoch_t0:.0f}s, total {elapsed/60:.1f}min)",
         )
+
+        if (
+            early_stop_patience > 0
+            and epochs_no_improve >= early_stop_patience
+        ):
+            stopped_early_at = epoch + 1
+            progress_cb(
+                0.05 + 0.90 * (epoch + 1) / epochs,
+                f"Early stopping at epoch {epoch + 1} — "
+                f"val loss hasn't improved in {early_stop_patience} epochs "
+                f"(best={best_val_loss:.5f}).",
+            )
+            break
 
     torch.save(model.state_dict(), output_dir / "final_model.pth")
 
@@ -380,10 +603,13 @@ def train_supcon(
         "best_val_loss": best_val_loss,
         "final_train_loss": train_losses[-1] if train_losses else None,
         "final_val_loss": val_losses[-1] if val_losses else None,
-        "epochs_trained": epochs,
+        "epochs_trained": stopped_early_at if stopped_early_at else epochs,
+        "stopped_early_at": stopped_early_at,
         "train_cells": len(train_ds),
         "val_cells": len(val_ds),
         "n_classes": n_classes,
+        "label_source": label_source,
+        "min_cells_per_class": min_cells,
         "model_path": str(output_dir / "best_model.pth"),
         "elapsed_seconds": time.time() - t0,
         "loss": "supcon",

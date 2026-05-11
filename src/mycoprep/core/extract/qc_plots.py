@@ -369,6 +369,8 @@ _MORPHOLOGY_COLS_PREFERRED = [
     "width_max_um",
     "width_min_um",
     "width_std_um",
+    "width_amplitude_um",
+    "width_variation",
     "area_um2_subpixel",
     "area_um2",
     "perimeter_um_subpixel",
@@ -376,6 +378,20 @@ _MORPHOLOGY_COLS_PREFERRED = [
     "eccentricity",
     "solidity",
     "sinuosity",
+    "aspect_ratio",
+    "circularity_subpixel",
+    "roundness",
+    "pole_width_um",
+    "pole_taper",
+    "angularity_mean",
+    "angularity_max",
+    "angularity_median",
+    "angularity_std",
+    "angularity_amplitude",
+    "angularity_variation",
+    "curvature_mean",
+    "curvature_std",
+    "curvature_max",
     "feret_diameter_max_um",
     "major_axis_length_um",
     "minor_axis_length_um",
@@ -540,10 +556,35 @@ def _subsample_stratified(df, max_n, group_col, rng):
     return __import__("pandas").concat(parts, ignore_index=True)
 
 
-def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
-                       min_cluster_size=15, random_state=42,
-                       batch_labels=None):
-    """PCA → [Harmony] → UMAP → HDBSCAN.  Returns (embedding_2d, cluster_labels)."""
+def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
+                       min_cluster_size=3, random_state=42,
+                       batch_labels=None,
+                       *,
+                       n_consensus_runs: int = 25,
+                       pca_threshold_features: int = 100):
+    """[PCA] → [Harmony] → consensus UMAP+HDBSCAN → (embedding_2d, cluster_labels).
+
+    Mirrors the MorphologicalProfiling_Mtb R pipeline's stability strategy:
+    UMAP+HDBSCAN is rerun with ``n_consensus_runs`` different random seeds,
+    a co-association proportion matrix is built across runs, and a single
+    stable partition is recovered by hierarchical clustering on
+    ``1 − co_assoc`` with ``k`` picked by silhouette in
+    ``[2, min(8, N-1)]``. The 2D embedding for plotting comes from the
+    ``random_state``-seeded run so the picture is reproducible.
+
+    PCA is skipped when ``n_features <= pca_threshold_features`` — UMAP
+    handles ~30–60-D inputs directly and PCA-to-95%-variance silently
+    drops the low-variance shape axes (``width_std``, ``sinuosity`` …)
+    that carry the discriminative phenotype signal.
+
+    Defaults (``n_neighbors=3``, ``min_dist=0``, ``min_cluster_size=3``)
+    match the Mtb R config; they capture local structure rather than
+    dissolving into global geometry.
+
+    Harmony, when batch labels are present, uses ``nclust = min(max(2,
+    n_batches), 5)`` instead of an adaptive ``N // 5``-based heuristic
+    that over-aligned and erased biology on small profile counts.
+    """
     import numpy as np
     from sklearn.cluster import HDBSCAN
     from sklearn.decomposition import PCA
@@ -554,45 +595,136 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=15, min_dist=0.1,
         raise ImportError("umap-learn is required for clustering plots")
 
     n_samples, n_features = X_scaled.shape
-    n_components = min(n_features, n_samples, 50)
-    if n_components >= 2:
-        pca = PCA(n_components=min(n_components, 0.95), random_state=random_state)
-        X_pca = pca.fit_transform(X_scaled)
-    else:
-        X_pca = X_scaled
 
-    # Harmony batch correction: align PCA embeddings across runs.
+    # Skip PCA on low-D inputs (typical: 28–60-D shape S-scores). UMAP
+    # handles them directly and PCA would discard low-variance axes that
+    # carry phenotype signal. Keep PCA only when the input is genuinely
+    # high-D (e.g. 512-D CNN embeddings), in which case it both denoises
+    # and accelerates Harmony.
+    if n_features > pca_threshold_features:
+        n_components = min(n_features, n_samples, 50)
+        if n_components >= 2:
+            pca = PCA(
+                n_components=min(n_components, 0.95),
+                random_state=random_state,
+            )
+            X_proc = pca.fit_transform(X_scaled)
+        else:
+            X_proc = X_scaled
+    else:
+        X_proc = X_scaled
+
     if batch_labels is not None:
         unique_batches = np.unique(batch_labels)
-        if len(unique_batches) >= 2:
+        n_batches = len(unique_batches)
+        if n_batches >= 2:
             try:
                 import harmonypy
                 import pandas as pd
 
                 ho = harmonypy.run_harmony(
-                    X_pca,
+                    X_proc,
                     pd.DataFrame({"run_id": batch_labels}),
                     vars_use="run_id",
                     max_iter_harmony=20,
-                    nclust=min(max(2, n_samples // 5), 20),
+                    # Conservative pinned nclust — anchored on the actual
+                    # batch count, capped at 5. The previous adaptive
+                    # ``min(max(2, N//5), 20)`` over-aligned on small N
+                    # and could erase real biology when run/condition
+                    # confounding was partial.
+                    nclust=min(max(2, n_batches), 5),
                 )
-                X_pca = ho.Z_corr
+                X_proc = ho.Z_corr
             except ImportError:
                 pass
 
-    effective_neighbors = min(n_neighbors, n_samples - 1)
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=max(2, effective_neighbors),
-        min_dist=min_dist,
-        random_state=random_state,
-        n_jobs=1,
-    )
-    embedding = reducer.fit_transform(X_pca)
+    effective_neighbors = max(2, min(n_neighbors, n_samples - 1))
+    effective_min_cluster = max(2, min(min_cluster_size, n_samples // 2))
 
-    effective_min_cluster = min(min_cluster_size, max(2, n_samples // 10))
-    clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
-    labels = clusterer.fit_predict(embedding)
+    def _single_run(seed: int):
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=effective_neighbors,
+            min_dist=min_dist,
+            random_state=seed,
+            n_jobs=1,
+        )
+        emb = reducer.fit_transform(X_proc)
+        clusterer = HDBSCAN(min_cluster_size=effective_min_cluster, copy=False)
+        return emb, clusterer.fit_predict(emb)
+
+    # Single-shot path for tiny datasets where consensus is meaningless.
+    if n_samples < 6 or n_consensus_runs <= 1:
+        return _single_run(random_state)
+
+    # Consensus: gather labels across many seeds, compute pairwise
+    # co-association proportion, hclust, pick k by silhouette.
+    embedding, _ = _single_run(random_state)
+
+    label_runs: list[np.ndarray] = []
+    seeds = [random_state] + list(range(random_state + 1,
+                                        random_state + n_consensus_runs))
+    for seed in seeds:
+        if seed == random_state:
+            _, lbl = _single_run(seed)
+        else:
+            _, lbl = _single_run(seed)
+        # Remap HDBSCAN noise label (-1) to unique negative IDs per
+        # sample so two noise points are NOT counted as co-clustered.
+        lbl = np.asarray(lbl).astype(np.int64).copy()
+        noise = lbl == -1
+        if noise.any():
+            offset = int(lbl.max()) + 1 if (lbl >= 0).any() else 0
+            lbl[noise] = -(offset + 1 + np.arange(int(noise.sum())))
+        label_runs.append(lbl)
+
+    L = np.stack(label_runs, axis=1)  # (n_samples, n_runs)
+    co_assoc = np.zeros((n_samples, n_samples), dtype=np.float64)
+    for r in range(L.shape[1]):
+        col = L[:, r][:, None]
+        co_assoc += (col == col.T).astype(np.float64)
+    co_assoc /= L.shape[1]
+    consensus_dist = 1.0 - co_assoc
+    np.fill_diagonal(consensus_dist, 0.0)
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+        from sklearn.metrics import silhouette_score
+
+        condensed = squareform(consensus_dist, checks=False)
+        Z = linkage(condensed, method="average")
+
+        scores: list[tuple[int, float]] = []
+        k_max = min(8, n_samples - 1)
+        for k in range(2, k_max + 1):
+            cand = fcluster(Z, t=k, criterion="maxclust")
+            if len(np.unique(cand)) < 2:
+                continue
+            try:
+                score = silhouette_score(
+                    consensus_dist, cand, metric="precomputed",
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            scores.append((k, score))
+
+        if scores:
+            best_score = max(s for _, s in scores)
+            # Bias toward parsimony: pick the SMALLEST k whose silhouette
+            # is within ``tol`` of the maximum. Without this, silhouette
+            # routinely splits a single dense biological cluster into
+            # 2–3 noise-driven sub-clusters because the within-cluster
+            # consensus distance is tiny.
+            tol = 0.03
+            eligible = [k for k, s in scores if s >= best_score - tol]
+            best_k = min(eligible) if eligible else scores[0][0]
+            labels = fcluster(Z, t=best_k, criterion="maxclust") - 1
+        else:
+            labels = label_runs[0]
+    except Exception:  # noqa: BLE001
+        # Fallback: just use the labels from the seeded run.
+        labels = label_runs[0]
 
     return embedding, labels
 
@@ -624,8 +756,9 @@ def _embed_profiles(profiles, *, batch_correct: bool = True):
     if n >= 6:
         emb, lbl = _run_umap_hdbscan(
             X,
-            n_neighbors=min(5, n - 1),
-            min_cluster_size=max(2, n // 5),
+            n_neighbors=min(3, n - 1),
+            min_dist=0.0,
+            min_cluster_size=3,
             batch_labels=batch_labels if has_batches else None,
         )
     else:
@@ -1963,10 +2096,352 @@ def render_embeddings_html(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _ot_sidecar_path(html_path: "Path") -> "Path":
+    """Sidecar location for the cached OT distance matrix + group metadata."""
+    return Path(html_path).with_suffix(".ot_distance.parquet")
+
+
+def _save_ot_sidecar(
+    html_path: "Path",
+    D: "np.ndarray",
+    group_meta: list[dict],
+    params: "dict | None" = None,
+) -> None:
+    """Persist the OT distance matrix as a parquet so downstream analyses
+    (ranked matches, permutation tests, recolouring) don't recompute it.
+
+    Schema: one row per group, columns = group_meta keys + ``d_<idx>``
+    columns holding the distance to every other group. Indexed by row
+    position. ``params`` is a dict of the parameters that produced the
+    matrix (n_cells, sinkhorn_reg, pca_dims, batch_correct …) — saved
+    as a sibling JSON so cache lookups can validate a hit. Best-effort
+    — silently swallows write failures.
+    """
+    import json
+    import pandas as pd
+
+    try:
+        meta_df = pd.DataFrame(group_meta)
+        n = D.shape[0]
+        for j in range(n):
+            meta_df[f"d_{j}"] = D[:, j]
+        sidecar = _ot_sidecar_path(html_path)
+        meta_df.to_parquet(sidecar, index=False)
+        if params is not None:
+            sidecar.with_suffix(sidecar.suffix + ".params.json").write_text(
+                json.dumps(params, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _embedding_ot_cache_path(emb_path: "Path") -> "Path":
+    """Stable cache location next to the embeddings parquet for the
+    precomputed OT distance matrix written by ``EmbeddingsStage``.
+    """
+    return Path(emb_path).with_name(
+        Path(emb_path).stem + ".ot_default.ot_distance.parquet",
+    )
+
+
+def _features_ot_cache_path(library_dir: "Path | None", species: str) -> "Path":
+    """Stable cache location for the features-OT distance matrix.
+
+    Lives under the library's ``features_ot_cache/`` subdir, keyed by
+    species (since each species' library is queried separately and has
+    its own condition / control set).
+    """
+    from .feature_library import FeatureLibrary
+
+    lib = FeatureLibrary(library_dir)
+    cache_dir = lib.library_dir / "features_ot_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() else "_" for c in (species or "all"))
+    return cache_dir / f"{safe}.ot_distance.parquet"
+
+
+def _try_load_ot_cache(
+    cache_sidecar: "Path",
+    requested_params: dict,
+) -> "tuple[np.ndarray, list[dict]] | None":
+    """Return ``(D, group_meta)`` if the cache exists and its stored
+    params match the requested ones. ``None`` on miss / stale cache.
+    """
+    import json
+
+    import numpy as np
+    import pandas as pd
+
+    if not cache_sidecar.exists():
+        return None
+    params_path = cache_sidecar.with_suffix(
+        cache_sidecar.suffix + ".params.json",
+    )
+    if params_path.exists():
+        try:
+            stored = json.loads(params_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        for k, v in requested_params.items():
+            if str(stored.get(k)) != str(v):
+                return None
+    try:
+        df = pd.read_parquet(cache_sidecar)
+    except Exception:  # noqa: BLE001
+        return None
+    d_cols = sorted(
+        [c for c in df.columns if c.startswith("d_")],
+        key=lambda c: int(c.split("_", 1)[1]),
+    )
+    if not d_cols:
+        return None
+    D = df[d_cols].to_numpy(dtype=np.float64)
+    meta = df.drop(columns=d_cols).to_dict("records")
+    return D, meta
+
+
+def precompute_features_ot_cache(
+    library_dir: "Path | None",
+    species: str,
+    *,
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    pca_dims_before_ot: int = 0,
+    batch_correct: bool = True,
+    progress_cb=None,
+) -> "Path | None":
+    """Precompute the features-OT distance matrix for one species.
+
+    Called by ``ExtractStage`` after a successful feature library
+    registration so the Feature Profiles (OT) view in the Analysis
+    panel renders instantly. Cached at
+    ``<library>/features_ot_cache/<species>.ot_distance.parquet`` and
+    keyed by (params, library mtime). Best-effort — silently skips
+    when there are < 3 groups (typical for a single-condition library).
+    """
+    out_path = Path(_features_ot_cache_path(library_dir, species)).with_name(
+        _features_ot_cache_path(library_dir, species).stem + ".html",
+    )
+    try:
+        render_features_ot_html(
+            out_path,
+            library_dir=library_dir,
+            species=species,
+            n_cells_per_condition=n_cells_per_condition,
+            sinkhorn_reg=sinkhorn_reg,
+            pca_dims_before_ot=pca_dims_before_ot,
+            batch_correct=batch_correct,
+            progress_cb=progress_cb,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    cache = _features_ot_cache_path(library_dir, species)
+    return cache if cache.exists() else None
+
+
+def precompute_embedding_ot_cache(
+    emb_path: "Path",
+    *,
+    library_dir: "Path | None" = None,
+    species: str = "",
+    model_type: str = "",
+    n_cells_per_condition: int = 400,
+    sinkhorn_reg: float = 0.05,
+    pca_dims_before_ot: int = 50,
+    batch_correct: bool = True,
+    progress_cb=None,
+) -> "Path | None":
+    """Precompute the OT distance matrix for an embeddings parquet.
+
+    Called by ``EmbeddingsStage`` at the end of training so the Analysis
+    panel's first OT view render is instant — the expensive Sinkhorn
+    loop has already happened. Writes the cache to the stable location
+    returned by :func:`_embedding_ot_cache_path`. Renders into a
+    temporary HTML file (which gets discarded) only because the
+    distance computation is currently embedded inside
+    :func:`render_embeddings_ot_html`; the sidecar is the artifact
+    that matters.
+    """
+    import tempfile
+
+    out_path = Path(emb_path).with_name(
+        Path(emb_path).stem + ".ot_default.html",
+    )
+    try:
+        render_embeddings_ot_html(
+            out_path,
+            library_dir=library_dir,
+            species=species,
+            model_type=model_type,
+            n_cells_per_condition=n_cells_per_condition,
+            sinkhorn_reg=sinkhorn_reg,
+            pca_dims_before_ot=pca_dims_before_ot,
+            batch_correct=batch_correct,
+            progress_cb=progress_cb,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    cache = _embedding_ot_cache_path(emb_path)
+    return cache if cache.exists() else None
+
+
+def _ot_render_from_distance(
+    out_path: "Path",
+    *,
+    D: "np.ndarray",
+    group_meta: list[dict],
+    color_by: str,
+    highlight_genes: "list[str] | None",
+    n_neighbors: int,
+    sinkhorn_reg: float,
+    pathway_csv: "Path | None",
+    has_multi_runs: bool,
+    batch_correct: bool,
+    n_cells_per_condition: int,
+    label: str,
+    extra_title: str = "",
+    progress_cb=None,
+) -> "Path | None":
+    """UMAP + Plotly render given a precomputed ``D`` and ``group_meta``.
+
+    Shared by :func:`render_embeddings_ot_html` and
+    :func:`render_features_ot_html` so both benefit from caching, and
+    so a cache hit doesn't need to recompute the expensive Sinkhorn
+    matrix.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if progress_cb is None:
+        progress_cb = lambda f: None
+
+    n_groups = D.shape[0]
+    if n_groups < 3:
+        return None
+
+    try:
+        import umap
+        eff_neighbors = max(2, min(int(n_neighbors), n_groups - 1))
+        coords = umap.UMAP(
+            n_components=2,
+            n_neighbors=eff_neighbors,
+            min_dist=0.1,
+            metric="precomputed",
+            random_state=42,
+            n_jobs=1,
+        ).fit_transform(D)
+    except Exception:  # noqa: BLE001
+        from sklearn.manifold import MDS
+        coords = MDS(
+            n_components=2, dissimilarity="precomputed", random_state=42,
+        ).fit_transform(D)
+
+    progress_cb(0.95)
+
+    plot_df = pd.DataFrame(group_meta)
+    plot_df["x"] = coords[:, 0]
+    plot_df["y"] = coords[:, 1]
+
+    pathway_map = _load_pathway_map(pathway_csv)
+    if pathway_map:
+        plot_df["pathway"] = (
+            plot_df["gene"].astype(str).str.lower().map(pathway_map)
+            .fillna("Unannotated")
+        )
+    elif color_by == "pathway":
+        plot_df["pathway"] = "Unannotated"
+
+    try:
+        import plotly.express as px
+
+        color_col = "gene"
+        if color_by == "run_id":
+            color_col = "run_id"
+        elif color_by == "pathway" and "pathway" in plot_df.columns:
+            color_col = "pathway"
+        hover = [
+            c for c in [
+                "condition_label", "gene", "run_id", "pathway", "n_cells_used",
+            ]
+            if c in plot_df.columns and c != color_col
+        ]
+        fig = px.scatter(
+            plot_df, x="x", y="y", color=color_col, hover_data=hover,
+        )
+
+        if highlight_genes:
+            hl_set = {g.lower() for g in highlight_genes}
+            mask = plot_df["gene"].str.lower().isin(hl_set)
+            fig.update_traces(marker=dict(size=8, opacity=0.3))
+            hl = plot_df[mask]
+            if not hl.empty:
+                fig.add_scatter(
+                    x=hl["x"], y=hl["y"], mode="markers",
+                    marker=dict(size=12, color="red", opacity=1.0),
+                    text=hl["condition_label"], hoverinfo="text",
+                    name="Highlighted",
+                )
+
+        harmony_status = (
+            (" · Harmony" if batch_correct else " · raw")
+            if has_multi_runs else ""
+        )
+        title = (
+            f"{label} — Optimal Transport "
+            f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
+            f"{harmony_status}"
+            f" · {n_groups} groups × {n_cells_per_condition} cells"
+            f" · n_neighbors={max(2, min(int(n_neighbors), n_groups - 1))}"
+        )
+        if extra_title:
+            title += extra_title
+        fig.update_layout(
+            title=title,
+            xaxis_title="UMAP 1 (from OT distance)",
+            yaxis_title="UMAP 2 (from OT distance)",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=60, b=40),
+        )
+        fig.write_html(
+            str(out_path), include_plotlyjs=True, default_height="100vh",
+        )
+        _make_plot_html_fullheight(out_path)
+        progress_cb(1.0)
+        return out_path
+    except ImportError:
+        return None
+
+
+def _load_pathway_map(pathway_csv: "Path | None") -> dict[str, str]:
+    """Load a gene → pathway mapping from a CSV.
+
+    Accepts any CSV with at least a ``gene`` column and a ``pathway``
+    column (case-insensitive). Genes are matched case-insensitively
+    downstream. Returns ``{}`` on missing file / read failure.
+    """
+    if pathway_csv is None:
+        return {}
+    try:
+        import pandas as pd
+        df = pd.read_csv(pathway_csv)
+        cols = {c.lower(): c for c in df.columns}
+        if "gene" not in cols or "pathway" not in cols:
+            return {}
+        gcol, pcol = cols["gene"], cols["pathway"]
+        return {
+            str(g).lower(): str(p)
+            for g, p in zip(df[gcol], df[pcol])
+            if str(g).strip()
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _sinkhorn_divergence_matrix(
     point_clouds: list["np.ndarray"],
     reg: float = 0.1,
-    n_iter_max: int = 2000,
+    n_iter_max: int = 1000,
     progress_cb=None,
 ) -> "np.ndarray":
     """Pairwise Sinkhorn divergence between point clouds.
@@ -2057,6 +2532,9 @@ def render_embeddings_ot_html(
     model_type: str = "",
     n_cells_per_condition: int = 400,
     sinkhorn_reg: float = 0.05,
+    n_neighbors: int = 5,
+    pca_dims_before_ot: int = 50,
+    pathway_csv: "Path | None" = None,
     progress_cb=None,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings with **Optimal Transport** distance.
@@ -2132,6 +2610,42 @@ def render_embeddings_ot_html(
         "run_id" in df.columns and df["run_id"].nunique() > 1
     )
 
+    # Cache key: parameters that affect the OT distance matrix. Anything
+    # downstream of D (n_neighbors, color_by, pathway_csv, highlight)
+    # can vary freely without invalidating. Embedding-parquet mtime
+    # invalidates the cache after a re-extraction.
+    cache_params = {
+        "n_cells_per_condition": int(n_cells_per_condition),
+        "sinkhorn_reg": float(sinkhorn_reg),
+        "pca_dims_before_ot": int(pca_dims_before_ot or 0),
+        "batch_correct": bool(batch_correct),
+        "emb_mtime_ns": emb_path.stat().st_mtime_ns,
+    }
+    cache_sidecar = _embedding_ot_cache_path(emb_path)
+    cached = _try_load_ot_cache(cache_sidecar, cache_params)
+    if cached is not None:
+        D, group_meta = cached
+        # Mirror the cached matrix to the per-render sidecar so the
+        # Analysis panel's "Ranked matches" / "Permutation test"
+        # buttons resolve it the same as a freshly-rendered view.
+        _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        return _ot_render_from_distance(
+            out_path,
+            D=D, group_meta=group_meta,
+            color_by=color_by, highlight_genes=highlight_genes,
+            n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+            pathway_csv=pathway_csv,
+            has_multi_runs=has_multi_runs,
+            batch_correct=batch_correct,
+            n_cells_per_condition=n_cells_per_condition,
+            label="CNN Embeddings",
+            extra_title=(
+                f" · model: {emb_path.parent.name}"
+                if emb_path.parent.name != "embeddings" else ""
+            ),
+            progress_cb=progress_cb,
+        )
+
     # Detect controls (same as the mean-based renderer).
     control_genes: set[str] = set()
     try:
@@ -2184,7 +2698,16 @@ def render_embeddings_ot_html(
         except Exception:  # noqa: BLE001
             pass
 
-    df["gene"] = df["condition_label"].str.split().str[0]
+    # Prefer the per-cell ``gene`` column written by extract.py; fall
+    # back to splitting condition_label on whitespace for older parquets.
+    if "gene" in df.columns and df["gene"].astype(str).str.len().gt(0).any():
+        df["gene"] = df["gene"].astype(str)
+        df["gene"] = df["gene"].where(
+            df["gene"].str.len() > 0,
+            df["condition_label"].str.split().str[0],
+        )
+    else:
+        df["gene"] = df["condition_label"].str.split().str[0]
 
     # Per-run NT centering at the cell level. Done before OT, so the
     # point clouds are already control-normalised.
@@ -2198,6 +2721,30 @@ def render_embeddings_ot_html(
                     a = X[idx][rid_ctrl_mask].mean(axis=0)
                     X[idx] = X[idx] - a
             df[emb_cols] = X
+
+    # Standalone PCA-before-OT (independent of Harmony). When Harmony is
+    # off we'd otherwise be running Sinkhorn on a 512-D embedding, which
+    # is both slower and noisier than working in a denoised 50-D subspace.
+    if (
+        pca_dims_before_ot
+        and pca_dims_before_ot > 0
+        and len(emb_cols) > pca_dims_before_ot
+    ):
+        try:
+            from sklearn.decomposition import PCA as _PCA
+            n_pca = min(
+                int(pca_dims_before_ot), len(emb_cols), max(2, len(df) // 10),
+            )
+            X_pca = _PCA(n_components=n_pca).fit_transform(
+                df[emb_cols].values.astype(np.float32),
+            )
+            new_cols = [f"pcot_{i}" for i in range(X_pca.shape[1])]
+            df = df.drop(columns=emb_cols)
+            for i, c in enumerate(new_cols):
+                df[c] = X_pca[:, i]
+            emb_cols = new_cols
+        except Exception:  # noqa: BLE001
+            pass
 
     # Group by (run_id, condition_label), sample n cells per group.
     group_cols = (
@@ -2214,8 +2761,13 @@ def render_embeddings_ot_html(
         idx = rng.choice(len(gdf), size=n, replace=False)
         pc = gdf[emb_cols].values[idx].astype(np.float32)
         point_clouds.append(pc)
-        if isinstance(key, tuple):
+        # pandas 3.x returns groupby keys as tuples even for single-col
+        # groupbys (("cond",)), so check the actual tuple length rather
+        # than relying on has_multi_runs to align with the tuple shape.
+        if isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
+        elif isinstance(key, tuple) and len(key) == 1:
+            run_id, cond = "unknown", key[0]
         else:
             run_id, cond = "unknown", key
         group_meta.append({
@@ -2234,7 +2786,7 @@ def render_embeddings_ot_html(
         D = _sinkhorn_divergence_matrix(
             point_clouds,
             reg=sinkhorn_reg,
-            n_iter_max=200,
+            n_iter_max=1000,
             progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
         )
     except ImportError:
@@ -2256,91 +2808,44 @@ def render_embeddings_ot_html(
     np.fill_diagonal(D, 0.0)
     D = np.sqrt(np.maximum(D, 0.0))
 
-    # UMAP from precomputed distance.
+    # Cache the distance matrix + group metadata as a sidecar parquet
+    # next to the HTML, AND at the stable per-embeddings location so a
+    # subsequent render with the same params hits the cache. Downstream
+    # analyses (ranked matches, permutation test, alternative colourings)
+    # also read from these sidecars.
+    _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
     try:
-        import umap
-        n_neighbors = min(15, len(point_clouds) - 1)
-        n_neighbors = max(2, n_neighbors)
-        reducer = umap.UMAP(
-            n_components=2,
-            n_neighbors=n_neighbors,
-            min_dist=0.1,
-            metric="precomputed",
-            random_state=42,
-            n_jobs=1,
+        import shutil
+        shutil.copyfile(_ot_sidecar_path(out_path), cache_sidecar)
+        params_src = _ot_sidecar_path(out_path).with_suffix(
+            _ot_sidecar_path(out_path).suffix + ".params.json",
         )
-        coords = reducer.fit_transform(D)
+        if params_src.exists():
+            shutil.copyfile(
+                params_src,
+                cache_sidecar.with_suffix(
+                    cache_sidecar.suffix + ".params.json",
+                ),
+            )
     except Exception:  # noqa: BLE001
-        # Fallback: classical MDS.
-        from sklearn.manifold import MDS
-        coords = MDS(
-            n_components=2, dissimilarity="precomputed", random_state=42,
-        ).fit_transform(D)
+        pass
 
-    progress_cb(0.95)
-
-    # Build Plotly DataFrame.
-    plot_df = pd.DataFrame(group_meta)
-    plot_df["x"] = coords[:, 0]
-    plot_df["y"] = coords[:, 1]
-
-    try:
-        import plotly.express as px
-
-        if color_by == "run_id":
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="run_id",
-                hover_data=["condition_label", "gene", "n_cells_used"],
-            )
-        else:
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="gene",
-                hover_data=["condition_label", "run_id", "n_cells_used"],
-            )
-
-        if highlight_genes:
-            hl_set = {g.lower() for g in highlight_genes}
-            mask = plot_df["gene"].str.lower().isin(hl_set)
-            fig.update_traces(marker=dict(size=8, opacity=0.3))
-            hl = plot_df[mask]
-            if not hl.empty:
-                fig.add_scatter(
-                    x=hl["x"], y=hl["y"], mode="markers",
-                    marker=dict(size=12, color="red", opacity=1.0),
-                    text=hl["condition_label"], hoverinfo="text",
-                    name="Highlighted",
-                )
-
-        harmony_status = ""
-        if has_multi_runs:
-            harmony_status = (
-                " · Harmony" if batch_correct else " · raw"
-            )
-        title = (
-            f"CNN Embeddings — Optimal Transport "
-            f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
-            f"{harmony_status}"
-            f" · {len(point_clouds)} groups × {n_cells_per_condition} cells"
-        )
-        if emb_path.parent.name != "embeddings":
-            title += f" · model: {emb_path.parent.name}"
-        fig.update_layout(
-            title=title,
-            xaxis_title="UMAP 1 (from OT distance)",
-            yaxis_title="UMAP 2 (from OT distance)",
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-        fig.write_html(
-            str(out_path),
-            include_plotlyjs=True,
-            default_height="100vh",
-        )
-        _make_plot_html_fullheight(out_path)
-        progress_cb(1.0)
-        return out_path
-    except ImportError:
-        return None
+    return _ot_render_from_distance(
+        out_path,
+        D=D, group_meta=group_meta,
+        color_by=color_by, highlight_genes=highlight_genes,
+        n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+        pathway_csv=pathway_csv,
+        has_multi_runs=has_multi_runs,
+        batch_correct=batch_correct,
+        n_cells_per_condition=n_cells_per_condition,
+        label="CNN Embeddings",
+        extra_title=(
+            f" · model: {emb_path.parent.name}"
+            if emb_path.parent.name != "embeddings" else ""
+        ),
+        progress_cb=progress_cb,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2359,6 +2864,9 @@ def render_features_ot_html(
     batch_correct: bool = True,
     n_cells_per_condition: int = 400,
     sinkhorn_reg: float = 0.05,
+    n_neighbors: int = 5,
+    pca_dims_before_ot: int = 0,
+    pathway_csv: "Path | None" = None,
     progress_cb=None,
 ) -> "Path | None":
     """OT-based UMAP of S-score morphological profiles.
@@ -2394,6 +2902,49 @@ def render_features_ot_html(
     morph_cols = _select_morphology_cols(df_lib)
     if len(morph_cols) < 3:
         return None
+
+    # Cache key: parameters that affect D plus the library's mtime
+    # (invalidates when runs are registered or removed).
+    library_index = lib.library_dir / "library.parquet"
+    cache_params = {
+        "n_cells_per_condition": int(n_cells_per_condition),
+        "sinkhorn_reg": float(sinkhorn_reg),
+        "pca_dims_before_ot": int(pca_dims_before_ot or 0),
+        "batch_correct": bool(batch_correct),
+        "library_mtime_ns": (
+            library_index.stat().st_mtime_ns
+            if library_index.exists() else 0
+        ),
+        "species": str(species or ""),
+        "n_features": len(morph_cols),
+    }
+    cache_sidecar = _features_ot_cache_path(library_dir, species)
+    cached = _try_load_ot_cache(
+        cache_sidecar,
+        # Only validate D-affecting params + library state. n_features
+        # is metadata and shouldn't gate cache hits.
+        {k: v for k, v in cache_params.items() if k != "n_features"},
+    )
+    has_multi_runs_cached = (
+        df_lib["_library_run_id"].nunique() > 1
+        if "_library_run_id" in df_lib.columns else False
+    )
+    if cached is not None:
+        D, group_meta = cached
+        _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        return _ot_render_from_distance(
+            out_path,
+            D=D, group_meta=group_meta,
+            color_by=color_by, highlight_genes=highlight_genes,
+            n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+            pathway_csv=pathway_csv,
+            has_multi_runs=has_multi_runs_cached,
+            batch_correct=batch_correct,
+            n_cells_per_condition=n_cells_per_condition,
+            label="Feature Profiles",
+            extra_title=f" · {len(morph_cols)} features",
+            progress_cb=progress_cb,
+        )
 
     # Run / condition / gene metadata. ``feature_library.load_species``
     # adds ``_library_run_id`` per cell which we treat as the canonical
@@ -2499,8 +3050,13 @@ def render_features_ot_html(
             continue
         idx = rng.choice(len(gdf), size=n, replace=False)
         point_clouds.append(gdf[morph_cols].values[idx].astype(np.float32))
-        if isinstance(key, tuple):
+        # pandas 3.x returns groupby keys as tuples even for single-col
+        # groupbys (("cond",)), so check the actual tuple length rather
+        # than relying on has_multi_runs to align with the tuple shape.
+        if isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
+        elif isinstance(key, tuple) and len(key) == 1:
+            run_id, cond = "unknown", key[0]
         else:
             run_id, cond = "unknown", key
         group_meta.append({
@@ -2514,11 +3070,31 @@ def render_features_ot_html(
 
     progress_cb(0.1)
 
+    # Optional PCA-before-OT (off by default for the feature path —
+    # 30-D shape input is already small enough that OT handles it
+    # directly; included for parity with the embeddings path).
+    if (
+        pca_dims_before_ot
+        and pca_dims_before_ot > 0
+        and len(morph_cols) > pca_dims_before_ot
+    ):
+        try:
+            from sklearn.decomposition import PCA as _PCA
+            n_pca = min(int(pca_dims_before_ot), len(morph_cols))
+            X_red = _PCA(n_components=n_pca).fit_transform(
+                np.vstack(point_clouds).astype(np.float32),
+            )
+            sizes = [len(pc) for pc in point_clouds]
+            cum = np.cumsum([0] + sizes)
+            point_clouds = [X_red[cum[i]:cum[i + 1]] for i in range(len(sizes))]
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         D = _sinkhorn_divergence_matrix(
             point_clouds,
             reg=sinkhorn_reg,
-            n_iter_max=200,
+            n_iter_max=1000,
             progress_cb=lambda f: progress_cb(0.1 + 0.7 * f),
         )
     except ImportError:
@@ -2534,70 +3110,38 @@ def render_features_ot_html(
     np.fill_diagonal(D, 0.0)
     D = np.sqrt(np.maximum(D, 0.0))
 
+    # Save both to the per-render sidecar and to the stable library
+    # cache so subsequent renders (with the same params + library state)
+    # hit the cache.
+    _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+    try:
+        import shutil
+        shutil.copyfile(_ot_sidecar_path(out_path), cache_sidecar)
+        params_src = _ot_sidecar_path(out_path).with_suffix(
+            _ot_sidecar_path(out_path).suffix + ".params.json",
+        )
+        if params_src.exists():
+            shutil.copyfile(
+                params_src,
+                cache_sidecar.with_suffix(
+                    cache_sidecar.suffix + ".params.json",
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     progress_cb(0.85)
 
-    try:
-        import umap
-        n_neighbors = max(2, min(15, len(point_clouds) - 1))
-        coords = umap.UMAP(
-            n_components=2, n_neighbors=n_neighbors, min_dist=0.1,
-            metric="precomputed", random_state=42, n_jobs=1,
-        ).fit_transform(D)
-    except Exception:  # noqa: BLE001
-        from sklearn.manifold import MDS
-        coords = MDS(
-            n_components=2, dissimilarity="precomputed", random_state=42,
-        ).fit_transform(D)
-
-    plot_df = pd.DataFrame(group_meta)
-    plot_df["x"] = coords[:, 0]
-    plot_df["y"] = coords[:, 1]
-
-    try:
-        import plotly.express as px
-        if color_by == "run_id":
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="run_id",
-                hover_data=["condition_label", "gene", "n_cells_used"],
-            )
-        else:
-            fig = px.scatter(
-                plot_df, x="x", y="y", color="gene",
-                hover_data=["condition_label", "run_id", "n_cells_used"],
-            )
-
-        if highlight_genes:
-            hl_set = {g.lower() for g in highlight_genes}
-            fig.update_traces(marker=dict(size=8, opacity=0.3))
-            hl = plot_df[plot_df["gene"].str.lower().isin(hl_set)]
-            if not hl.empty:
-                fig.add_scatter(
-                    x=hl["x"], y=hl["y"], mode="markers",
-                    marker=dict(size=12, color="red", opacity=1.0),
-                    text=hl["condition_label"], hoverinfo="text",
-                    name="Highlighted",
-                )
-
-        harmony_status = ""
-        if has_multi_runs:
-            harmony_status = " · Harmony" if batch_correct else " · raw"
-        fig.update_layout(
-            title=(
-                f"Feature Profiles — Optimal Transport "
-                f"(Sinkhorn ε = {sinkhorn_reg * 100:.1f}% of typical cost)"
-                f"{harmony_status} · {len(point_clouds)} groups × "
-                f"{n_cells_per_condition} cells · {len(morph_cols)} features"
-            ),
-            xaxis_title="UMAP 1 (from OT distance)",
-            yaxis_title="UMAP 2 (from OT distance)",
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-        fig.write_html(
-            str(out_path), include_plotlyjs=True, default_height="100vh",
-        )
-        _make_plot_html_fullheight(out_path)
-        progress_cb(1.0)
-        return out_path
-    except ImportError:
-        return None
+    return _ot_render_from_distance(
+        out_path,
+        D=D, group_meta=group_meta,
+        color_by=color_by, highlight_genes=highlight_genes,
+        n_neighbors=n_neighbors, sinkhorn_reg=sinkhorn_reg,
+        pathway_csv=pathway_csv,
+        has_multi_runs=has_multi_runs,
+        batch_correct=batch_correct,
+        n_cells_per_condition=n_cells_per_condition,
+        label="Feature Profiles",
+        extra_title=f" · {len(morph_cols)} features",
+        progress_cb=progress_cb,
+    )
