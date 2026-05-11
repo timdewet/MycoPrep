@@ -267,6 +267,7 @@ class _EmbeddingsWorker(QObject):
         highlight_genes: Optional[list[str]] = None,
         batch_correct: bool = True,
         model_type: str = "",
+        merge_replicates: bool = False,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -277,6 +278,7 @@ class _EmbeddingsWorker(QObject):
         self._highlight_genes = list(highlight_genes or [])
         self._batch_correct = batch_correct
         self._model_type = model_type
+        self._merge_replicates = bool(merge_replicates)
 
     def run(self) -> None:
         try:
@@ -293,6 +295,7 @@ class _EmbeddingsWorker(QObject):
                 highlight_genes=self._highlight_genes,
                 batch_correct=self._batch_correct,
                 model_type=self._model_type,
+                merge_replicates=self._merge_replicates,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
@@ -448,6 +451,7 @@ class _LibraryWorker(QObject):
         highlight_genes: Optional[list[str]] = None,
         baseline_mode: str = "pooled",
         batch_correct: bool = True,
+        merge_replicates: bool = False,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -458,6 +462,7 @@ class _LibraryWorker(QObject):
         self._highlight_genes = list(highlight_genes or [])
         self._baseline_mode = baseline_mode
         self._batch_correct = batch_correct
+        self._merge_replicates = bool(merge_replicates)
 
     def run(self) -> None:
         try:
@@ -475,6 +480,7 @@ class _LibraryWorker(QObject):
                 highlight_genes=self._highlight_genes,
                 baseline_mode=self._baseline_mode,
                 batch_correct=self._batch_correct,
+                merge_replicates=self._merge_replicates,
             )
             self.progress.emit(100, "Done")
             self.finished.emit(written)
@@ -669,13 +675,14 @@ class AnalysisPanel(QWidget):
         self._merge_replicates.setChecked(False)
         self._merge_replicates.setToolTip(
             "Collapse non-control conditions across replicate runs.\n\n"
-            "When on, all cells with the same condition_label across\n"
-            "runs end up as ONE point cloud / row in the OT distance\n"
-            "matrix (e.g. rpoB cells from run1+run2+run3 → one rpoB\n"
-            "group). Control conditions still split per-run so between-\n"
-            "control variation stays visible as a noise floor.\n\n"
-            "Currently affects the OT views; mean views still group\n"
-            "by (run, condition)."
+            "When on, cells with the same condition_label across runs\n"
+            "are pooled into one group (rpoB cells from run1+run2+run3\n"
+            "→ one rpoB point in both the mean views and the OT views).\n"
+            "Any trailing replicate suffix (_R1, _R2 …) is stripped\n"
+            "from the merge key so labels that embed a run index still\n"
+            "collapse correctly.\n\n"
+            "Control conditions stay per-run so between-control\n"
+            "variation remains visible as a noise floor."
         )
         self._merge_replicates.stateChanged.connect(
             lambda _s: self._refresh_library_view(force=True)
@@ -855,6 +862,7 @@ class AnalysisPanel(QWidget):
                 highlight_genes=self._highlight_genes.selected(),
                 batch_correct=self._batch_correct.isChecked(),
                 model_type=str(model_type),
+                merge_replicates=merge_replicates,
             )
             status = "Rendering CNN Embeddings (mean)\u2026"
         elif view_mode == "embeddings_ot":
@@ -876,6 +884,7 @@ class AnalysisPanel(QWidget):
                 highlight_genes=self._highlight_genes.selected(),
                 baseline_mode=baseline_mode,
                 batch_correct=self._batch_correct.isChecked(),
+                merge_replicates=merge_replicates,
             )
             status = "Rendering library plot\u2026"
 
