@@ -2290,6 +2290,7 @@ def precompute_features_ot_cache(
     sinkhorn_reg: float = 0.05,
     pca_dims_before_ot: int = 0,
     batch_correct: bool = True,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Precompute the features-OT distance matrix for one species.
@@ -2313,6 +2314,7 @@ def precompute_features_ot_cache(
             sinkhorn_reg=sinkhorn_reg,
             pca_dims_before_ot=pca_dims_before_ot,
             batch_correct=batch_correct,
+            merge_replicates=merge_replicates,
             progress_cb=progress_cb,
         )
     except Exception:  # noqa: BLE001
@@ -2331,6 +2333,7 @@ def precompute_embedding_ot_cache(
     sinkhorn_reg: float = 0.05,
     pca_dims_before_ot: int = 50,
     batch_correct: bool = True,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Precompute the OT distance matrix for an embeddings parquet.
@@ -2359,6 +2362,7 @@ def precompute_embedding_ot_cache(
             sinkhorn_reg=sinkhorn_reg,
             pca_dims_before_ot=pca_dims_before_ot,
             batch_correct=batch_correct,
+            merge_replicates=merge_replicates,
             progress_cb=progress_cb,
         )
     except Exception:  # noqa: BLE001
@@ -2689,6 +2693,7 @@ def render_embeddings_ot_html(
     n_neighbors: int = 5,
     pca_dims_before_ot: int = 50,
     pathway_csv: "Path | None" = None,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings with **Optimal Transport** distance.
@@ -2773,6 +2778,7 @@ def render_embeddings_ot_html(
         "sinkhorn_reg": float(sinkhorn_reg),
         "pca_dims_before_ot": int(pca_dims_before_ot or 0),
         "batch_correct": bool(batch_correct),
+        "merge_replicates": bool(merge_replicates),
         "emb_mtime_ns": emb_path.stat().st_mtime_ns,
     }
     cache_sidecar = _embedding_ot_cache_path(emb_path)
@@ -2930,10 +2936,24 @@ def render_embeddings_ot_html(
         except Exception:  # noqa: BLE001
             pass
 
-    # Group by (run_id, condition_label), sample n cells per group.
-    group_cols = (
-        ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
-    )
+    # Group by (run_id, condition_label). When ``merge_replicates`` is
+    # on, non-control rows get keyed by ``condition_label`` alone so
+    # the same condition across multiple runs ends up as a single
+    # point cloud. Controls keep their per-run identity so between-
+    # control variation is still visible as a noise floor (the user
+    # explicitly asked for this carve-out).
+    if merge_replicates:
+        is_ctrl = df["gene"].astype(str).isin(control_genes)
+        df["_merge_key"] = np.where(
+            is_ctrl.values,
+            df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+            df["condition_label"].astype(str),
+        )
+        group_cols = ["_merge_key"]
+    else:
+        group_cols = (
+            ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+        )
     groups = df.groupby(group_cols)
     rng = np.random.default_rng(42)
     point_clouds: list[np.ndarray] = []
@@ -2945,10 +2965,22 @@ def render_embeddings_ot_html(
         idx = rng.choice(len(gdf), size=n, replace=False)
         pc = gdf[emb_cols].values[idx].astype(np.float32)
         point_clouds.append(pc)
-        # pandas 3.x returns groupby keys as tuples even for single-col
-        # groupbys (("cond",)), so check the actual tuple length rather
-        # than relying on has_multi_runs to align with the tuple shape.
-        if isinstance(key, tuple) and len(key) == 2:
+        if merge_replicates:
+            key_str = key[0] if isinstance(key, tuple) else str(key)
+            if "::" in key_str:
+                # Per-run control key.
+                run_id, cond = key_str.split("::", 1)
+            else:
+                # Merged non-control: summarise contributing runs.
+                runs_present = sorted(gdf["run_id"].astype(str).unique())
+                run_id = (
+                    ",".join(runs_present) if len(runs_present) <= 3
+                    else f"{len(runs_present)} runs"
+                )
+                cond = key_str
+        elif isinstance(key, tuple) and len(key) == 2:
+            # pandas 3.x returns groupby keys as tuples even for single-col
+            # groupbys (("cond",)), so check the actual tuple length.
             run_id, cond = key
         elif isinstance(key, tuple) and len(key) == 1:
             run_id, cond = "unknown", key[0]
@@ -3051,6 +3083,7 @@ def render_features_ot_html(
     n_neighbors: int = 5,
     pca_dims_before_ot: int = 0,
     pathway_csv: "Path | None" = None,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """OT-based UMAP of S-score morphological profiles.
@@ -3095,6 +3128,7 @@ def render_features_ot_html(
         "sinkhorn_reg": float(sinkhorn_reg),
         "pca_dims_before_ot": int(pca_dims_before_ot or 0),
         "batch_correct": bool(batch_correct),
+        "merge_replicates": bool(merge_replicates),
         "library_mtime_ns": (
             library_index.stat().st_mtime_ns
             if library_index.exists() else 0
@@ -3242,8 +3276,22 @@ def render_features_ot_html(
                     X[idx] = X[idx] - a
             df[morph_cols] = X
 
-    # Group + sample.
-    group_cols = ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+    # Group + sample. ``merge_replicates`` collapses same-condition
+    # cells across runs (so e.g. rpoB-knockdown cells from run1+run2+
+    # run3 become a single point cloud) but keeps controls per-run
+    # so between-control variation remains visible.
+    if merge_replicates:
+        is_ctrl = df["gene"].astype(str).isin(control_genes)
+        df["_merge_key"] = np.where(
+            is_ctrl.values,
+            df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+            df["condition_label"].astype(str),
+        )
+        group_cols = ["_merge_key"]
+    else:
+        group_cols = (
+            ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+        )
     rng = np.random.default_rng(42)
     point_clouds: list[np.ndarray] = []
     group_meta: list[dict] = []
@@ -3253,10 +3301,18 @@ def render_features_ot_html(
             continue
         idx = rng.choice(len(gdf), size=n, replace=False)
         point_clouds.append(gdf[morph_cols].values[idx].astype(np.float32))
-        # pandas 3.x returns groupby keys as tuples even for single-col
-        # groupbys (("cond",)), so check the actual tuple length rather
-        # than relying on has_multi_runs to align with the tuple shape.
-        if isinstance(key, tuple) and len(key) == 2:
+        if merge_replicates:
+            key_str = key[0] if isinstance(key, tuple) else str(key)
+            if "::" in key_str:
+                run_id, cond = key_str.split("::", 1)
+            else:
+                runs_present = sorted(gdf["run_id"].astype(str).unique())
+                run_id = (
+                    ",".join(runs_present) if len(runs_present) <= 3
+                    else f"{len(runs_present)} runs"
+                )
+                cond = key_str
+        elif isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
         elif isinstance(key, tuple) and len(key) == 1:
             run_id, cond = "unknown", key[0]

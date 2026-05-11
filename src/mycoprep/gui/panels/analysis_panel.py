@@ -319,6 +319,7 @@ class _EmbeddingsOTWorker(QObject):
         model_type: str = "",
         n_neighbors: int = 5,
         pathway_csv: Optional[Path] = None,
+        merge_replicates: bool = False,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -331,6 +332,7 @@ class _EmbeddingsOTWorker(QObject):
         self._model_type = model_type
         self._n_neighbors = int(n_neighbors)
         self._pathway_csv = pathway_csv
+        self._merge_replicates = bool(merge_replicates)
 
     def run(self) -> None:
         try:
@@ -356,6 +358,7 @@ class _EmbeddingsOTWorker(QObject):
                 model_type=self._model_type,
                 n_neighbors=self._n_neighbors,
                 pathway_csv=self._pathway_csv,
+                merge_replicates=self._merge_replicates,
                 progress_cb=_cb,
             )
             self.progress.emit(100, "Done")
@@ -382,6 +385,7 @@ class _FeaturesOTWorker(QObject):
         batch_correct: bool = True,
         n_neighbors: int = 5,
         pathway_csv: Optional[Path] = None,
+        merge_replicates: bool = False,
     ) -> None:
         super().__init__()
         self._out_path = out_path
@@ -393,6 +397,7 @@ class _FeaturesOTWorker(QObject):
         self._batch_correct = batch_correct
         self._n_neighbors = int(n_neighbors)
         self._pathway_csv = pathway_csv
+        self._merge_replicates = bool(merge_replicates)
 
     def run(self) -> None:
         try:
@@ -417,6 +422,7 @@ class _FeaturesOTWorker(QObject):
                 batch_correct=self._batch_correct,
                 n_neighbors=self._n_neighbors,
                 pathway_csv=self._pathway_csv,
+                merge_replicates=self._merge_replicates,
                 progress_cb=_cb,
             )
             self.progress.emit(100, "Done")
@@ -659,6 +665,24 @@ class AnalysisPanel(QWidget):
         colour_row.addWidget(self._batch_correct)
 
         colour_row.addSpacing(tokens.S4)
+        self._merge_replicates = QCheckBox("Merge replicates")
+        self._merge_replicates.setChecked(False)
+        self._merge_replicates.setToolTip(
+            "Collapse non-control conditions across replicate runs.\n\n"
+            "When on, all cells with the same condition_label across\n"
+            "runs end up as ONE point cloud / row in the OT distance\n"
+            "matrix (e.g. rpoB cells from run1+run2+run3 → one rpoB\n"
+            "group). Control conditions still split per-run so between-\n"
+            "control variation stays visible as a noise floor.\n\n"
+            "Currently affects the OT views; mean views still group\n"
+            "by (run, condition)."
+        )
+        self._merge_replicates.stateChanged.connect(
+            lambda _s: self._refresh_library_view(force=True)
+        )
+        colour_row.addWidget(self._merge_replicates)
+
+        colour_row.addSpacing(tokens.S4)
         colour_row.addWidget(QLabel("Highlight gene(s):"))
         self._highlight_genes = _MultiSelectButton("(none)")
         self._highlight_genes.setToolTip(
@@ -811,6 +835,7 @@ class AnalysisPanel(QWidget):
         model_type = self._model_select.currentData() or ""
         n_neighbors = int(self._ot_nn.value())
         pathway_csv = self._pathway_csv
+        merge_replicates = self._merge_replicates.isChecked()
 
         if view_mode == "features_ot":
             worker = _FeaturesOTWorker(
@@ -820,6 +845,7 @@ class AnalysisPanel(QWidget):
                 batch_correct=self._batch_correct.isChecked(),
                 n_neighbors=n_neighbors,
                 pathway_csv=pathway_csv,
+                merge_replicates=merge_replicates,
             )
             status = "Rendering Feature Profiles (OT)\u2026"
         elif view_mode == "embeddings":
@@ -840,6 +866,7 @@ class AnalysisPanel(QWidget):
                 model_type=str(model_type),
                 n_neighbors=n_neighbors,
                 pathway_csv=pathway_csv,
+                merge_replicates=merge_replicates,
             )
             status = "Rendering CNN Embeddings (OT)\u2026"
         else:
