@@ -2735,6 +2735,20 @@ def render_embeddings_ot_html(
         # Analysis panel's "Ranked matches" / "Permutation test"
         # buttons resolve it the same as a freshly-rendered view.
         _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        # Make cache hits VISIBLY distinct. Without this the worker's
+        # default "Computing OT distance matrix… 95%" text still
+        # fires and the user can't tell whether they're waiting on a
+        # 30-second recompute or a 1-second cache load.
+        progress_cb(
+            0.5,
+            f"OT cache HIT — rendering UMAP from precomputed "
+            f"({D.shape[0]}×{D.shape[0]}) distance matrix...",
+        )
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache HIT (embeddings @ %s): %d groups",
+            cache_sidecar, D.shape[0],
+        )
         return _ot_render_from_distance(
             out_path,
             D=D, group_meta=group_meta,
@@ -3047,6 +3061,16 @@ def render_features_ot_html(
     if cached is not None:
         D, group_meta = cached
         _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        progress_cb(
+            0.5,
+            f"OT cache HIT — rendering UMAP from precomputed "
+            f"({D.shape[0]}×{D.shape[0]}) distance matrix...",
+        )
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache HIT (features @ %s): %d groups",
+            cache_sidecar, D.shape[0],
+        )
         return _ot_render_from_distance(
             out_path,
             D=D, group_meta=group_meta,
