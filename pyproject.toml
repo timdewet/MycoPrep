@@ -46,3 +46,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "mycoprep.core" = ["models/*.pth"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
