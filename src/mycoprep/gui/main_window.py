@@ -189,6 +189,16 @@ class MainWindow(QMainWindow):
         # Keep the Analysis panel's library plot pointed at the same
         # library directory the user picks in FeaturesPanel.
         self.features_panel.library_dir.textChanged.connect(self._sync_analysis_library_dir)
+        # The Embeddings stage needs ``all_crops.h5``, which is only
+        # produced when Features' "Save HDF5 crops" sub-option is on.
+        # Mirror that state into the run panel so the Embeddings stage
+        # checkbox stays in sync.
+        self.features_panel.save_crops.toggled.connect(
+            self.run_panel.set_features_save_crops
+        )
+        self.run_panel.set_features_save_crops(
+            self.features_panel.save_crops.isChecked()
+        )
 
         # Stage-state tracking for sidebar status dots.
         self._stage_status: dict[str, StageStatus] = {e.key: StageStatus.IDLE for e in NAV_ENTRIES}

@@ -62,6 +62,18 @@ class RunPanel(QWidget):
             cb.toggled.connect(self._refresh_run_enable)
             cb.toggled.connect(lambda _checked: self.stageEnablesChanged.emit())
             self.checks[name] = cb
+        # Embeddings reads the crop H5 written by the Features stage —
+        # without Features (and its save_crops sub-option) there's
+        # nothing to embed. Wire the dependency so the user can't get
+        # into a state where the run silently no-ops at the Embeddings
+        # stage. Train-only mode (see ``set_train_only_mode``) bypasses
+        # this — that mode reads library crops directly.
+        self.checks["Features"].toggled.connect(self._enforce_features_dep)
+        self.checks["Embeddings"].setToolTip(
+            "Train / fine-tune the CNN embedding model on the cell crops "
+            "produced by the Features stage. Requires Features to be "
+            "ticked (and its 'Save HDF5 crops' sub-option enabled)."
+        )
 
         self.stepper = Stepper(STAGE_NAMES)
 
@@ -112,7 +124,14 @@ class RunPanel(QWidget):
         self._follow_btn.setChecked(True)
         self._follow_btn.toggled.connect(self.log.set_follow)
 
+        # Tracks the Features panel's "Save HDF5 crops" sub-toggle — when
+        # off, the Features stage doesn't produce ``all_crops.h5`` and
+        # Embeddings has nothing to read. Default ``True`` matches the
+        # FeaturesPanel default.
+        self._features_save_crops_enabled: bool = True
+
         self._build_ui()
+        self._enforce_features_dep()
         self._refresh_run_enable()
 
     def _build_ui(self) -> None:
@@ -367,6 +386,57 @@ class RunPanel(QWidget):
         if "reuse_existing" in s:
             self.reuse_existing.setChecked(bool(s["reuse_existing"]))
 
+    # ---------------------------------------------------------------- deps
+
+    def _enforce_features_dep(self, _checked: bool = False) -> None:
+        """Disable the Embeddings checkbox when its dependencies are off.
+
+        Embeddings needs:
+        - The Features stage to be ticked in the same run (so
+          ``all_crops.h5`` exists at run time), AND
+        - The Features panel's "Save HDF5 crops" sub-option to be ON
+          (without it, Features writes only the per-cell features parquet
+          and no crop H5).
+
+        Train-only mode (see :meth:`set_train_only_mode`) bypasses this
+        constraint — that mode reads library crops directly and doesn't
+        run Features.
+        """
+        if getattr(self, "_train_only_active", False):
+            return
+        features_ticked = self.checks["Features"].isChecked()
+        ok = features_ticked and self._features_save_crops_enabled
+        emb_cb = self.checks["Embeddings"]
+        if not ok:
+            # Uncheck and disable; the user can't run an Embeddings stage
+            # with nothing to embed.
+            if emb_cb.isChecked():
+                emb_cb.setChecked(False)
+            emb_cb.setEnabled(False)
+            reason = (
+                "Tick the Features stage and enable its 'Save HDF5 crops' "
+                "sub-option to use the Embeddings stage."
+                if not features_ticked else
+                "Enable 'Save HDF5 crops' in the Features panel to use "
+                "the Embeddings stage."
+            )
+            emb_cb.setToolTip(reason)
+        else:
+            emb_cb.setEnabled(True)
+            emb_cb.setToolTip(
+                "Train / fine-tune the CNN embedding model on the cell "
+                "crops produced by the Features stage."
+            )
+
+    def set_features_save_crops(self, enabled: bool) -> None:
+        """Hook from the Features panel: track its 'Save HDF5 crops' state.
+
+        Called by MainWindow when the user toggles the sub-option, so
+        the Embeddings checkbox can react accordingly.
+        """
+        self._features_save_crops_enabled = bool(enabled)
+        self._enforce_features_dep()
+
     # ---------------------------------------------------------------- modes
 
     def set_train_only_mode(self, train_only: bool) -> None:
@@ -403,6 +473,9 @@ class RunPanel(QWidget):
         # is selectable, only its progress strip is meaningful.
         for name in self.checks.keys():
             self.stepper.set_visible(name, name == "Embeddings" if train_only else True)
+        # Re-enforce the Features → Embeddings dependency now that we've
+        # restored (or wiped) the checkbox states.
+        self._enforce_features_dep()
         self._refresh_run_enable()
 
     # ---------------------------------------------------------------- getters
