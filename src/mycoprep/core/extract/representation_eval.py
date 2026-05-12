@@ -1017,6 +1017,9 @@ def score_all_representations(
     include_umap: bool = True,
     replicate_key_mode: str = "gene",
     include_replicate_scope: bool = True,
+    epochs: int = 50,
+    batch_size: int = 64,
+    retrain: bool = False,
     k_list: tuple[int, ...] = (1, 3, 5),
     out_dir: Optional[Path] = None,
     progress_cb: Optional[Callable[[float, str], None]] = None,
@@ -1051,6 +1054,9 @@ def score_all_representations(
         batch_correct_states=tuple(batch_correct_states),
         compute_features_ot=bool(include_features_ot),
         compute_embedding_ot=bool(include_embeddings_ot),
+        epochs=int(epochs),
+        batch_size=int(batch_size),
+        retrain=bool(retrain),
     )
 
     def _gen_cb(f, msg):
