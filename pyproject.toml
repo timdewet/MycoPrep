@@ -33,7 +33,12 @@ dependencies = [
 
 [project.optional-dependencies]
 napari = ["napari"]
-profiling = ["harmonypy>=0.0.9"]
+profiling = [
+    # Pin upper bound: versions after 0.0.9 require a C++ toolchain to
+    # build from source on Windows (scikit-build-core + CMake). 0.0.9 is
+    # pure-Python and installs from PyPI as a wheel everywhere.
+    "harmonypy>=0.0.9,<0.0.10",
+]
 test = ["pytest>=8", "pytest-qt>=4"]
 
 [project.scripts]
