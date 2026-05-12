@@ -193,19 +193,18 @@ def _harmony_correct(embeddings: np.ndarray, run_ids: np.ndarray) -> np.ndarray:
     Note: kept for back-compat. Production batch correction now happens at
     the per-profile level inside ``render_embeddings_html`` rather than
     inside extract_embeddings — see comments in that module.
+    Orientation handling is delegated to ``qc_plots._run_harmony_oriented``
+    so the result is always (n_obs, n_features) regardless of the
+    installed harmonypy version (0.0.x returns transposed; 2.x doesn't).
     """
     try:
-        import harmonypy
-
-        ho = harmonypy.run_harmony(
-            embeddings,
-            pd.DataFrame({"run_id": run_ids}),
-            ["run_id"],
-            max_iter_harmony=20,
+        from mycoprep.core.extract.qc_plots import _run_harmony_oriented
+        import numpy as np
+        unique = np.unique(np.asarray(run_ids).astype(str))
+        return _run_harmony_oriented(
+            embeddings, run_ids,
+            nclust=min(max(2, len(unique)), 5),
         )
-        # harmonypy.run_harmony returns Z_corr already in (n_obs, n_features)
-        # shape — DON'T transpose. The previous .T was a latent bug.
-        return ho.Z_corr
     except ImportError:
         return embeddings
     except Exception:

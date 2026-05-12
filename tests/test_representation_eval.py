@@ -313,6 +313,46 @@ def test_feature_matrix_cosine_perfect():
     assert math.isclose(m.knn_accuracy[1], 1.0)
 
 
+def test_harmony_orientation_helper_round_trip():
+    """The shared harmony helper must always return (n_samples, n_features),
+    regardless of the installed harmonypy version (0.0.x transposes;
+    2.x doesn't)."""
+    try:
+        from mycoprep.core.extract.qc_plots import _run_harmony_oriented
+    except ImportError:
+        return  # qc_plots optional-deps not installed — skip
+    try:
+        import harmonypy  # noqa: F401
+    except ImportError:
+        return  # harmonypy not installed in this env — skip
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    # 30 cells × 8 features, two batches with a constant offset (a
+    # textbook batch effect Harmony should remove).
+    n_per_batch = 15
+    X = np.vstack([
+        rng.normal(loc=0.0, scale=1.0, size=(n_per_batch, 8)),
+        rng.normal(loc=5.0, scale=1.0, size=(n_per_batch, 8)),
+    ]).astype(np.float32)
+    batches = np.array(["a"] * n_per_batch + ["b"] * n_per_batch)
+
+    Z = _run_harmony_oriented(X, batches, nclust=2)
+
+    # Shape must match input — this is the invariant that previously
+    # broke silently on 0.0.9.
+    assert Z.shape == X.shape, f"Z.shape {Z.shape} != X.shape {X.shape}"
+
+    # Sanity: the inter-batch mean gap should shrink after correction.
+    pre_gap = float(np.linalg.norm(
+        X[:n_per_batch].mean(axis=0) - X[n_per_batch:].mean(axis=0)
+    ))
+    post_gap = float(np.linalg.norm(
+        Z[:n_per_batch].mean(axis=0) - Z[n_per_batch:].mean(axis=0)
+    ))
+    assert post_gap < pre_gap, f"Harmony did not reduce inter-batch gap: pre={pre_gap:.2f} post={post_gap:.2f}"
+
+
 if __name__ == "__main__":
     import sys
     failed = []

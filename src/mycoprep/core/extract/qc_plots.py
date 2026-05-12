@@ -362,6 +362,51 @@ def make_qc_plots(
 # Morphology clustering helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _run_harmony_oriented(
+    X: "np.ndarray",
+    batch_labels,
+    *,
+    nclust: int,
+    max_iter: int = 20,
+) -> "np.ndarray":
+    """Run Harmony and return the corrected matrix oriented (n_samples, n_features).
+
+    Harmonypy's ``Z_corr`` orientation differs between major versions:
+    0.0.x returns ``(n_features, n_samples)``; 2.x returns
+    ``(n_samples, n_features)``. Every other call site in MycoPrep
+    historically assumed the 2.x orientation, which silently produced
+    transposed matrices on 0.0.9 (the version we pin for Windows
+    installability) — and the surrounding ``try/except`` would then
+    bury the resulting shape mismatch, leaving Harmony effectively
+    disabled with no warning.
+
+    This helper guarantees the returned shape equals ``X.shape``.
+    Raises ``ValueError`` if the result has an unexpected shape so the
+    caller can surface the failure rather than silently dropping it.
+    """
+    import harmonypy
+    import numpy as np
+    import pandas as pd
+
+    X = np.asarray(X)
+    ho = harmonypy.run_harmony(
+        X,
+        pd.DataFrame({"_batch": np.asarray(batch_labels).astype(str)}),
+        vars_use="_batch",
+        max_iter_harmony=int(max_iter),
+        nclust=int(nclust),
+    )
+    Z = np.asarray(ho.Z_corr)
+    if Z.shape == X.shape:
+        return Z
+    if Z.shape == (X.shape[1], X.shape[0]):
+        return Z.T
+    raise ValueError(
+        f"harmonypy returned Z_corr with unexpected shape {Z.shape} "
+        f"for input shape {X.shape}"
+    )
+
+
 _MORPHOLOGY_COLS_PREFERRED = [
     "length_um",
     "width_median_um",
@@ -619,22 +664,15 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
         n_batches = len(unique_batches)
         if n_batches >= 2:
             try:
-                import harmonypy
-                import pandas as pd
-
-                ho = harmonypy.run_harmony(
-                    X_proc,
-                    pd.DataFrame({"run_id": batch_labels}),
-                    vars_use="run_id",
-                    max_iter_harmony=20,
-                    # Conservative pinned nclust — anchored on the actual
-                    # batch count, capped at 5. The previous adaptive
-                    # ``min(max(2, N//5), 20)`` over-aligned on small N
-                    # and could erase real biology when run/condition
-                    # confounding was partial.
+                # Conservative pinned nclust — anchored on the actual
+                # batch count, capped at 5. The previous adaptive
+                # ``min(max(2, N//5), 20)`` over-aligned on small N and
+                # could erase real biology when run/condition
+                # confounding was partial.
+                X_proc = _run_harmony_oriented(
+                    X_proc, batch_labels,
                     nclust=min(max(2, n_batches), 5),
                 )
-                X_proc = ho.Z_corr
             except ImportError:
                 pass
 
@@ -1964,16 +2002,10 @@ def render_embeddings_html(
         # 3. Harmony in PCA space (more stable than raw 512-d).
         if batch_correct and has_multi_runs:
             try:
-                import harmonypy
                 nclust = max(2, min(20, len(profiles) // 4))
-                ho = harmonypy.run_harmony(
-                    reduced,
-                    pd.DataFrame({"run_id": profiles["run_id"].values}),
-                    vars_use="run_id",
-                    max_iter_harmony=20,
-                    nclust=nclust,
+                reduced = _run_harmony_oriented(
+                    reduced, profiles["run_id"].values, nclust=nclust,
                 )
-                reduced = ho.Z_corr
             except ImportError:
                 pass
             except Exception:  # noqa: BLE001
@@ -2779,26 +2811,22 @@ def render_embeddings_ot_html(
 
     if batch_correct and has_multi_runs:
         try:
-            import harmonypy
             from sklearn.decomposition import PCA
             # Reduce to ~50-d before Harmony (same logic as S-score path).
             n_pca = min(50, len(emb_cols), max(2, len(df) // 10))
             pca = PCA(n_components=n_pca)
             X_pca = pca.fit_transform(df[emb_cols].values.astype(np.float32))
-            ho = harmonypy.run_harmony(
-                X_pca,
-                pd.DataFrame({"run_id": df["run_id"].values}),
-                vars_use="run_id",
-                max_iter_harmony=20,
+            Z = _run_harmony_oriented(
+                X_pca, df["run_id"].values,
                 nclust=min(20, max(2, len(df) // 200)),
             )
             # Replace embeddings columns with corrected (and PCA-reduced)
             # representation. OT works in any dim — the reduced form is
             # actually faster.
-            emb_cols = [f"hpc_{i}" for i in range(ho.Z_corr.shape[1])]
+            emb_cols = [f"hpc_{i}" for i in range(Z.shape[1])]
             df = df.drop(columns=[c for c in df.columns if c.startswith("emb_")])
             for i, c in enumerate(emb_cols):
-                df[c] = ho.Z_corr[:, i]
+                df[c] = Z[:, i]
         except ImportError:
             pass
         except Exception:  # noqa: BLE001
@@ -3128,15 +3156,12 @@ def render_features_ot_html(
     # isn't necessary first).
     if batch_correct and has_multi_runs:
         try:
-            import harmonypy
-            ho = harmonypy.run_harmony(
+            Z = _run_harmony_oriented(
                 df[morph_cols].values.astype(np.float32),
-                pd.DataFrame({"run_id": df["run_id"].values}),
-                vars_use="run_id",
-                max_iter_harmony=20,
+                df["run_id"].values,
                 nclust=min(20, max(2, len(df) // 200)),
             )
-            df[morph_cols] = ho.Z_corr
+            df[morph_cols] = Z
         except ImportError:
             pass
         except Exception:  # noqa: BLE001

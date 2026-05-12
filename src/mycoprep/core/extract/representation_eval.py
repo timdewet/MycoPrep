@@ -521,33 +521,23 @@ def apply_harmony(
 
     Returns ``(X_corrected, applied)``. ``applied`` is False when
     Harmony was a no-op (single batch, missing dependency, or failure).
+    Orientation handling is delegated to
+    :func:`qc_plots._run_harmony_oriented`.
     """
     arr = np.asarray(batch_labels)
     unique = [b for b in np.unique(arr) if str(b)]
     if len(unique) < 2:
         return X, False
     try:
-        import harmonypy
+        from .qc_plots import _run_harmony_oriented
     except ImportError:
         return X, False
     try:
-        ho = harmonypy.run_harmony(
-            X,
-            pd.DataFrame({"run_id": arr.astype(str)}),
-            vars_use="run_id",
-            max_iter_harmony=20,
-            nclust=min(max(2, len(unique)), 5),
+        Z = _run_harmony_oriented(
+            X, arr, nclust=min(max(2, len(unique)), 5),
         )
-        Z = np.asarray(ho.Z_corr)
-        # harmonypy 0.0.9 returns Z_corr as (n_features, n_samples) —
-        # transpose of the input. Newer versions return (n_samples,
-        # n_features) directly. Orient back to match X regardless.
-        if Z.shape == X.shape:
-            return Z, True
-        if Z.shape == (X.shape[1], X.shape[0]):
-            return Z.T, True
-        # Unexpected shape — don't silently mangle metrics; fall back
-        # to the uncorrected matrix and let the caller flag it.
+        return Z, True
+    except ImportError:
         return X, False
     except Exception:  # noqa: BLE001
         return X, False
