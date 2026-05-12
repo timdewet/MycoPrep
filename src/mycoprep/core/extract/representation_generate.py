@@ -496,13 +496,21 @@ def ensure_all_representations(
                 )
                 report.artefacts.append(ot_rep)
 
-    # Features-OT for both BC states.
+    # Features-OT for both BC states. Allocate the trailing 5% of overall
+    # progress equally between the BC states so the per-Sinkhorn-iteration
+    # fraction reported by the inner callback actually advances the bar
+    # instead of repeatedly logging the same hardcoded percentage.
     if plan.compute_features_ot:
-        for bc in plan.batch_correct_states:
-            def _sub_cb(f, msg, *, _bc=bc):
+        n_bcs = max(1, len(plan.batch_correct_states))
+        for bi, bc in enumerate(plan.batch_correct_states):
+            bc_lo = 0.95 + (bi / n_bcs) * 0.05
+            bc_hi = 0.95 + ((bi + 1) / n_bcs) * 0.05
+
+            def _sub_cb(f, msg, *, _bc=bc, _lo=bc_lo, _hi=bc_hi):
                 if progress_cb:
+                    clamped = max(0.0, min(1.0, float(f)))
                     progress_cb(
-                        0.95 + 0.05 * (0.0 if _bc else 0.5),
+                        _lo + clamped * (_hi - _lo),
                         f"[features-OT BC={'on' if _bc else 'off'}] {msg}",
                     )
 
