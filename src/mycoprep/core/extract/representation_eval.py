@@ -538,7 +538,17 @@ def apply_harmony(
             max_iter_harmony=20,
             nclust=min(max(2, len(unique)), 5),
         )
-        return np.asarray(ho.Z_corr), True
+        Z = np.asarray(ho.Z_corr)
+        # harmonypy 0.0.9 returns Z_corr as (n_features, n_samples) —
+        # transpose of the input. Newer versions return (n_samples,
+        # n_features) directly. Orient back to match X regardless.
+        if Z.shape == X.shape:
+            return Z, True
+        if Z.shape == (X.shape[1], X.shape[0]):
+            return Z.T, True
+        # Unexpected shape — don't silently mangle metrics; fall back
+        # to the uncorrected matrix and let the caller flag it.
+        return X, False
     except Exception:  # noqa: BLE001
         return X, False
 
