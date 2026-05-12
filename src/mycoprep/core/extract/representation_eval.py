@@ -486,14 +486,27 @@ class SourceData:
 
 
 def _gene_from_condition_label(cond: str) -> str:
-    """First whitespace-separated token of the condition label.
+    """Best-effort gene extraction from a condition or well label.
 
-    Matches the convention used throughout qc_plots
-    ("<gene> ATc-" / "<gene> ATc+") and analysis_panel.
+    Handles both label conventions present in MycoPrep:
+    - Parsed condition labels like "hadA ATc+" → first whitespace token.
+    - Raw well stems "<atc>__<reporter>__<mutant>[__R<n>]" → ``mutant``
+      (third underscore token), via ``crops.derive_condition_fields``.
     """
     cond = str(cond).strip()
     if not cond:
         return ""
+    if "__" in cond:
+        from .crops import derive_condition_fields
+        gene = derive_condition_fields(cond).get("gene", "") or ""
+        if gene:
+            return gene
+        # derive_condition_fields returns "" when the mutant token looks
+        # like a control hint — fall back to that token so the row still
+        # has a usable key for replicate matching.
+        parts = cond.split("__")
+        if len(parts) > 2:
+            return parts[2].replace("_focused", "").replace("_filtered", "")
     return cond.split()[0]
 
 

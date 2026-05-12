@@ -260,6 +260,29 @@ def library_gene_template(
             typer.echo("No species detected; pass --species explicitly.")
             raise typer.Exit(code=1)
 
+    from .extract.crops import derive_condition_fields
+
+    def _gene_from_row(row, primary_col, fallback_col):
+        """Best-effort gene extraction.
+
+        For MycoPrep wells the canonical form is
+        ``<atc>__<reporter>__<mutant>[__R<n>]`` so the gene is the
+        third ``__`` token (parsed by ``derive_condition_fields``).
+        When the row already carries a parsed ``condition_label`` like
+        "hadA ATc+", first-whitespace-token suffices. The function tries
+        both.
+        """
+        cand = ""
+        if primary_col and primary_col in row.index:
+            cand = str(row[primary_col]).strip()
+        if not cand and fallback_col and fallback_col in row.index:
+            cand = str(row[fallback_col]).strip()
+        if not cand or cand.lower() == "nan":
+            return ""
+        if "__" in cand:
+            return derive_condition_fields(cand).get("gene", "") or ""
+        return cand.split()[0]
+
     counts: Counter[str] = Counter()
     diagnostics: list[str] = []
     for sp in species_iter:
@@ -267,36 +290,41 @@ def library_gene_template(
         if df.empty:
             diagnostics.append(f"  species={sp!r}: no runs matched")
             continue
-        # Resolve the column that holds the per-cell condition label.
-        cond_col = next(
-            (c for c in ("condition", "condition_label", "well") if c in df.columns),
+        # Prefer the underscore-delimited well stem (parsed by
+        # derive_condition_fields) since that's the authoritative source
+        # of the gene name; fall back to condition / condition_label.
+        primary_col = next(
+            (c for c in ("well", "condition", "condition_label") if c in df.columns),
             None,
         )
-        if cond_col is None:
+        fallback_col = next(
+            (c for c in ("condition", "condition_label", "well")
+             if c in df.columns and c != primary_col),
+            None,
+        )
+        if primary_col is None:
             diagnostics.append(
                 f"  species={sp!r}: loaded {len(df)} cells but no "
-                f"condition/condition_label/well column "
+                f"well/condition/condition_label column "
                 f"(columns: {list(df.columns)[:10]}...)"
             )
             continue
-        per_cond = (
-            df.groupby(cond_col)
-            .size()
-            .reset_index(name="n_cells")
-        )
-        per_cond["gene"] = (
-            per_cond[cond_col].astype(str).str.split().str[0].str.strip()
+        # Collapse to per-(well, condition) — one row per unique condition
+        # so the count column reflects condition-count, not cell-count.
+        group_cols = [c for c in [primary_col, fallback_col] if c]
+        per_cond = df[group_cols].drop_duplicates().reset_index(drop=True)
+        per_cond["__gene"] = per_cond.apply(
+            lambda r: _gene_from_row(r, primary_col, fallback_col), axis=1,
         )
         added = 0
-        for gene, n in (
-            per_cond.groupby("gene")[cond_col].nunique().items()
-        ):
-            if gene and gene.lower() != "nan":
-                counts[gene] += int(n)
-                added += 1
+        for gene, sub in per_cond.groupby("__gene"):
+            if not gene or gene.lower() == "nan":
+                continue
+            counts[gene] += int(len(sub))
+            added += 1
         diagnostics.append(
             f"  species={sp!r}: {len(df)} cells, {len(per_cond)} conditions, "
-            f"{added} unique genes (from column {cond_col!r})"
+            f"{added} unique genes (parsed from {primary_col!r})"
         )
 
     if not counts:
