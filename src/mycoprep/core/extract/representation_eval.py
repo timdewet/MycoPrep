@@ -63,7 +63,9 @@ def load_group_table(
         )
     df = df.rename(columns={lc["gene"]: "gene"})
 
-    grouping_cols = [c for c in df.columns if c != "gene"]
+    # Columns starting with "_" are treated as metadata (e.g. _n_conditions
+    # emitted by `library gene-template`) and never become grouping schemes.
+    grouping_cols = [c for c in df.columns if c != "gene" and not c.startswith("_")]
     if not grouping_cols:
         raise ValueError(
             f"Group table {path} must have at least one non-'gene' column"

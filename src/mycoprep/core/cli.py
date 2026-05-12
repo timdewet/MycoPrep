@@ -210,6 +210,102 @@ def library_remove(
         raise typer.Exit(code=1)
 
 
+@library_app.command("gene-template")
+def library_gene_template(
+    out_csv: str = typer.Argument(
+        ..., help="Output CSV path."
+    ),
+    species: str = typer.Option(
+        "", "--species", "-s",
+        help="Restrict to one species; default: every gene across all species.",
+    ),
+    columns: str = typer.Option(
+        "operon,family,functional_class", "--columns", "-c",
+        help="Comma-separated empty grouping columns to include for you to fill in.",
+    ),
+    with_counts: bool = typer.Option(
+        True, "--with-counts/--no-counts",
+        help="Include an _n_conditions column showing how many conditions exist "
+             "per gene. The underscore prefix means compare-representations "
+             "ignores it as metadata.",
+    ),
+    library_dir: str = typer.Option(
+        "", "--dir", help="Library directory."
+    ),
+) -> None:
+    """Emit a starter groupings CSV pre-filled with the genes in the library.
+
+    Each non-empty gene token across the library becomes a row; grouping
+    columns are left blank for you to fill in. Pass the resulting file
+    to `library compare-representations`.
+    """
+    from collections import Counter
+    from pathlib import Path
+
+    import pandas as pd
+
+    from .extract.feature_library import FeatureLibrary
+
+    lib = FeatureLibrary(Path(library_dir) if library_dir else None)
+
+    if species:
+        species_iter = [species]
+    else:
+        idx = lib.list_runs()
+        if idx.empty:
+            typer.echo("Library is empty.")
+            raise typer.Exit(code=1)
+        species_iter = sorted(s for s in idx["species"].astype(str).unique() if s)
+        if not species_iter:
+            typer.echo("No species detected; pass --species explicitly.")
+            raise typer.Exit(code=1)
+
+    counts: Counter[str] = Counter()
+    for sp in species_iter:
+        df = lib.load_species(sp)
+        if df.empty or "condition" not in df.columns:
+            continue
+        # Per-condition gene token (first whitespace-separated word).
+        per_cond = (
+            df.groupby("condition")
+            .size()
+            .reset_index(name="n_cells")
+        )
+        per_cond["gene"] = (
+            per_cond["condition"].astype(str).str.split().str[0].str.strip()
+        )
+        # One "condition" row per (gene, condition) — count unique conditions.
+        for gene, n in (
+            per_cond.groupby("gene")["condition"].nunique().items()
+        ):
+            if gene and gene.lower() != "nan":
+                counts[gene] += int(n)
+
+    if not counts:
+        typer.echo("No genes found in the library.")
+        raise typer.Exit(code=1)
+
+    group_cols = [c.strip() for c in columns.split(",") if c.strip()]
+    rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    out_df = pd.DataFrame({"gene": [g for g, _ in rows]})
+    if with_counts:
+        out_df["_n_conditions"] = [n for _, n in rows]
+    for col in group_cols:
+        out_df[col] = ""
+
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(out_path, index=False)
+
+    typer.echo(
+        f"Wrote {len(out_df)} genes to {out_path}.\n"
+        f"Fill in {', '.join(group_cols)} (empty cells = unmapped), then run:\n"
+        f"  mycoprep-cli library compare-representations {out_path}"
+        + (f' --species "{species}"' if species else "")
+    )
+
+
 @library_app.command("compare-representations")
 def library_compare_representations(
     group_csv: str = typer.Argument(
