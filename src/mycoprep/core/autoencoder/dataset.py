@@ -142,17 +142,36 @@ class HDF5CropDataset(Dataset):
     def _populate_cache(self) -> None:
         """Load each file's crops (selected channels, resized) and metadata into RAM."""
         import h5py
+        import sys
+        import time
 
         # Per-file metadata caches: path → dict[name → ndarray-of-strings/ints].
         # Keyed only by path (not channels/size) since the metadata is per-cell
         # and independent of how the imagery is sliced.
         self._cached_meta: list[dict] = []
+        n_files = len(self._h5_paths)
+        total_gb = self._cache_bytes / 1e9
+        sys.stderr.write(
+            f"  HDF5CropDataset: caching {n_files} file(s), "
+            f"~{total_gb:.1f} GB. This is one-time per session.\n"
+        )
+        sys.stderr.flush()
+        t0 = time.time()
         for fi, path in enumerate(self._h5_paths):
             ch_idx = self._channel_indices[fi]
             cache_key = (path.resolve(), tuple(ch_idx), self.target_size)
             if cache_key in _CROP_CACHE:
                 self._cached[fi] = _CROP_CACHE[cache_key]
+                sys.stderr.write(
+                    f"    [{fi+1}/{n_files}] {path.name}: hit shared cache\n"
+                )
+                sys.stderr.flush()
             else:
+                t_file = time.time()
+                sys.stderr.write(
+                    f"    [{fi+1}/{n_files}] {path.name}: reading...\n"
+                )
+                sys.stderr.flush()
                 with h5py.File(str(path), "r") as f:
                     arr = f["crops"][:, ch_idx]  # (N, C, H, W) float32
                 arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
@@ -167,6 +186,12 @@ class HDF5CropDataset(Dataset):
                     )
                 _CROP_CACHE[cache_key] = arr
                 self._cached[fi] = arr
+                sys.stderr.write(
+                    f"    [{fi+1}/{n_files}] {path.name}: cached "
+                    f"({arr.shape[0]} cells, {arr.nbytes/1e9:.1f} GB, "
+                    f"{time.time()-t_file:.1f}s)\n"
+                )
+                sys.stderr.flush()
 
             # Cache metadata too — tiny compared to crops, but necessary
             # downstream (groupby condition_label etc).
@@ -203,6 +228,11 @@ class HDF5CropDataset(Dataset):
                         meta_dict[key] = f[key][:].astype(bool)
             _CROP_CACHE[meta_key] = meta_dict  # type: ignore[assignment]
             self._cached_meta.append(meta_dict)
+
+        sys.stderr.write(
+            f"  HDF5CropDataset: cache populated in {time.time()-t0:.1f}s.\n"
+        )
+        sys.stderr.flush()
 
     @staticmethod
     def _batched_resize(arr: np.ndarray, target: int) -> np.ndarray:
