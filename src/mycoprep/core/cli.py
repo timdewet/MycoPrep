@@ -261,28 +261,61 @@ def library_gene_template(
             raise typer.Exit(code=1)
 
     counts: Counter[str] = Counter()
+    diagnostics: list[str] = []
     for sp in species_iter:
         df = lib.load_species(sp)
-        if df.empty or "condition" not in df.columns:
+        if df.empty:
+            diagnostics.append(f"  species={sp!r}: no runs matched")
             continue
-        # Per-condition gene token (first whitespace-separated word).
+        # Resolve the column that holds the per-cell condition label.
+        cond_col = next(
+            (c for c in ("condition", "condition_label", "well") if c in df.columns),
+            None,
+        )
+        if cond_col is None:
+            diagnostics.append(
+                f"  species={sp!r}: loaded {len(df)} cells but no "
+                f"condition/condition_label/well column "
+                f"(columns: {list(df.columns)[:10]}...)"
+            )
+            continue
         per_cond = (
-            df.groupby("condition")
+            df.groupby(cond_col)
             .size()
             .reset_index(name="n_cells")
         )
         per_cond["gene"] = (
-            per_cond["condition"].astype(str).str.split().str[0].str.strip()
+            per_cond[cond_col].astype(str).str.split().str[0].str.strip()
         )
-        # One "condition" row per (gene, condition) — count unique conditions.
+        added = 0
         for gene, n in (
-            per_cond.groupby("gene")["condition"].nunique().items()
+            per_cond.groupby("gene")[cond_col].nunique().items()
         ):
             if gene and gene.lower() != "nan":
                 counts[gene] += int(n)
+                added += 1
+        diagnostics.append(
+            f"  species={sp!r}: {len(df)} cells, {len(per_cond)} conditions, "
+            f"{added} unique genes (from column {cond_col!r})"
+        )
 
     if not counts:
         typer.echo("No genes found in the library.")
+        if diagnostics:
+            typer.echo("\nDiagnostics:")
+            for line in diagnostics:
+                typer.echo(line)
+        # Show what's registered so the user can correct the species filter.
+        idx_all = lib.list_runs()
+        if not idx_all.empty:
+            sp_present = sorted(
+                s for s in idx_all["species"].astype(str).unique() if s
+            )
+            typer.echo(
+                f"\nSpecies registered in the library: "
+                f"{sp_present if sp_present else '(none)'}"
+            )
+            typer.echo(f"Library dir: {lib.library_dir}")
         raise typer.Exit(code=1)
 
     group_cols = [c.strip() for c in columns.split(",") if c.strip()]
