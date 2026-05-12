@@ -574,8 +574,26 @@ def load_features_mean_source(
     if df_lib.empty:
         return None
 
-    df_lib["_run_id"] = df_lib.get("_library_run_id", "library").astype(str)
-    df_lib["condition"] = df_lib.get("condition", "").astype(str)
+    if "_library_run_id" in df_lib.columns:
+        df_lib["_run_id"] = df_lib["_library_run_id"].astype(str)
+    else:
+        df_lib["_run_id"] = "library"
+
+    # Resolve a usable per-condition label. Older library parquets may
+    # carry only `well` (raw filename stem); derive condition_label from
+    # the well via crops.derive_condition_fields when that's the case.
+    if "condition" in df_lib.columns:
+        df_lib["condition"] = df_lib["condition"].astype(str)
+    elif "condition_label" in df_lib.columns:
+        df_lib["condition"] = df_lib["condition_label"].astype(str)
+    elif "well" in df_lib.columns:
+        from .crops import derive_condition_fields
+        df_lib["condition"] = (
+            df_lib["well"].astype(str)
+            .map(lambda w: derive_condition_fields(w).get("condition_label") or w)
+        )
+    else:
+        return None
     df_lib["_combined_label"] = (
         df_lib["condition"] + " @ " + df_lib["_run_id"]
     )
