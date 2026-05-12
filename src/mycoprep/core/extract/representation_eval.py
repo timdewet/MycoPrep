@@ -1065,6 +1065,26 @@ def score_all_representations(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # If the caller asked for Harmony-on rows but harmonypy isn't installed,
+    # warn loudly — every "BC=True" result will silently equal the
+    # corresponding "BC=False" result, defeating the entire BC comparison.
+    if True in tuple(batch_correct_states):
+        try:
+            import harmonypy  # noqa: F401
+        except ImportError:
+            warning = (
+                "WARNING: --batch-correct on/both requested but `harmonypy` "
+                "is not installed. Harmony will be a no-op; BC=True and "
+                "BC=False rows will be identical. Install with:\n"
+                "  pip install harmonypy\n"
+                "or:  pip install -e .[profiling]"
+            )
+            if progress_cb:
+                progress_cb(0.0, warning)
+            else:
+                import sys
+                sys.stderr.write(warning + "\n")
+
     # ── 1. Generate artefacts ─────────────────────────────────────────
     plan = GenerationPlan(
         species=species,
