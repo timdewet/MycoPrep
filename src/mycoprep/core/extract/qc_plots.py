@@ -2153,10 +2153,13 @@ def _save_ot_sidecar(
     import pandas as pd
 
     try:
-        meta_df = pd.DataFrame(group_meta)
+        meta_df = pd.DataFrame(group_meta).reset_index(drop=True)
         n = D.shape[0]
-        for j in range(n):
-            meta_df[f"d_{j}"] = D[:, j]
+        # Build the distance columns as one block instead of inserting
+        # them one at a time — for a 62×62 matrix the latter triggers
+        # pandas' "DataFrame is highly fragmented" PerformanceWarning.
+        d_df = pd.DataFrame(D, columns=[f"d_{j}" for j in range(n)])
+        meta_df = pd.concat([meta_df, d_df], axis=1)
         sidecar = _ot_sidecar_path(html_path)
         meta_df.to_parquet(sidecar, index=False)
         if params is not None:
