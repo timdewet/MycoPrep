@@ -210,5 +210,171 @@ def library_remove(
         raise typer.Exit(code=1)
 
 
+@library_app.command("compare-representations")
+def library_compare_representations(
+    group_csv: str = typer.Argument(
+        ..., help="CSV/TSV with a 'gene' column and one or more grouping columns "
+                  "(e.g. operon, family, functional_class)."
+    ),
+    species: str = typer.Option(
+        "", "--species", "-s",
+        help="Restrict to one species; default: evaluate each species separately.",
+    ),
+    models: str = typer.Option(
+        "resnet18,lightweight,supcon_resnet18,supcon_lightweight",
+        "--models", "-m",
+        help="Comma-separated CNN architectures to evaluate (and train if missing).",
+    ),
+    batch_correct: str = typer.Option(
+        "both", "--batch-correct",
+        help="'both', 'on', or 'off' — which Harmony states to evaluate.",
+    ),
+    retrain: bool = typer.Option(
+        False, "--retrain",
+        help="Force retraining even if a model_type is already in the manifest.",
+    ),
+    epochs: int = typer.Option(
+        50, "--epochs", help="Epochs used when training a missing model."
+    ),
+    batch_size: int = typer.Option(64, "--batch-size"),
+    ot: bool = typer.Option(
+        True, "--ot/--no-ot",
+        help="Generate OT distance caches for features and embeddings.",
+    ),
+    umap: bool = typer.Option(
+        True, "--umap/--no-umap",
+        help="Add UMAP-projected evaluation rows for each source.",
+    ),
+    k: str = typer.Option(
+        "1,3,5", "--k",
+        help="Comma-separated k values for kNN same-group accuracy.",
+    ),
+    gene_key: str = typer.Option(
+        "gene", "--gene-key",
+        help="Replicate key: 'gene' (default; first token of condition_label) "
+             "or 'condition' (full condition, treats different reporter "
+             "backgrounds / treatments as distinct biological observations).",
+    ),
+    replicate_scope: bool = typer.Option(
+        True, "--replicate-scope/--no-replicate-scope",
+        help="Also emit a separate replicate-consistency score per source.",
+    ),
+    library_dir: str = typer.Option(
+        "", "--dir", help="Library directory (default: ~/.mycoprep/morphology_library/)."
+    ),
+    out_dir: str = typer.Option(
+        "", "--out",
+        help="Output dir; default: <library>/representation_eval/<timestamp>/",
+    ),
+    top_n: int = typer.Option(
+        15, "--top",
+        help="Show this many top rows of the summary table on stdout.",
+    ),
+) -> None:
+    """Score every representation against every grouping in GROUP_CSV.
+
+    Generates missing CNN encoders, embeddings, and OT distance caches
+    (with and without Harmony batch correction), then evaluates every
+    (source, batch_correct, grouping) using kNN same-group accuracy and
+    mAP. Writes a CSV/PNG summary under the output directory and prints
+    the top rows to stdout.
+    """
+    from pathlib import Path
+
+    from .extract.feature_library import FeatureLibrary
+    from .extract.representation_eval import score_all_representations
+
+    bc_arg = batch_correct.strip().lower()
+    if bc_arg == "both":
+        bc_states: tuple[bool, ...] = (True, False)
+    elif bc_arg == "on":
+        bc_states = (True,)
+    elif bc_arg == "off":
+        bc_states = (False,)
+    else:
+        typer.echo(f"--batch-correct must be one of: both, on, off (got {batch_correct!r})")
+        raise typer.Exit(code=1)
+
+    model_types = [m.strip() for m in models.split(",") if m.strip()]
+    if not model_types:
+        typer.echo("--models must list at least one model type.")
+        raise typer.Exit(code=1)
+
+    try:
+        k_list = tuple(int(x) for x in k.split(",") if x.strip())
+    except ValueError:
+        typer.echo(f"--k must be comma-separated integers (got {k!r})")
+        raise typer.Exit(code=1) from None
+    if not k_list:
+        k_list = (1, 3, 5)
+
+    if gene_key not in ("gene", "condition"):
+        typer.echo(f"--gene-key must be 'gene' or 'condition' (got {gene_key!r})")
+        raise typer.Exit(code=1)
+
+    lib_dir = Path(library_dir) if library_dir else None
+    out_path = Path(out_dir) if out_dir else None
+
+    # Resolve species list: a single one if specified, else iterate every
+    # species present in the library.
+    if species:
+        species_list = [species]
+    else:
+        lib = FeatureLibrary(lib_dir)
+        idx = lib.list_runs()
+        if idx.empty:
+            typer.echo("Library is empty.")
+            raise typer.Exit(code=1)
+        species_list = sorted(s for s in idx["species"].astype(str).unique() if s)
+        if not species_list:
+            typer.echo("No species detected in library; pass --species explicitly.")
+            raise typer.Exit(code=1)
+
+    all_metrics = []
+    for sp in species_list:
+        typer.echo(f"\n=== Species: {sp} ===")
+
+        def _cb(f: float, msg: str, *, _sp=sp):
+            typer.echo(f"  [{_sp}] {int(f * 100):3d}%  {msg}")
+
+        metrics, _ = score_all_representations(
+            lib_dir,
+            sp,
+            Path(group_csv),
+            model_types=model_types,
+            batch_correct_states=bc_states,
+            include_features_ot=ot,
+            include_embeddings_ot=ot,
+            include_umap=umap,
+            replicate_key_mode=gene_key,
+            include_replicate_scope=replicate_scope,
+            k_list=k_list,
+            out_dir=out_path,
+            progress_cb=_cb,
+        )
+        all_metrics.extend(metrics)
+
+    # Print headline table.
+    if not all_metrics:
+        typer.echo("\nNo metrics produced.")
+        return
+
+    from .extract.representation_eval import metrics_to_summary_df
+    df = metrics_to_summary_df(all_metrics)
+    if df.empty:
+        typer.echo("\nSummary table is empty.")
+        return
+
+    head = df.head(int(top_n))
+    show_cols = [
+        c for c in [
+            "species", "grouping", "scope", "representation", "batch_correct",
+            "map", "knn@1", "knn@5", "n_conditions",
+        ] if c in head.columns
+    ]
+    typer.echo(f"\nTop {len(head)} rows by mAP:\n")
+    typer.echo(head[show_cols].to_string(index=False))
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
