@@ -1076,8 +1076,29 @@ def score_all_representations(
                 "WARNING: --batch-correct on/both requested but `harmonypy` "
                 "is not installed. Harmony will be a no-op; BC=True and "
                 "BC=False rows will be identical. Install with:\n"
-                "  pip install harmonypy\n"
+                "  pip install \"harmonypy==0.0.9\"\n"
                 "or:  pip install -e .[profiling]"
+            )
+            if progress_cb:
+                progress_cb(0.0, warning)
+            else:
+                import sys
+                sys.stderr.write(warning + "\n")
+
+    # OT precompute needs `POT`. Without it, OT renders silently write a
+    # placeholder HTML and no sidecar, so the evaluator finds no rows for
+    # any OT representation (canonical caches built in a different env
+    # may still load, but new ones can't be produced).
+    if include_features_ot or include_embeddings_ot:
+        try:
+            import ot  # noqa: F401
+        except ImportError:
+            warning = (
+                "WARNING: OT evaluation requested but `POT` (Python Optimal "
+                "Transport) is not installed. OT distance matrices cannot "
+                "be computed; only pre-existing canonical caches will be "
+                "scored, and all BC=off OT rows will be missing. Install:\n"
+                "  pip install pot"
             )
             if progress_cb:
                 progress_cb(0.0, warning)
