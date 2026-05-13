@@ -210,6 +210,157 @@ def library_remove(
         raise typer.Exit(code=1)
 
 
+@library_app.command("precompute-ot-views")
+def library_precompute_ot_views(
+    species: str = typer.Option(
+        "", "--species", "-s",
+        help="Restrict to one species; default: every species in the library.",
+    ),
+    models: str = typer.Option(
+        "all",
+        "--models", "-m",
+        help="Comma-separated CNN model_types for embeddings-OT, or 'all' to "
+             "auto-discover from the embeddings directory, or 'none' to skip.",
+    ),
+    features: bool = typer.Option(
+        True, "--features/--no-features",
+        help="Also precompute the features-OT variants.",
+    ),
+    combos: str = typer.Option(
+        "all", "--combos",
+        help="Which (batch_correct, merge_replicates) combos to populate: "
+             "'all' for every variant, or a comma list like "
+             "'bc-on:merge-off,bc-off:merge-on'.",
+    ),
+    n_cells_per_condition: int = typer.Option(400, "--n-cells"),
+    sinkhorn_reg: float = typer.Option(0.05, "--reg"),
+    library_dir: str = typer.Option(
+        "", "--dir", help="Library directory."
+    ),
+) -> None:
+    """Populate the variant-keyed OT cache for every toggle combination.
+
+    Each (source, batch_correct, merge_replicates) cell gets its own
+    sidecar under ``<canonical>.variants/`` so flipping the toggles in
+    the Analysis panel doesn't trigger a fresh Sinkhorn compute. Time
+    cost equals one full OT compute per cell — features-OT × 4 combos
+    × N species + embeddings-OT × 4 combos × M model_types.
+    """
+    import itertools
+    from pathlib import Path
+
+    from .extract.feature_library import FeatureLibrary
+    from .extract.qc_plots import (
+        precompute_embedding_ot_cache,
+        precompute_features_ot_cache,
+    )
+
+    # Parse combos.
+    if combos.strip().lower() == "all":
+        bc_mr_combos = list(itertools.product([True, False], [True, False]))
+    else:
+        bc_mr_combos = []
+        for token in combos.split(","):
+            t = token.strip().lower().replace(" ", "")
+            if not t:
+                continue
+            bc = "bc-on" in t
+            mr = "merge-on" in t
+            if "bc-off" in t:
+                bc = False
+            if "merge-off" in t:
+                mr = False
+            bc_mr_combos.append((bc, mr))
+        if not bc_mr_combos:
+            typer.echo(f"No valid combos parsed from --combos {combos!r}")
+            raise typer.Exit(code=1)
+
+    lib_dir = Path(library_dir) if library_dir else None
+    lib = FeatureLibrary(lib_dir)
+
+    # Species.
+    if species:
+        species_list = [species]
+    else:
+        idx = lib.list_runs()
+        if idx.empty:
+            typer.echo("Library is empty.")
+            raise typer.Exit(code=1)
+        species_list = sorted(s for s in idx["species"].astype(str).unique() if s)
+
+    # Models.
+    if models.lower() == "none":
+        model_types: list[str] = []
+    elif models.lower() == "all":
+        emb_root = lib.models_dir / "embeddings"
+        model_types = (
+            sorted(
+                sub.name for sub in emb_root.iterdir()
+                if sub.is_dir() and (sub / "cnn_embeddings.parquet").exists()
+            ) if emb_root.exists() else []
+        )
+    else:
+        model_types = [m.strip() for m in models.split(",") if m.strip()]
+
+    total_jobs = (
+        (len(species_list) if features else 0) * len(bc_mr_combos)
+        + len(species_list) * len(model_types) * len(bc_mr_combos)
+    )
+    typer.echo(
+        f"Planning {total_jobs} OT precompute jobs across "
+        f"species={species_list}, model_types={model_types}, "
+        f"combos={[('bc-on' if b else 'bc-off', 'merge-on' if m else 'merge-off') for b, m in bc_mr_combos]}"
+    )
+
+    done = 0
+    for sp in species_list:
+        if features:
+            for bc, mr in bc_mr_combos:
+                done += 1
+                tag = f"features {sp!r} bc-{'on' if bc else 'off'}__merge-{'on' if mr else 'off'}"
+                typer.echo(f"\n[{done}/{total_jobs}] {tag}")
+                try:
+                    precompute_features_ot_cache(
+                        library_dir=lib_dir,
+                        species=sp,
+                        n_cells_per_condition=int(n_cells_per_condition),
+                        sinkhorn_reg=float(sinkhorn_reg),
+                        batch_correct=bc,
+                        merge_replicates=mr,
+                        progress_cb=lambda f, *_a: None,
+                    )
+                    typer.echo(f"  ok")
+                except Exception as exc:  # noqa: BLE001
+                    typer.echo(f"  FAILED: {exc}")
+
+        for mt in model_types:
+            emb_path = lib.models_dir / "embeddings" / mt / "cnn_embeddings.parquet"
+            if not emb_path.exists():
+                typer.echo(f"\n(skip — no embeddings parquet for {mt})")
+                continue
+            for bc, mr in bc_mr_combos:
+                done += 1
+                tag = f"embeddings {mt} {sp!r} bc-{'on' if bc else 'off'}__merge-{'on' if mr else 'off'}"
+                typer.echo(f"\n[{done}/{total_jobs}] {tag}")
+                try:
+                    precompute_embedding_ot_cache(
+                        emb_path,
+                        library_dir=lib_dir,
+                        species=sp,
+                        model_type=mt,
+                        n_cells_per_condition=int(n_cells_per_condition),
+                        sinkhorn_reg=float(sinkhorn_reg),
+                        batch_correct=bc,
+                        merge_replicates=mr,
+                        progress_cb=lambda f, *_a: None,
+                    )
+                    typer.echo(f"  ok")
+                except Exception as exc:  # noqa: BLE001
+                    typer.echo(f"  FAILED: {exc}")
+
+    typer.echo(f"\nDone. Variants live under <cache>.variants/bc-*__merge-*.ot_distance.parquet")
+
+
 @library_app.command("gene-template")
 def library_gene_template(
     out_csv: str = typer.Argument(

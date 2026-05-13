@@ -2353,6 +2353,63 @@ def _features_ot_cache_path(library_dir: "Path | None", species: str) -> "Path":
     return cache_dir / f"{safe}.ot_distance.parquet"
 
 
+def _ot_variant_cache_path(
+    canonical_path: "Path",
+    *,
+    batch_correct: bool,
+    merge_replicates: bool,
+) -> "Path":
+    """Sibling cache file for a specific ``(batch_correct, merge_replicates)`` combo.
+
+    The render functions overwrite the canonical cache file on every
+    parameter change (only one matrix fits per filename), which means
+    flipping a toggle in the GUI always triggers a full Sinkhorn
+    recompute. Storing a per-variant copy under
+    ``<canonical>.variants/bc-{on|off}__merge-{on|off}.ot_distance.parquet``
+    lets all four combos coexist; the load path checks the variant
+    location first and only falls through to the canonical cache as a
+    backward-compat fallback.
+    """
+    bc = "on" if batch_correct else "off"
+    mr = "on" if merge_replicates else "off"
+    variants_dir = canonical_path.parent / (canonical_path.stem + ".variants")
+    variants_dir.mkdir(parents=True, exist_ok=True)
+    return variants_dir / f"bc-{bc}__merge-{mr}.ot_distance.parquet"
+
+
+def _copy_to_variant_cache(
+    canonical_path: "Path",
+    *,
+    batch_correct: bool,
+    merge_replicates: bool,
+) -> "Path | None":
+    """After a fresh canonical cache write, snapshot it into the
+    matching variant slot so future renders with the same toggles can
+    skip recomputation. Best-effort — failures are non-fatal."""
+    import shutil
+
+    if not canonical_path.exists():
+        return None
+    variant = _ot_variant_cache_path(
+        canonical_path,
+        batch_correct=batch_correct,
+        merge_replicates=merge_replicates,
+    )
+    try:
+        shutil.copyfile(canonical_path, variant)
+        params_src = canonical_path.with_suffix(
+            canonical_path.suffix + ".params.json",
+        )
+        if params_src.exists():
+            shutil.copyfile(
+                params_src,
+                variant.with_suffix(variant.suffix + ".params.json"),
+            )
+        return variant
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _try_load_ot_cache(
     cache_sidecar: "Path",
     requested_params: dict,
@@ -2913,10 +2970,23 @@ def render_embeddings_ot_html(
         "emb_mtime_ns": emb_path.stat().st_mtime_ns,
     }
     cache_sidecar = _embedding_ot_cache_path(emb_path)
+    # Variant-keyed cache: lets all four (batch_correct, merge_replicates)
+    # combos coexist on disk so flipping toggles in the GUI doesn't force
+    # a Sinkhorn recompute. Try the variant slot first, fall through to
+    # the canonical cache (backward compat) only when the variant misses.
+    variant_sidecar = _ot_variant_cache_path(
+        cache_sidecar,
+        batch_correct=batch_correct,
+        merge_replicates=merge_replicates,
+    )
     cache_miss: list[str] = []
     cached = _try_load_ot_cache(
-        cache_sidecar, cache_params, miss_reason=cache_miss,
+        variant_sidecar, cache_params, miss_reason=cache_miss,
     )
+    if cached is None:
+        cached = _try_load_ot_cache(
+            cache_sidecar, cache_params, miss_reason=cache_miss,
+        )
     if cached is None and cache_miss:
         # Surface why a precomputed cache didn't take so the user can
         # see "param mismatch on emb_mtime_ns: ..." in the status bar
@@ -3187,6 +3257,14 @@ def render_embeddings_ot_html(
             )
     except Exception:  # noqa: BLE001
         pass
+    # Also snapshot to the variant slot so future renders with the same
+    # (batch_correct, merge_replicates) skip recomputation even when a
+    # different toggle combo has since overwritten the canonical cache.
+    _copy_to_variant_cache(
+        cache_sidecar,
+        batch_correct=batch_correct,
+        merge_replicates=merge_replicates,
+    )
 
     return _ot_render_from_distance(
         out_path,
@@ -3279,14 +3357,23 @@ def render_features_ot_html(
         "n_features": len(morph_cols),
     }
     cache_sidecar = _features_ot_cache_path(library_dir, species)
-    cache_miss: list[str] = []
-    cached = _try_load_ot_cache(
+    # Variant-keyed cache for the (batch_correct, merge_replicates) combo.
+    variant_sidecar = _ot_variant_cache_path(
         cache_sidecar,
-        # Only validate D-affecting params + library state. n_features
-        # is metadata and shouldn't gate cache hits.
-        {k: v for k, v in cache_params.items() if k != "n_features"},
-        miss_reason=cache_miss,
+        batch_correct=batch_correct,
+        merge_replicates=merge_replicates,
     )
+    cache_miss: list[str] = []
+    # Only validate D-affecting params + library state. n_features
+    # is metadata and shouldn't gate cache hits.
+    validate_params = {k: v for k, v in cache_params.items() if k != "n_features"}
+    cached = _try_load_ot_cache(
+        variant_sidecar, validate_params, miss_reason=cache_miss,
+    )
+    if cached is None:
+        cached = _try_load_ot_cache(
+            cache_sidecar, validate_params, miss_reason=cache_miss,
+        )
     if cached is None and cache_miss:
         progress_cb(0.05, f"OT cache miss: {cache_miss[0]}")
         import logging
@@ -3536,6 +3623,12 @@ def render_features_ot_html(
             )
     except Exception:  # noqa: BLE001
         pass
+    # Snapshot to variant slot for this (batch_correct, merge_replicates) combo.
+    _copy_to_variant_cache(
+        cache_sidecar,
+        batch_correct=batch_correct,
+        merge_replicates=merge_replicates,
+    )
 
     progress_cb(0.85)
 
