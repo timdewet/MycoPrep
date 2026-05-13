@@ -467,16 +467,13 @@ class SourceData:
     condition_keys: list[str] = field(default_factory=list)  # condition_label w/o run_id
     note: str = ""
 
-    def filter_to_conditions(self, allowed_keys: set[str]) -> "SourceData":
-        """Return a copy of this source containing only rows whose
-        ``condition_key`` (or ``condition_label`` as fallback) appears in
-        ``allowed_keys``. Returns ``self`` unchanged when nothing would
-        be dropped, otherwise a new :class:`SourceData` with X / D
-        sub-indexed appropriately.
+    def restrict_rows(self, keep: list[int]) -> "SourceData":
+        """Return a copy of this source restricted to the given row indices.
+
+        ``X`` / ``D`` are sub-indexed appropriately. Returns ``self``
+        unchanged when ``keep`` already covers every row in order.
         """
-        keys = self.condition_keys or self.condition_labels
-        keep = [i for i, k in enumerate(keys) if k in allowed_keys]
-        if len(keep) == len(self.condition_labels):
+        if len(keep) == len(self.condition_labels) and keep == list(range(len(keep))):
             return self
         new_X = self.X[keep] if self.X is not None else None
         if self.D is not None:
@@ -492,9 +489,23 @@ class SourceData:
             X=new_X,
             D=new_D,
             metric=self.metric,
-            condition_keys=[keys[i] for i in keep] if self.condition_keys else [],
+            condition_keys=(
+                [self.condition_keys[i] for i in keep]
+                if self.condition_keys else []
+            ),
             note=self.note,
         )
+
+    def filter_to_genes(self, allowed_genes: set[str]) -> "SourceData":
+        """Return a copy of this source restricted to rows whose
+        ``gene_labels`` value is in ``allowed_genes``. Gene-based filtering
+        is more robust than condition-key filtering because the
+        condition-label format differs between source types
+        (e.g. OT-features uses ``"<gene> ATc±"`` while CNN sidecars use
+        just ``"<gene>"``).
+        """
+        keep = [i for i, g in enumerate(self.gene_labels) if g in allowed_genes]
+        return self.restrict_rows(keep)
 
     def replicate_keys_for(self, mode: str) -> list[str]:
         """Return replicate keys per condition under the requested mode.
@@ -1215,35 +1226,41 @@ def score_all_representations(
                 if ot_src is not None:
                     sources.append((ot_src, bc))
 
-    # Diagnostic: report per-source condition counts so coverage gaps are
-    # visible regardless of whether the user enabled the intersection.
+    # Diagnostic: report per-source gene coverage so gaps are visible
+    # regardless of whether the user enabled the intersection.
     if sources and progress_cb:
-        counts_msg = "Source condition coverage:"
+        counts_msg = "Source coverage (unique genes / unique conditions):"
         for src, bc in sources:
+            n_genes = len({g for g in src.gene_labels if g})
             keys = src.condition_keys or src.condition_labels
             counts_msg += (
-                f"\n  {src.name} (bc={bc}): {len(set(keys))} unique conditions"
+                f"\n  {src.name} (bc={bc}): "
+                f"{n_genes} genes, {len(set(keys))} condition labels"
             )
         progress_cb(0.85, counts_msg)
 
-    # Optionally restrict every source to the intersection of condition
-    # keys so absolute mAPs are comparable across architectures whose
-    # extraction pipelines may have produced different condition sets.
+    # Optionally restrict every source to the intersection of *gene* sets
+    # so absolute mAPs are comparable across sources whose extraction
+    # pipelines produced different gene coverage. Intersecting by gene
+    # (rather than condition_label) is robust to format differences
+    # between source types — e.g. OT-features sidecars use "<gene> ATc±"
+    # while CNN-embedding sidecars use just "<gene>".
     intersected_size: Optional[int] = None
     if same_conditions_only and sources:
         common: Optional[set[str]] = None
         for src, _bc in sources:
-            keys = set(src.condition_keys or src.condition_labels)
-            common = keys if common is None else common & keys
+            gene_set = {g for g in src.gene_labels if g}
+            common = gene_set if common is None else common & gene_set
         intersected_size = len(common or set())
         if progress_cb:
             progress_cb(
                 0.86,
-                f"--same-conditions-only: restricting every source to "
-                f"the common {intersected_size} conditions",
+                f"--same-conditions-only: restricting every source to the "
+                f"common {intersected_size} genes (intersection across all "
+                f"loaded sources)",
             )
         if common is not None and intersected_size > 0:
-            sources = [(src.filter_to_conditions(common), bc) for src, bc in sources]
+            sources = [(src.filter_to_genes(common), bc) for src, bc in sources]
 
     all_metrics: list[RepresentationMetrics] = []
     for src, bc in sources:
@@ -1279,7 +1296,7 @@ def score_all_representations(
         "k_list": list(k_list),
         "include_umap": bool(include_umap),
         "same_conditions_only": bool(same_conditions_only),
-        "intersected_n_conditions": intersected_size,
+        "intersected_n_genes": intersected_size,
         "out_dir": str(out_dir),
         "generation": [
             {

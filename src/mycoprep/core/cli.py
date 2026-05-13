@@ -419,10 +419,12 @@ def library_compare_representations(
     same_conditions_only: bool = typer.Option(
         False, "--same-conditions-only",
         help="Before scoring, restrict every source to the intersection "
-             "of condition labels present across all loaded sources. "
-             "Use when different architectures' extractions cover "
-             "different subsets of conditions and the absolute mAPs "
-             "would otherwise not be directly comparable.",
+             "of *genes* present across all loaded sources. Use when "
+             "different architectures' extractions cover different "
+             "subsets of genes and the absolute mAPs would otherwise "
+             "not be directly comparable. Intersects by gene (not full "
+             "condition label) so it's robust to differences in how "
+             "each source formats its condition strings.",
     ),
     library_dir: str = typer.Option(
         "", "--dir", help="Library directory (default: ~/.mycoprep/morphology_library/)."
