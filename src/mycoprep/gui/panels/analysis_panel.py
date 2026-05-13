@@ -32,6 +32,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStackedLayout,
     QToolButton,
@@ -734,7 +736,33 @@ class AnalysisPanel(QWidget):
         self._status.setWordWrap(True)
         colour_row.addWidget(self._status, stretch=2)
 
-        root.addLayout(colour_row)
+        # Wrap the bottom toolbar in a horizontal scroll area. With ~20
+        # widgets in a single row (Colour-by + Baseline + Batch-correct +
+        # Highlight-gene + Compare + OT controls + export buttons +
+        # status), narrow Windows windows otherwise clip widgets off the
+        # right edge — the "Highlight gene(s)" selector and the OT
+        # controls would silently disappear with no visual indication.
+        # The scroll area shows a horizontal scrollbar only when needed
+        # and stays invisible on wide enough windows.
+        controls_container = QWidget()
+        controls_container.setLayout(colour_row)
+        controls_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed,
+        )
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidget(controls_container)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        controls_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        # Cap the scroll area's height to the natural height of one row
+        # so it doesn't steal vertical space from the plot.
+        controls_scroll.setFixedHeight(controls_container.sizeHint().height() + 12)
+        root.addWidget(controls_scroll)
 
     # ------------------------------------------------------------------
     # External wiring
