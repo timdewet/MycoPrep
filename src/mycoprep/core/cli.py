@@ -416,6 +416,14 @@ def library_compare_representations(
         True, "--replicate-scope/--no-replicate-scope",
         help="Also emit a separate replicate-consistency score per source.",
     ),
+    same_conditions_only: bool = typer.Option(
+        False, "--same-conditions-only",
+        help="Before scoring, restrict every source to the intersection "
+             "of condition labels present across all loaded sources. "
+             "Use when different architectures' extractions cover "
+             "different subsets of conditions and the absolute mAPs "
+             "would otherwise not be directly comparable.",
+    ),
     library_dir: str = typer.Option(
         "", "--dir", help="Library directory (default: ~/.mycoprep/morphology_library/)."
     ),
@@ -505,6 +513,7 @@ def library_compare_representations(
             include_umap=umap,
             replicate_key_mode=gene_key,
             include_replicate_scope=replicate_scope,
+            same_conditions_only=bool(same_conditions_only),
             epochs=int(epochs),
             batch_size=int(batch_size),
             retrain=bool(retrain),

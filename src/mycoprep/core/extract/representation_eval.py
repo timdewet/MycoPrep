@@ -467,6 +467,35 @@ class SourceData:
     condition_keys: list[str] = field(default_factory=list)  # condition_label w/o run_id
     note: str = ""
 
+    def filter_to_conditions(self, allowed_keys: set[str]) -> "SourceData":
+        """Return a copy of this source containing only rows whose
+        ``condition_key`` (or ``condition_label`` as fallback) appears in
+        ``allowed_keys``. Returns ``self`` unchanged when nothing would
+        be dropped, otherwise a new :class:`SourceData` with X / D
+        sub-indexed appropriately.
+        """
+        keys = self.condition_keys or self.condition_labels
+        keep = [i for i, k in enumerate(keys) if k in allowed_keys]
+        if len(keep) == len(self.condition_labels):
+            return self
+        new_X = self.X[keep] if self.X is not None else None
+        if self.D is not None:
+            new_D = self.D[np.ix_(keep, keep)]
+        else:
+            new_D = None
+        return SourceData(
+            name=self.name,
+            species=self.species,
+            condition_labels=[self.condition_labels[i] for i in keep],
+            gene_labels=[self.gene_labels[i] for i in keep],
+            run_ids=[self.run_ids[i] for i in keep] if self.run_ids else [],
+            X=new_X,
+            D=new_D,
+            metric=self.metric,
+            condition_keys=[keys[i] for i in keep] if self.condition_keys else [],
+            note=self.note,
+        )
+
     def replicate_keys_for(self, mode: str) -> list[str]:
         """Return replicate keys per condition under the requested mode.
 
@@ -1035,6 +1064,7 @@ def score_all_representations(
     include_umap: bool = True,
     replicate_key_mode: str = "gene",
     include_replicate_scope: bool = True,
+    same_conditions_only: bool = False,
     epochs: int = 50,
     batch_size: int = 64,
     retrain: bool = False,
@@ -1131,10 +1161,10 @@ def score_all_representations(
     if not mappings:
         raise ValueError(f"No usable groupings in {group_csv}")
 
-    # ── 3. Score each source × BC state ───────────────────────────────
-    all_metrics: list[RepresentationMetrics] = []
+    # ── 3. Load all sources first, optionally intersect their condition
+    # sets so every representation is scored on the same rows, then score.
+    sources: list[tuple[SourceData, bool]] = []
 
-    # Mean: morphology features
     if include_features:
         for bc in batch_correct_states:
             src = load_features_mean_source(
@@ -1142,17 +1172,8 @@ def score_all_representations(
             )
             if src is not None:
                 src.name = "features"
-                all_metrics.extend(
-                    score_source(
-                        src, mappings,
-                        batch_correct=bc,
-                        k_list=k_list, include_umap=include_umap,
-                        replicate_key_mode=replicate_key_mode,
-                        include_replicate_scope=include_replicate_scope,
-                    )
-                )
+                sources.append((src, bc))
 
-    # OT: morphology features
     if include_features_ot:
         for bc in batch_correct_states:
             sidecar = (
@@ -1166,37 +1187,18 @@ def score_all_representations(
                 batch_correct=bc,
             )
             if src is not None:
-                all_metrics.extend(
-                    score_source(
-                        src, mappings,
-                        batch_correct=bc,
-                        k_list=k_list, include_umap=include_umap,
-                        replicate_key_mode=replicate_key_mode,
-                        include_replicate_scope=include_replicate_scope,
-                    )
-                )
+                sources.append((src, bc))
 
-    # CNN: mean + OT per model_type
+    from .feature_library import FeatureLibrary
+    lib_local = FeatureLibrary(library_dir)
     for mt in model_types:
         for bc in batch_correct_states:
-            # Mean profiles
             src = load_cnn_mean_source(
                 library_dir, species, mt, batch_correct=bc,
             )
             if src is not None:
-                all_metrics.extend(
-                    score_source(
-                        src, mappings,
-                        batch_correct=bc,
-                        k_list=k_list, include_umap=include_umap,
-                        replicate_key_mode=replicate_key_mode,
-                        include_replicate_scope=include_replicate_scope,
-                    )
-                )
-            # OT
+                sources.append((src, bc))
             if include_embeddings_ot:
-                from .feature_library import FeatureLibrary
-                lib_local = FeatureLibrary(library_dir)
                 emb_parquet = (
                     lib_local.models_dir / "embeddings" / mt / "cnn_embeddings.parquet"
                 )
@@ -1211,13 +1213,49 @@ def score_all_representations(
                     batch_correct=bc,
                 )
                 if ot_src is not None:
-                    all_metrics.extend(
-                        score_source(
-                            ot_src, mappings,
-                            batch_correct=bc,
-                            k_list=k_list, include_umap=include_umap,
-                        )
-                    )
+                    sources.append((ot_src, bc))
+
+    # Diagnostic: report per-source condition counts so coverage gaps are
+    # visible regardless of whether the user enabled the intersection.
+    if sources and progress_cb:
+        counts_msg = "Source condition coverage:"
+        for src, bc in sources:
+            keys = src.condition_keys or src.condition_labels
+            counts_msg += (
+                f"\n  {src.name} (bc={bc}): {len(set(keys))} unique conditions"
+            )
+        progress_cb(0.85, counts_msg)
+
+    # Optionally restrict every source to the intersection of condition
+    # keys so absolute mAPs are comparable across architectures whose
+    # extraction pipelines may have produced different condition sets.
+    intersected_size: Optional[int] = None
+    if same_conditions_only and sources:
+        common: Optional[set[str]] = None
+        for src, _bc in sources:
+            keys = set(src.condition_keys or src.condition_labels)
+            common = keys if common is None else common & keys
+        intersected_size = len(common or set())
+        if progress_cb:
+            progress_cb(
+                0.86,
+                f"--same-conditions-only: restricting every source to "
+                f"the common {intersected_size} conditions",
+            )
+        if common is not None and intersected_size > 0:
+            sources = [(src.filter_to_conditions(common), bc) for src, bc in sources]
+
+    all_metrics: list[RepresentationMetrics] = []
+    for src, bc in sources:
+        all_metrics.extend(
+            score_source(
+                src, mappings,
+                batch_correct=bc,
+                k_list=k_list, include_umap=include_umap,
+                replicate_key_mode=replicate_key_mode,
+                include_replicate_scope=include_replicate_scope,
+            )
+        )
 
     # ── 4. Write outputs ──────────────────────────────────────────────
     summary_df = metrics_to_summary_df(all_metrics)
@@ -1240,6 +1278,8 @@ def score_all_representations(
         "groupings": list(mappings.keys()),
         "k_list": list(k_list),
         "include_umap": bool(include_umap),
+        "same_conditions_only": bool(same_conditions_only),
+        "intersected_n_conditions": intersected_size,
         "out_dir": str(out_dir),
         "generation": [
             {
