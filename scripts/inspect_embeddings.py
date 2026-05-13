@@ -87,6 +87,38 @@ def main() -> None:
     else:
         print("(no per-run breakdown available)")
 
+    # Sample condition_label strings per architecture so format / parsing
+    # differences are visible without guessing.
+    print("\n=== Sample condition_label strings (first 5 unique) ===")
+    label_sets: dict[str, set[str]] = {}
+    for sub in sorted(emb_root.iterdir()):
+        p = sub / "cnn_embeddings.parquet"
+        if not p.exists():
+            continue
+        df = pd.read_parquet(p)
+        if "condition_label" not in df.columns:
+            print(f"{sub.name}: (no condition_label column)")
+            continue
+        labels = sorted(df["condition_label"].astype(str).unique())
+        label_sets[sub.name] = set(labels)
+        print(f"\n{sub.name} ({len(labels)} unique):")
+        for s in labels[:5]:
+            print(f"    {s!r}")
+        if len(labels) > 5:
+            print(f"    ... and {len(labels) - 5} more")
+
+    # Pairwise intersection counts to see which architectures share labels.
+    if len(label_sets) > 1:
+        print("\n=== Pairwise condition_label intersection ===")
+        names = sorted(label_sets.keys())
+        rows = []
+        for a in names:
+            row = {"_": a}
+            for b in names:
+                row[b] = len(label_sets[a] & label_sets[b])
+            rows.append(row)
+        print(pd.DataFrame(rows).set_index("_").to_string())
+
 
 if __name__ == "__main__":
     main()
