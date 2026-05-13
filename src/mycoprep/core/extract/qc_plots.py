@@ -362,51 +362,6 @@ def make_qc_plots(
 # Morphology clustering helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_harmony_oriented(
-    X: "np.ndarray",
-    batch_labels,
-    *,
-    nclust: int,
-    max_iter: int = 20,
-) -> "np.ndarray":
-    """Run Harmony and return the corrected matrix oriented (n_samples, n_features).
-
-    Harmonypy's ``Z_corr`` orientation differs between major versions:
-    0.0.x returns ``(n_features, n_samples)``; 2.x returns
-    ``(n_samples, n_features)``. Every other call site in MycoPrep
-    historically assumed the 2.x orientation, which silently produced
-    transposed matrices on 0.0.9 (the version we pin for Windows
-    installability) — and the surrounding ``try/except`` would then
-    bury the resulting shape mismatch, leaving Harmony effectively
-    disabled with no warning.
-
-    This helper guarantees the returned shape equals ``X.shape``.
-    Raises ``ValueError`` if the result has an unexpected shape so the
-    caller can surface the failure rather than silently dropping it.
-    """
-    import harmonypy
-    import numpy as np
-    import pandas as pd
-
-    X = np.asarray(X)
-    ho = harmonypy.run_harmony(
-        X,
-        pd.DataFrame({"_batch": np.asarray(batch_labels).astype(str)}),
-        vars_use="_batch",
-        max_iter_harmony=int(max_iter),
-        nclust=int(nclust),
-    )
-    Z = np.asarray(ho.Z_corr)
-    if Z.shape == X.shape:
-        return Z
-    if Z.shape == (X.shape[1], X.shape[0]):
-        return Z.T
-    raise ValueError(
-        f"harmonypy returned Z_corr with unexpected shape {Z.shape} "
-        f"for input shape {X.shape}"
-    )
-
-
 _MORPHOLOGY_COLS_PREFERRED = [
     "length_um",
     "width_median_um",
@@ -601,6 +556,83 @@ def _subsample_stratified(df, max_n, group_col, rng):
     return __import__("pandas").concat(parts, ignore_index=True)
 
 
+_REPLICATE_RX_CACHE = None
+
+
+def _replicate_strip_regex():
+    """Lazy-compile a regex that matches a replicate suffix in a label.
+
+    Common patterns observed in MycoPrep labelling (current and likely-
+    future variants):
+    - ``"rpoB R1"`` → strip `` R1``
+    - ``"rpoB_R1"`` → strip ``_R1``
+    - ``"ATc+__iniB-mScarlet__rpoB__R1"`` → strip ``__R1``
+    - ``"rpoB R2 ATc+"`` → strip `` R2`` (middle of the string)
+
+    The regex consumes the separator + ``R<digits>`` together; downstream
+    callers clean orphan whitespace / trailing connectors.
+    """
+    global _REPLICATE_RX_CACHE
+    if _REPLICATE_RX_CACHE is None:
+        import re
+
+        _REPLICATE_RX_CACHE = re.compile(r"[\s_]+R\d+\b", re.IGNORECASE)
+    return _REPLICATE_RX_CACHE
+
+
+def _strip_replicate_suffix(label: str) -> str:
+    """Return ``label`` with ``_R<digits>`` / `` R<digits>`` patterns stripped.
+
+    Used by the OT views' and mean-views' ``merge_replicates`` mode to
+    collapse same-condition cells across replicate runs even when the
+    labeller embedded a per-run replicate index in ``condition_label``.
+
+    The user's current dataset uses ``R1`` for every condition (no
+    suffix variation between runs), so this is a no-op for them — kept
+    for future-proofing in case the labelling convention starts using
+    distinct ``R<n>`` suffixes per run.
+    """
+    import re
+
+    rx = _replicate_strip_regex()
+    s = rx.sub("", str(label))
+    # Collapse leftover whitespace + strip trailing connectors.
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[_\s]+$", "", s).strip()
+    return s
+
+
+def _harmony_oriented(ho, n_samples: int):
+    """Return Harmony's corrected matrix as ``(n_samples, d)``.
+
+    ``harmonypy.run_harmony`` returns ``Z_corr`` as a ``(d, N)`` matrix
+    (features × cells / samples), not the ``(N, d)`` orientation that
+    downstream sklearn / UMAP / DataFrame code expects. Older callers
+    in this module assigned ``ho.Z_corr`` directly and silently produced
+    UMAP embeddings of length ``d`` instead of ``n_samples`` — broken,
+    but it didn't error out under single-shot clustering. The consensus
+    UMAP+HDBSCAN in :func:`_run_umap_hdbscan` accumulates a
+    ``(n_samples, n_samples)`` co-association matrix and rejects the
+    mismatch loudly (``"operands could not be broadcast together with
+    shapes (95,95) (60,60) ..."``).
+
+    Detect orientation against ``n_samples`` and transpose if needed.
+    Robust to any future harmonypy version that flips the convention.
+    """
+    import numpy as np
+
+    Z = np.asarray(ho.Z_corr)
+    if Z.ndim != 2:
+        raise ValueError(f"harmony Z_corr has unexpected ndim={Z.ndim}")
+    if Z.shape[0] == n_samples:
+        return Z
+    if Z.shape[1] == n_samples:
+        return Z.T
+    raise ValueError(
+        f"harmony Z_corr shape {Z.shape} doesn't match n_samples={n_samples}",
+    )
+
+
 def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
                        min_cluster_size=3, random_state=42,
                        batch_labels=None,
@@ -641,6 +673,36 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
 
     n_samples, n_features = X_scaled.shape
 
+    # NaN / inf cleanup. Some shape features (angularity, curvature,
+    # pole_taper) produce NaN per cell when the contour spline fails on
+    # too-small or pathological cells; means and CVs of those features
+    # then carry NaN into per-condition profiles, and per-run S-score
+    # baselines compute NaN-bearing (μ, σ). Harmony's internal KMeans
+    # rejects NaN explicitly. Drop columns that are entirely NaN
+    # (no signal anywhere — keeping them just propagates problems),
+    # then impute remaining NaN/inf with 0 (post-z-score that's
+    # equivalent to "no deviation from baseline").
+    X_scaled = np.asarray(X_scaled, dtype=np.float64)
+    if X_scaled.size:
+        # NaN-only columns get dropped entirely. We do this in-place on
+        # a local copy and warn via the mycoprep logger so it's visible
+        # when troubleshooting; the column count is also stable across
+        # consensus runs (no random drops).
+        col_all_nan = np.all(~np.isfinite(X_scaled), axis=0)
+        if col_all_nan.any():
+            import logging
+            logging.getLogger("mycoprep").info(
+                "Clustering: dropping %d all-NaN columns out of %d",
+                int(col_all_nan.sum()), n_features,
+            )
+            X_scaled = X_scaled[:, ~col_all_nan]
+            n_features = X_scaled.shape[1]
+        # Replace remaining NaN / ±inf with 0. After S-score scaling the
+        # output is centred so 0 corresponds to "control baseline".
+        X_scaled = np.nan_to_num(
+            X_scaled, nan=0.0, posinf=0.0, neginf=0.0,
+        )
+
     # Skip PCA on low-D inputs (typical: 28–60-D shape S-scores). UMAP
     # handles them directly and PCA would discard low-variance axes that
     # carry phenotype signal. Keep PCA only when the input is genuinely
@@ -664,15 +726,22 @@ def _run_umap_hdbscan(X_scaled, n_neighbors=3, min_dist=0.0,
         n_batches = len(unique_batches)
         if n_batches >= 2:
             try:
-                # Conservative pinned nclust — anchored on the actual
-                # batch count, capped at 5. The previous adaptive
-                # ``min(max(2, N//5), 20)`` over-aligned on small N and
-                # could erase real biology when run/condition
-                # confounding was partial.
-                X_proc = _run_harmony_oriented(
-                    X_proc, batch_labels,
+                import harmonypy
+                import pandas as pd
+
+                ho = harmonypy.run_harmony(
+                    X_proc,
+                    pd.DataFrame({"run_id": batch_labels}),
+                    vars_use="run_id",
+                    max_iter_harmony=20,
+                    # Conservative pinned nclust — anchored on the actual
+                    # batch count, capped at 5. The previous adaptive
+                    # ``min(max(2, N//5), 20)`` over-aligned on small N
+                    # and could erase real biology when run/condition
+                    # confounding was partial.
                     nclust=min(max(2, n_batches), 5),
                 )
+                X_proc = _harmony_oriented(ho, n_samples)
             except ImportError:
                 pass
 
@@ -1448,6 +1517,7 @@ def render_library_html(
     highlight_genes: list[str] | None = None,
     baseline_mode: str = "pooled",
     batch_correct: bool = True,
+    merge_replicates: bool = False,
 ) -> "Path | None":
     """Render an interactive Plotly HTML for the library on its own.
 
@@ -1495,9 +1565,6 @@ def render_library_html(
         "_library_experiment_type", "knockdown",
     ).astype(str).fillna("knockdown")
     df_lib["_is_current_run"] = False
-    df_lib["_combined_label"] = (
-        df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str)
-    )
 
     # Union all controls registered with library runs.
     controls: list[str] = []
@@ -1507,6 +1574,34 @@ def render_library_html(
                 tok = tok.strip()
                 if tok and tok not in controls:
                     controls.append(tok)
+
+    # ``_combined_label`` is the per-condition key the S-score pipeline
+    # uses. Default convention: ``"<condition> @ <run_id>"`` (each
+    # (run, condition) gets its own profile point). When
+    # ``merge_replicates`` is on, non-control rows drop the ``@ run_id``
+    # suffix and additionally strip any embedded replicate identifier
+    # (R1, R2 …) — so the same condition across replicate runs collapses
+    # into one profile point. Controls keep the run_id suffix so their
+    # per-run variation remains visible as a noise floor.
+    if merge_replicates and controls:
+        import numpy as np
+
+        gene_for_merge = (
+            df_lib["condition"].astype(str).str.split().str[0]
+        )
+        is_ctrl_row = gene_for_merge.isin(controls)
+        cond_stripped = (
+            df_lib["condition"].astype(str).map(_strip_replicate_suffix)
+        )
+        df_lib["_combined_label"] = np.where(
+            is_ctrl_row.values,
+            df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str),
+            cond_stripped.astype(str),
+        )
+    else:
+        df_lib["_combined_label"] = (
+            df_lib["condition"].astype(str) + " @ " + df_lib["_run_id"].astype(str)
+        )
 
     profiles = _compute_condition_sscores(
         df_lib, morph_cols, "_combined_label",
@@ -1805,6 +1900,7 @@ def render_embeddings_html(
     highlight_genes: list[str] | None = None,
     batch_correct: bool = True,
     model_type: str = "",
+    merge_replicates: bool = False,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings as interactive Plotly HTML.
 
@@ -1910,7 +2006,56 @@ def render_embeddings_html(
     # already do for the S-score pipeline. Profile-level Harmony is more
     # stable with few batches: the algorithm doesn't have to invent a
     # cell-level subcluster structure that the data may not support.
-    if has_multi_runs and "condition_label" in df.columns:
+    #
+    # When ``merge_replicates`` is on, non-control cells are pooled across
+    # runs into one row (same condition across runs = one profile point);
+    # controls keep their per-run identity so between-control variation
+    # stays visible.
+    if merge_replicates and has_multi_runs and "condition_label" in df.columns:
+        # Build a row-level group key that collapses non-control rows
+        # by condition_label and keeps controls per-run.
+        _gene_for_merge = (
+            df["gene"].astype(str)
+            if "gene" in df.columns
+            else df["condition_label"].astype(str).str.split().str[0]
+        )
+        ctrl_mask = _gene_for_merge.isin(control_genes) if control_genes else None
+        cond_stripped = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
+        if ctrl_mask is not None and ctrl_mask.any():
+            run_key = np.where(
+                ctrl_mask.values,
+                df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+                cond_stripped.astype(str),
+            )
+        else:
+            run_key = cond_stripped.astype(str).values
+        df = df.copy()
+        df["_merge_key"] = run_key
+        profiles = df.groupby("_merge_key")[emb_cols].mean().reset_index()
+        # Split the synthetic key back into (run_id, condition_label) for
+        # downstream colouring / hover.
+        def _split_key(k):
+            k = str(k)
+            if "::" in k:
+                rid, cond = k.split("::", 1)
+                return rid, cond
+            # Merged non-control row — surface the contributing runs.
+            cond_rows = df[df["_merge_key"] == k]
+            runs = sorted(cond_rows["run_id"].astype(str).unique())
+            rid_label = ",".join(runs) if len(runs) <= 3 else f"{len(runs)} runs"
+            return rid_label, k
+        rids: list[str] = []
+        conds: list[str] = []
+        for k in profiles["_merge_key"]:
+            rid, cond = _split_key(k)
+            rids.append(rid)
+            conds.append(cond)
+        profiles["run_id"] = rids
+        profiles["condition_label"] = conds
+        profiles = profiles.drop(columns=["_merge_key"])
+    elif has_multi_runs and "condition_label" in df.columns:
         profiles = (
             df.groupby(["run_id", "condition_label"])[emb_cols]
             .mean()
@@ -1995,17 +2140,32 @@ def render_embeddings_html(
         from sklearn.decomposition import PCA
         import umap
 
+        # Strip NaN / ±inf BEFORE PCA → Harmony. Harmony's internal
+        # KMeans rejects NaN explicitly. Profile means can carry NaN
+        # when a condition has all-NaN cells for some embedding dim
+        # (rare for CNN embeddings but possible for upstream features-
+        # derived profiles).
+        emb_matrix = np.nan_to_num(
+            emb_matrix, nan=0.0, posinf=0.0, neginf=0.0,
+        )
         n_components_pca = min(50, emb_matrix.shape[1], emb_matrix.shape[0] - 1)
         pca = PCA(n_components=n_components_pca)
         reduced = pca.fit_transform(emb_matrix)
+        reduced = np.nan_to_num(reduced, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 3. Harmony in PCA space (more stable than raw 512-d).
         if batch_correct and has_multi_runs:
             try:
+                import harmonypy
                 nclust = max(2, min(20, len(profiles) // 4))
-                reduced = _run_harmony_oriented(
-                    reduced, profiles["run_id"].values, nclust=nclust,
+                ho = harmonypy.run_harmony(
+                    reduced,
+                    pd.DataFrame({"run_id": profiles["run_id"].values}),
+                    vars_use="run_id",
+                    max_iter_harmony=20,
+                    nclust=nclust,
                 )
+                reduced = _harmony_oriented(ho, reduced.shape[0])
             except ImportError:
                 pass
             except Exception:  # noqa: BLE001
@@ -2153,13 +2313,10 @@ def _save_ot_sidecar(
     import pandas as pd
 
     try:
-        meta_df = pd.DataFrame(group_meta).reset_index(drop=True)
+        meta_df = pd.DataFrame(group_meta)
         n = D.shape[0]
-        # Build the distance columns as one block instead of inserting
-        # them one at a time — for a 62×62 matrix the latter triggers
-        # pandas' "DataFrame is highly fragmented" PerformanceWarning.
-        d_df = pd.DataFrame(D, columns=[f"d_{j}" for j in range(n)])
-        meta_df = pd.concat([meta_df, d_df], axis=1)
+        for j in range(n):
+            meta_df[f"d_{j}"] = D[:, j]
         sidecar = _ot_sidecar_path(html_path)
         meta_df.to_parquet(sidecar, index=False)
         if params is not None:
@@ -2264,6 +2421,7 @@ def precompute_features_ot_cache(
     sinkhorn_reg: float = 0.05,
     pca_dims_before_ot: int = 0,
     batch_correct: bool = True,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Precompute the features-OT distance matrix for one species.
@@ -2287,6 +2445,7 @@ def precompute_features_ot_cache(
             sinkhorn_reg=sinkhorn_reg,
             pca_dims_before_ot=pca_dims_before_ot,
             batch_correct=batch_correct,
+            merge_replicates=merge_replicates,
             progress_cb=progress_cb,
         )
     except Exception:  # noqa: BLE001
@@ -2305,6 +2464,7 @@ def precompute_embedding_ot_cache(
     sinkhorn_reg: float = 0.05,
     pca_dims_before_ot: int = 50,
     batch_correct: bool = True,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Precompute the OT distance matrix for an embeddings parquet.
@@ -2333,6 +2493,7 @@ def precompute_embedding_ot_cache(
             sinkhorn_reg=sinkhorn_reg,
             pca_dims_before_ot=pca_dims_before_ot,
             batch_correct=batch_correct,
+            merge_replicates=merge_replicates,
             progress_cb=progress_cb,
         )
     except Exception:  # noqa: BLE001
@@ -2663,6 +2824,7 @@ def render_embeddings_ot_html(
     n_neighbors: int = 5,
     pca_dims_before_ot: int = 50,
     pathway_csv: "Path | None" = None,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """Render UMAP of CNN embeddings with **Optimal Transport** distance.
@@ -2747,6 +2909,7 @@ def render_embeddings_ot_html(
         "sinkhorn_reg": float(sinkhorn_reg),
         "pca_dims_before_ot": int(pca_dims_before_ot or 0),
         "batch_correct": bool(batch_correct),
+        "merge_replicates": bool(merge_replicates),
         "emb_mtime_ns": emb_path.stat().st_mtime_ns,
     }
     cache_sidecar = _embedding_ot_cache_path(emb_path)
@@ -2770,6 +2933,20 @@ def render_embeddings_ot_html(
         # Analysis panel's "Ranked matches" / "Permutation test"
         # buttons resolve it the same as a freshly-rendered view.
         _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        # Make cache hits VISIBLY distinct. Without this the worker's
+        # default "Computing OT distance matrix… 95%" text still
+        # fires and the user can't tell whether they're waiting on a
+        # 30-second recompute or a 1-second cache load.
+        progress_cb(
+            0.5,
+            f"OT cache HIT — rendering UMAP from precomputed "
+            f"({D.shape[0]}×{D.shape[0]}) distance matrix...",
+        )
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache HIT (embeddings @ %s): %d groups",
+            cache_sidecar, D.shape[0],
+        )
         return _ot_render_from_distance(
             out_path,
             D=D, group_meta=group_meta,
@@ -2814,18 +2991,30 @@ def render_embeddings_ot_html(
 
     if batch_correct and has_multi_runs:
         try:
+            import harmonypy
             from sklearn.decomposition import PCA
             # Reduce to ~50-d before Harmony (same logic as S-score path).
             n_pca = min(50, len(emb_cols), max(2, len(df) // 10))
+            # Strip NaN / ±inf BEFORE Harmony — its internal KMeans
+            # rejects them with the same error as the consensus path.
+            X_in = df[emb_cols].values.astype(np.float32)
+            X_in = np.nan_to_num(X_in, nan=0.0, posinf=0.0, neginf=0.0)
             pca = PCA(n_components=n_pca)
-            X_pca = pca.fit_transform(df[emb_cols].values.astype(np.float32))
-            Z = _run_harmony_oriented(
-                X_pca, df["run_id"].values,
+            X_pca = pca.fit_transform(X_in)
+            X_pca = np.nan_to_num(X_pca, nan=0.0, posinf=0.0, neginf=0.0)
+            ho = harmonypy.run_harmony(
+                X_pca,
+                pd.DataFrame({"run_id": df["run_id"].values}),
+                vars_use="run_id",
+                max_iter_harmony=20,
                 nclust=min(20, max(2, len(df) // 200)),
             )
             # Replace embeddings columns with corrected (and PCA-reduced)
             # representation. OT works in any dim — the reduced form is
-            # actually faster.
+            # actually faster. ``_harmony_oriented`` normalises Z_corr
+            # to (n_cells, d) regardless of harmonypy's internal axis
+            # convention.
+            Z = _harmony_oriented(ho, len(df))
             emb_cols = [f"hpc_{i}" for i in range(Z.shape[1])]
             df = df.drop(columns=[c for c in df.columns if c.startswith("emb_")])
             for i, c in enumerate(emb_cols):
@@ -2883,10 +3072,30 @@ def render_embeddings_ot_html(
         except Exception:  # noqa: BLE001
             pass
 
-    # Group by (run_id, condition_label), sample n cells per group.
-    group_cols = (
-        ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
-    )
+    # Group by (run_id, condition_label). When ``merge_replicates`` is
+    # on, non-control rows get keyed by ``condition_label`` alone so
+    # the same condition across multiple runs ends up as a single
+    # point cloud. Controls keep their per-run identity so between-
+    # control variation is still visible as a noise floor (the user
+    # explicitly asked for this carve-out).
+    if merge_replicates:
+        is_ctrl = df["gene"].astype(str).isin(control_genes)
+        # Non-control merge key: condition_label with any replicate
+        # suffix (R1, R2 …) stripped, so labels that embed a run index
+        # collapse correctly. Controls keep their per-run identity.
+        merge_key_noctrl = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
+        df["_merge_key"] = np.where(
+            is_ctrl.values,
+            df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+            merge_key_noctrl,
+        )
+        group_cols = ["_merge_key"]
+    else:
+        group_cols = (
+            ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+        )
     groups = df.groupby(group_cols)
     rng = np.random.default_rng(42)
     point_clouds: list[np.ndarray] = []
@@ -2898,10 +3107,22 @@ def render_embeddings_ot_html(
         idx = rng.choice(len(gdf), size=n, replace=False)
         pc = gdf[emb_cols].values[idx].astype(np.float32)
         point_clouds.append(pc)
-        # pandas 3.x returns groupby keys as tuples even for single-col
-        # groupbys (("cond",)), so check the actual tuple length rather
-        # than relying on has_multi_runs to align with the tuple shape.
-        if isinstance(key, tuple) and len(key) == 2:
+        if merge_replicates:
+            key_str = key[0] if isinstance(key, tuple) else str(key)
+            if "::" in key_str:
+                # Per-run control key.
+                run_id, cond = key_str.split("::", 1)
+            else:
+                # Merged non-control: summarise contributing runs.
+                runs_present = sorted(gdf["run_id"].astype(str).unique())
+                run_id = (
+                    ",".join(runs_present) if len(runs_present) <= 3
+                    else f"{len(runs_present)} runs"
+                )
+                cond = key_str
+        elif isinstance(key, tuple) and len(key) == 2:
+            # pandas 3.x returns groupby keys as tuples even for single-col
+            # groupbys (("cond",)), so check the actual tuple length.
             run_id, cond = key
         elif isinstance(key, tuple) and len(key) == 1:
             run_id, cond = "unknown", key[0]
@@ -3004,6 +3225,7 @@ def render_features_ot_html(
     n_neighbors: int = 5,
     pca_dims_before_ot: int = 0,
     pathway_csv: "Path | None" = None,
+    merge_replicates: bool = False,
     progress_cb=None,
 ) -> "Path | None":
     """OT-based UMAP of S-score morphological profiles.
@@ -3048,6 +3270,7 @@ def render_features_ot_html(
         "sinkhorn_reg": float(sinkhorn_reg),
         "pca_dims_before_ot": int(pca_dims_before_ot or 0),
         "batch_correct": bool(batch_correct),
+        "merge_replicates": bool(merge_replicates),
         "library_mtime_ns": (
             library_index.stat().st_mtime_ns
             if library_index.exists() else 0
@@ -3078,6 +3301,16 @@ def render_features_ot_html(
     if cached is not None:
         D, group_meta = cached
         _save_ot_sidecar(out_path, D, group_meta, params=cache_params)
+        progress_cb(
+            0.5,
+            f"OT cache HIT — rendering UMAP from precomputed "
+            f"({D.shape[0]}×{D.shape[0]}) distance matrix...",
+        )
+        import logging
+        logging.getLogger("mycoprep").info(
+            "OT cache HIT (features @ %s): %d groups",
+            cache_sidecar, D.shape[0],
+        )
         return _ot_render_from_distance(
             out_path,
             D=D, group_meta=group_meta,
@@ -3159,12 +3392,15 @@ def render_features_ot_html(
     # isn't necessary first).
     if batch_correct and has_multi_runs:
         try:
-            Z = _run_harmony_oriented(
+            import harmonypy
+            ho = harmonypy.run_harmony(
                 df[morph_cols].values.astype(np.float32),
-                df["run_id"].values,
+                pd.DataFrame({"run_id": df["run_id"].values}),
+                vars_use="run_id",
+                max_iter_harmony=20,
                 nclust=min(20, max(2, len(df) // 200)),
             )
-            df[morph_cols] = Z
+            df[morph_cols] = _harmony_oriented(ho, len(df))
         except ImportError:
             pass
         except Exception:  # noqa: BLE001
@@ -3182,8 +3418,28 @@ def render_features_ot_html(
                     X[idx] = X[idx] - a
             df[morph_cols] = X
 
-    # Group + sample.
-    group_cols = ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+    # Group + sample. ``merge_replicates`` collapses same-condition
+    # cells across runs (so e.g. rpoB-knockdown cells from run1+run2+
+    # run3 become a single point cloud) but keeps controls per-run
+    # so between-control variation remains visible.
+    if merge_replicates:
+        is_ctrl = df["gene"].astype(str).isin(control_genes)
+        # Non-control merge key: condition_label with any replicate
+        # suffix (R1, R2 …) stripped, so labels that embed a run index
+        # collapse correctly. Controls keep their per-run identity.
+        merge_key_noctrl = (
+            df["condition_label"].astype(str).map(_strip_replicate_suffix)
+        )
+        df["_merge_key"] = np.where(
+            is_ctrl.values,
+            df["run_id"].astype(str) + "::" + df["condition_label"].astype(str),
+            merge_key_noctrl,
+        )
+        group_cols = ["_merge_key"]
+    else:
+        group_cols = (
+            ["run_id", "condition_label"] if has_multi_runs else ["condition_label"]
+        )
     rng = np.random.default_rng(42)
     point_clouds: list[np.ndarray] = []
     group_meta: list[dict] = []
@@ -3193,10 +3449,18 @@ def render_features_ot_html(
             continue
         idx = rng.choice(len(gdf), size=n, replace=False)
         point_clouds.append(gdf[morph_cols].values[idx].astype(np.float32))
-        # pandas 3.x returns groupby keys as tuples even for single-col
-        # groupbys (("cond",)), so check the actual tuple length rather
-        # than relying on has_multi_runs to align with the tuple shape.
-        if isinstance(key, tuple) and len(key) == 2:
+        if merge_replicates:
+            key_str = key[0] if isinstance(key, tuple) else str(key)
+            if "::" in key_str:
+                run_id, cond = key_str.split("::", 1)
+            else:
+                runs_present = sorted(gdf["run_id"].astype(str).unique())
+                run_id = (
+                    ",".join(runs_present) if len(runs_present) <= 3
+                    else f"{len(runs_present)} runs"
+                )
+                cond = key_str
+        elif isinstance(key, tuple) and len(key) == 2:
             run_id, cond = key
         elif isinstance(key, tuple) and len(key) == 1:
             run_id, cond = "unknown", key[0]
