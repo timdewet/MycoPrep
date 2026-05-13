@@ -198,13 +198,18 @@ def _harmony_correct(embeddings: np.ndarray, run_ids: np.ndarray) -> np.ndarray:
     installed harmonypy version (0.0.x returns transposed; 2.x doesn't).
     """
     try:
-        from mycoprep.core.extract.qc_plots import _run_harmony_oriented
+        import harmonypy
+        from mycoprep.core.extract.qc_plots import _harmony_oriented
         import numpy as np
         unique = np.unique(np.asarray(run_ids).astype(str))
-        return _run_harmony_oriented(
-            embeddings, run_ids,
+        ho = harmonypy.run_harmony(
+            embeddings,
+            pd.DataFrame({"run_id": np.asarray(run_ids).astype(str)}),
+            vars_use="run_id",
+            max_iter_harmony=20,
             nclust=min(max(2, len(unique)), 5),
         )
+        return _harmony_oriented(ho, embeddings.shape[0])
     except ImportError:
         return embeddings
     except Exception:
