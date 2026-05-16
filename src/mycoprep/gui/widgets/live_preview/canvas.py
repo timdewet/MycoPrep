@@ -142,10 +142,27 @@ class MultiOverlayCanvas(QWidget):
             autoLevels=False,
             levels=(lo, hi),
         )
-        if not self._image_initialised:
+        first_image = not self._image_initialised
+        if first_image:
             self._image_view.view.autoRange()
             self._image_initialised = True
         self._phase_shape = phase.shape
+        # On the very first image, the ROI was built against a synthetic
+        # 512×512 fallback (no image had loaded yet), so it sits in the
+        # top-left of the real FOV. Re-centre it now that we know the
+        # actual dims and fire the change listeners so the controller
+        # re-runs segment on the centred crop instead of leaving the
+        # mask painted in the corner.
+        if first_image and self._roi is not None:
+            h, w = self._phase_shape
+            side = max(64, int(min(h, w) * 0.5))
+            x = max(0, (w - side) // 2)
+            y = max(0, (h - side) // 2)
+            self._roi.blockSignals(True)
+            self._roi.setPos([x, y])
+            self._roi.setSize([side, side])
+            self._roi.blockSignals(False)
+            self._on_roi_changed()
 
     def ensure_channel_item_count(self, n: int) -> None:
         """Pre-allocate ``n`` channel ``ImageItem`` slots.
@@ -285,19 +302,28 @@ class MultiOverlayCanvas(QWidget):
                 handle["item"].setVisible(visible)
 
     def get_roi_bounds(self) -> Optional[tuple[int, int, int, int]]:
-        """Return the ROI bounds clamped to the image, as ``(x0, y0, x1, y1)``,
-        or ``None`` when no ROI is shown / valid."""
+        """Return the ROI bounds as ``(x0, y0, x1, y1)`` in image-pixel
+        coordinates, or ``None`` when no ROI is shown / valid.
+
+        When ``_phase_shape`` is known the bounds are clamped to the image.
+        Before the first ``set_phase`` we don't know the image dims yet —
+        return the raw ROI rect (clamped to ``>= 0``) so the very first
+        segment runs on the small ROI patch rather than the whole FOV
+        (the worker clips against ``phase.shape`` defensively).
+        """
         if self._roi is None or not self._roi.isVisible():
             return None
-        if self._phase_shape is None:
-            return None
-        h, w = self._phase_shape
         pos = self._roi.pos()
         size = self._roi.size()
         x0 = int(max(0.0, pos.x()))
         y0 = int(max(0.0, pos.y()))
-        x1 = int(min(float(w), pos.x() + size.x()))
-        y1 = int(min(float(h), pos.y() + size.y()))
+        if self._phase_shape is None:
+            x1 = int(max(x0, pos.x() + size.x()))
+            y1 = int(max(y0, pos.y() + size.y()))
+        else:
+            h, w = self._phase_shape
+            x1 = int(min(float(w), pos.x() + size.x()))
+            y1 = int(min(float(h), pos.y() + size.y()))
         if x1 - x0 < 4 or y1 - y0 < 4:
             return None  # too small to bother with
         return (x0, y0, x1, y1)

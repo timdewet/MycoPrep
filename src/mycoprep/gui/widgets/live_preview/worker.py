@@ -309,11 +309,24 @@ class PreviewWorker(QThread):
         # If the user has set an ROI, crop the phase plane before
         # cellpose runs and pad the resulting mask back into a
         # full-size canvas so labels and overlays stay in image
-        # coordinates.
+        # coordinates. The ROI may have been produced by the canvas
+        # before it knew the real image dims (first render after
+        # launch), so clip against ``phase.shape`` here.
         roi = req.roi
         if roi is not None:
+            h, w = phase.shape[:2]
             x0, y0, x1, y1 = roi
-            phase_for_seg = phase[y0:y1, x0:x1]
+            x0 = max(0, min(int(x0), w))
+            x1 = max(x0, min(int(x1), w))
+            y0 = max(0, min(int(y0), h))
+            y1 = max(y0, min(int(y1), h))
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                # ROI clipped to nothing — fall back to the whole image.
+                roi = None
+                phase_for_seg = phase
+            else:
+                roi = (x0, y0, x1, y1)
+                phase_for_seg = phase[y0:y1, x0:x1]
         else:
             phase_for_seg = phase
 
