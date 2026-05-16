@@ -222,7 +222,6 @@ def run_focus(
 
 @dataclass
 class SegmentOpts:
-    model_type: str = "cpsam"
     diameter: Optional[float] = None
     gpu: bool = True
     pixels_per_um: float = DEFAULT_PIXELS_PER_UM
@@ -247,8 +246,8 @@ def segment_tiff(
 
     from .cellpose_pipeline import process_tiff_unit, save_hyperstack
 
-    progress_cb(0.0, f"Loading Cellpose model ({opts.model_type}, gpu={opts.gpu})")
-    model = CellposeModel(gpu=opts.gpu, model_type=opts.model_type)
+    progress_cb(0.0, f"Loading Cellpose model (cpsam, gpu={opts.gpu})")
+    model = CellposeModel(gpu=opts.gpu)
 
     progress_cb(0.1, f"Segmenting FOVs in {tiff_path.name}")
     stacked, fov_names, total_cells = process_tiff_unit(
@@ -257,7 +256,6 @@ def segment_tiff(
         phase_channel=phase_channel,
         diameter=opts.diameter,
         classify_opts=None,           # classification handled by classify_filter_tiff
-        model_type=opts.model_type,
         flow_threshold=opts.flow_threshold,
         cellprob_threshold=opts.cellprob_threshold,
         min_size=opts.min_size,

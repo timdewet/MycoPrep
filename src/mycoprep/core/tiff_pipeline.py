@@ -42,7 +42,7 @@ from .label_cells import load_hyperstack
 
 
 def process_tiff_file(tiff_path, model, phase_channel, diameter=None,
-                      classify_opts=None, model_type="cpsam", sample=False):
+                      classify_opts=None, sample=False):
     """
     Segment all (or a sampled) FOVs in a multi-FOV TIFF hyperstack.
 
@@ -52,7 +52,6 @@ def process_tiff_file(tiff_path, model, phase_channel, diameter=None,
         phase_channel: 0-indexed channel number for phase contrast
         diameter: Expected cell diameter in pixels (None = auto-estimate)
         classify_opts: dict with cell quality filtering options, or None
-        model_type: Cellpose model type string
         sample: If True, process only 1 random FOV
 
     Returns:
@@ -84,7 +83,7 @@ def process_tiff_file(tiff_path, model, phase_channel, diameter=None,
 
         phase = channels[phase_channel]
 
-        masks = segment_phase(phase, model, diameter=diameter, model_type=model_type)
+        masks = segment_phase(phase, model, diameter=diameter)
         n_cells = masks.max()
         print(f"{n_cells} cells", end=" ... ")
 

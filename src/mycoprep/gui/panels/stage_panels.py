@@ -206,8 +206,6 @@ class SegmentPanel(QWidget):
         form.setContentsMargins(tokens.S4, tokens.S5, tokens.S4, tokens.S4)
         form.setHorizontalSpacing(tokens.S4)
         form.setVerticalSpacing(tokens.S3)
-        self.model_type = QComboBox()
-        self.model_type.addItems(["cpsam", "cyto3", "cyto2"])
         self.diameter = QDoubleSpinBox(); self.diameter.setRange(0.0, 500.0); self.diameter.setSpecialValueText("auto")
         # Default to a concrete value (rather than ``auto``) so cellpose's
         # rescale-by-diameter pass lands on a sensible image size — the
@@ -242,10 +240,6 @@ class SegmentPanel(QWidget):
         self.min_size.setRange(0, 5000); self.min_size.setValue(15)
         self.min_size.setToolTip("Minimum mask area in pixels. Default 15. Set to 0 to disable.")
 
-        form.addRow("Cellpose model:", _with_helper(
-            self.model_type,
-            "cpsam = newest (recommended). cyto3/cyto2 = older Cellpose builds.",
-        ))
         form.addRow("Diameter (px):", _with_helper(
             self.diameter,
             "Median cell diameter in pixels; 0 = let Cellpose estimate.",
@@ -279,7 +273,6 @@ class SegmentPanel(QWidget):
         root.addStretch(1)
 
         # Fan in option-widget signals → optionsChanged.
-        self.model_type.currentIndexChanged.connect(self._emit_options_changed)
         self.diameter.valueChanged.connect(self._emit_options_changed)
         self.min_size.valueChanged.connect(self._emit_options_changed)
         self.gpu.toggled.connect(self._emit_options_changed)
@@ -309,7 +302,6 @@ class SegmentPanel(QWidget):
     def opts(self) -> SegmentOpts:
         diameter = None if self.diameter.value() == 0.0 else self.diameter.value()
         return SegmentOpts(
-            model_type=self.model_type.currentText(),
             diameter=diameter,
             flow_threshold=self.flow_threshold.value(),
             cellprob_threshold=self.cellprob_threshold.value(),
@@ -320,7 +312,6 @@ class SegmentPanel(QWidget):
 
     def state(self) -> dict:
         return {
-            "model_type": self.model_type.currentText(),
             "diameter": self.diameter.value(),
             "flow_threshold": self.flow_threshold.value(),
             "cellprob_threshold": self.cellprob_threshold.value(),
@@ -335,10 +326,8 @@ class SegmentPanel(QWidget):
             return
         self._loading = True
         try:
-            if "model_type" in s:
-                i = self.model_type.findText(str(s["model_type"]))
-                if i >= 0:
-                    self.model_type.setCurrentIndex(i)
+            # ``model_type`` was a dropdown in older builds; ignore it if
+            # present in saved state — cellpose 4.x ships only cpsam.
             if "diameter" in s:
                 self.diameter.setValue(float(s["diameter"]))
             if "flow_threshold" in s:
