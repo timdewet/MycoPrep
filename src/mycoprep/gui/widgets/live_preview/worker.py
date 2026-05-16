@@ -141,9 +141,9 @@ class PreviewWorker(QThread):
     cancelled = pyqtSignal()
 
     # Cellpose models are expensive to construct (~3-5 s) — share one
-    # across worker instances per (model_type, gpu) so re-renders don't
+    # across worker instances per gpu setting so re-renders don't
     # re-pay that cost. Cleared when the app exits.
-    _cellpose_cache: dict[tuple[str, bool], Any] = {}
+    _cellpose_cache: dict[bool, Any] = {}
 
     def __init__(self, request: RenderRequest, parent=None) -> None:
         super().__init__(parent)
@@ -300,10 +300,10 @@ class PreviewWorker(QThread):
         from cellpose.models import CellposeModel
         from mycoprep.core.cellpose_pipeline import segment_phase
 
-        model_key = (str(req.segment_opts.model_type), bool(req.segment_opts.gpu))
+        model_key = bool(req.segment_opts.gpu)
         model = self._cellpose_cache.get(model_key)
         if model is None:
-            model = CellposeModel(gpu=req.segment_opts.gpu, model_type=req.segment_opts.model_type)
+            model = CellposeModel(gpu=req.segment_opts.gpu)
             self._cellpose_cache[model_key] = model
 
         # If the user has set an ROI, crop the phase plane before
@@ -321,35 +321,27 @@ class PreviewWorker(QThread):
             mask_local = segment_phase(
                 phase_for_seg, model,
                 diameter=req.segment_opts.diameter,
-                model_type=req.segment_opts.model_type,
                 flow_threshold=req.segment_opts.flow_threshold,
                 cellprob_threshold=req.segment_opts.cellprob_threshold,
                 min_size=req.segment_opts.min_size,
             )
         except Exception as exc:  # noqa: BLE001
-            # Translate known-shape failure modes into actionable messages.
-            # The cpsam (Cellpose-SAM) model has fixed-size positional
-            # embeddings in its ViT-SAM backbone — when cellpose's
-            # auto-rescale produces a non-square or oversized patch grid,
-            # ``add_decomposed_rel_pos`` indexes out of range. The fix is
-            # outside our codebase, so guide the user to either set a
-            # concrete diameter (controls the rescale factor) or switch
-            # to a CNN model that doesn't have this limit.
+            # cpsam's ViT-SAM backbone has fixed-size positional embeddings;
+            # when cellpose's auto-rescale produces a non-square or oversized
+            # patch grid, ``add_decomposed_rel_pos`` indexes out of range.
+            # Set a concrete Diameter so the rescale lands on a sane size.
             msg = str(exc)
             looks_like_sam_relpos = (
                 "rel_pos" in msg
                 or "decomposed_rel_pos" in msg
                 or "out of bounds" in msg.lower()
             )
-            if (looks_like_sam_relpos
-                    and getattr(req.segment_opts, "model_type", "") == "cpsam"):
+            if looks_like_sam_relpos:
                 friendly = (
                     "Cellpose-SAM (cpsam) couldn't process this image at the "
                     "current settings: its position embeddings overflowed. "
-                    "Two ways to fix: (1) set a concrete Diameter in the "
-                    "Segment options instead of leaving it on auto, or "
-                    "(2) switch the Cellpose model to cyto3 — it uses a "
-                    "CNN backbone with no size limit."
+                    "Set a concrete Diameter in the Segment options instead "
+                    "of leaving it on auto."
                 )
                 raise RuntimeError(friendly) from exc
             raise

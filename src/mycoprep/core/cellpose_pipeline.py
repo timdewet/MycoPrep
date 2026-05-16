@@ -110,7 +110,7 @@ def read_czi(filepath):
     return img
 
 
-def segment_phase(phase_img, model, diameter=None, model_type="cpsam",
+def segment_phase(phase_img, model, diameter=None,
                   flow_threshold=0.4, cellprob_threshold=0.0, min_size=15):
     """
     Run Cellpose on a phase contrast image.
@@ -119,7 +119,6 @@ def segment_phase(phase_img, model, diameter=None, model_type="cpsam",
         phase_img: 2D numpy array (Y, X) — phase contrast image
         model: CellposeModel instance
         diameter: Expected cell diameter in pixels (None = auto-estimate)
-        model_type: Cellpose model type string (affects input format)
         flow_threshold: max allowed mask quality score; raise to keep more cells
         cellprob_threshold: probability cutoff; lower (negative) to keep more cells
         min_size: smallest mask in pixels
@@ -127,11 +126,9 @@ def segment_phase(phase_img, model, diameter=None, model_type="cpsam",
     Returns:
         masks: 2D integer array (Y, X) — 0 = background, 1,2,3... = cell labels
     """
-    # cpsam expects 3-channel RGB input; CNN models work with grayscale
-    if model_type == "cpsam":
-        img_input = np.stack([phase_img, phase_img, phase_img], axis=-1)
-    else:
-        img_input = phase_img
+    # cpsam's ViT backbone has a 3-channel input layer (SAM was trained on RGB);
+    # for a single-channel phase image we feed the same plane in all three slots.
+    img_input = np.stack([phase_img, phase_img, phase_img], axis=-1)
 
     masks, flows, styles = model.eval(
         img_input,
@@ -192,7 +189,7 @@ def add_cell_boundaries(masks, boundary_width=1):
 
 
 def segment_single_fov(channels, phase_channel, model, diameter=None,
-                       classify_opts=None, model_type="cpsam",
+                       classify_opts=None,
                        flow_threshold=0.4, cellprob_threshold=0.0, min_size=15):
     """
     Segment one FOV: run Cellpose, add boundaries, optionally classify,
@@ -204,7 +201,6 @@ def segment_single_fov(channels, phase_channel, model, diameter=None,
         model: CellposeModel instance
         diameter: Expected cell diameter in pixels (None = auto-estimate)
         classify_opts: dict with cell quality filtering options, or None
-        model_type: Cellpose model type string
 
     Returns:
         composite: numpy array (C+1, Y, X) — original channels + binary mask
@@ -213,7 +209,7 @@ def segment_single_fov(channels, phase_channel, model, diameter=None,
     phase = channels[phase_channel]
 
     masks = segment_phase(
-        phase, model, diameter=diameter, model_type=model_type,
+        phase, model, diameter=diameter,
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
         min_size=min_size,
@@ -248,7 +244,7 @@ def segment_single_fov(channels, phase_channel, model, diameter=None,
 
 
 def process_condition(condition_dir, model, phase_channel, diameter=None,
-                      classify_opts=None, model_type="cpsam"):
+                      classify_opts=None):
     """
     Process all CZI files in a condition folder.
 
@@ -292,7 +288,7 @@ def process_condition(condition_dir, model, phase_channel, diameter=None,
             continue
 
         composite, n_cells = segment_single_fov(
-            channels, phase_channel, model, diameter, classify_opts, model_type,
+            channels, phase_channel, model, diameter, classify_opts,
             flow_threshold=flow_threshold,
             cellprob_threshold=cellprob_threshold,
             min_size=min_size,
@@ -332,7 +328,7 @@ def process_condition(condition_dir, model, phase_channel, diameter=None,
 
 
 def process_tiff_unit(tiff_path, model, phase_channel, diameter=None,
-                      classify_opts=None, model_type="cpsam", sample=False,
+                      classify_opts=None, sample=False,
                       flow_threshold=0.4, cellprob_threshold=0.0, min_size=15):
     """
     Segment all (or a sampled) FOVs in a multi-FOV TIFF hyperstack.
@@ -343,7 +339,6 @@ def process_tiff_unit(tiff_path, model, phase_channel, diameter=None,
         phase_channel: 0-indexed channel number for phase contrast
         diameter: Expected cell diameter in pixels (None = auto-estimate)
         classify_opts: dict with cell quality filtering options, or None
-        model_type: Cellpose model type string
         sample: If True, process only 1 random FOV
 
     Returns:
@@ -376,7 +371,7 @@ def process_tiff_unit(tiff_path, model, phase_channel, diameter=None,
             continue
 
         composite, n_cells = segment_single_fov(
-            channels, phase_channel, model, diameter, classify_opts, model_type,
+            channels, phase_channel, model, diameter, classify_opts,
             flow_threshold=flow_threshold,
             cellprob_threshold=cellprob_threshold,
             min_size=min_size,
@@ -496,14 +491,6 @@ def main():
         action="store_true",
         default=False,
         help="Use GPU for Cellpose-SAM (recommended for batch processing)"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="cpsam",
-        help="Cellpose model type (default: cpsam). Options: cpsam (Cellpose-SAM), "
-             "cyto3 (fast CNN), cyto2. "
-             "cpsam is most accurate but benefits greatly from GPU acceleration."
     )
     parser.add_argument(
         "--flow-threshold",
@@ -660,11 +647,11 @@ def main():
             print(f"GPU: none detected, using CPU")
     print()
 
-    # Initialise Cellpose model
-    print(f"Loading Cellpose model ({args.model})...")
+    # Initialise Cellpose model (cellpose 4.x ships only cpsam)
+    print("Loading Cellpose model (cpsam)...")
     from cellpose import models
-    model = models.CellposeModel(model_type=args.model, gpu=args.gpu)
-    print(f"  Model loaded (type: {args.model}, GPU: {args.gpu})")
+    model = models.CellposeModel(gpu=args.gpu)
+    print(f"  Model loaded (GPU: {args.gpu})")
     print()
 
     # ── Auto-detect channel count from first input file ──────────────
@@ -750,7 +737,7 @@ def main():
 
             stacked, filenames, total_cells = process_condition(
                 condition_dir, model, phase_channel, diameter=args.diameter,
-                classify_opts=classify_opts, model_type=args.model
+                classify_opts=classify_opts,
             )
 
             if stacked is None:
@@ -782,7 +769,7 @@ def main():
 
             stacked, fov_names, total_cells = process_tiff_unit(
                 tiff_path, model, phase_channel, diameter=args.diameter,
-                classify_opts=classify_opts, model_type=args.model,
+                classify_opts=classify_opts,
                 sample=args.sample,
             )
 

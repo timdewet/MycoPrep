@@ -102,7 +102,6 @@ def segment_key(focus_k: FocusKey, segment_opts: Any, phase_channel: Any,
     return (
         "segment",
         focus_k,
-        getattr(segment_opts, "model_type", None),
         getattr(segment_opts, "diameter", None),
         getattr(segment_opts, "flow_threshold", None),
         getattr(segment_opts, "cellprob_threshold", None),
